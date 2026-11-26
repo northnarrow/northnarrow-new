@@ -69,6 +69,65 @@ const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Lot 1.10 (AlmaLinux 9): tell a test's daemon to go on through its fifo,
+/// within a bound. Opening a fifo for writing blocks until a reader opens
+/// it: a daemon that died first (on AlmaLinux 9 the `Type=forking` unit's
+/// copy, run by systemd in `init_t`, could not open the fifo in /tmp) left
+/// the test blocked there for good, and `test-ignored` with it. The open is
+/// non-blocking and retried while the daemon runs; a daemon gone or no
+/// reader within 30 s fails the test, naming which.
+fn tell_the_daemon(go: &Path, pid: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "the daemon (pid {pid}) exited before it was told to read: nothing reads {}",
+            go.display()
+        );
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(go)
+        {
+            Ok(mut f) => {
+                f.write_all(b"go\n").expect("tell the daemon to read");
+                return;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the daemon (pid {pid}) did not open {} within 30 s",
+                    go.display()
+                );
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => panic!("{}: {e}", go.display()),
+        }
+    }
+}
+
+/// Lot 1.10: with SELinux enforcing (the RHEL family), a daemon systemd
+/// starts from a file labelled `lib_t` (anything under /usr/local/lib) runs
+/// in `init_t`, which may not open the test's files in /tmp (refused
+/// without an AVC record: a `dontaudit` rule). Labelled `bin_t`, as a
+/// daemon installed in a bin directory is, it runs as
+/// `unconfined_service_t`, like an administrator's own service. No-op
+/// without SELinux or when it is permissive.
+fn label_as_a_system_binary(path: &Path) {
+    let enforcing =
+        std::fs::read_to_string("/sys/fs/selinux/enforce").is_ok_and(|v| v.trim() == "1");
+    if !enforcing {
+        return;
+    }
+    let ok = Command::new("chcon")
+        .args(["-t", "bin_t"])
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok, "chcon -t bin_t {}", path.display());
+}
+
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
@@ -789,11 +848,7 @@ fn a_reader_daemon_older_than_the_agent_stays_spared_after_2100_execs() {
     let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
     assert_eq!(canary_id.len(), 32);
     // the daemon reads the decoy
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&go)
-        .and_then(|mut f| f.write_all(b"go\n"))
-        .expect("tell the daemon to read");
+    tell_the_daemon(&go, pid);
     let rows = fx.wait_access(1);
     assert_eq!(
         rows[0]["accessor_pid"].as_u64(),
@@ -878,6 +933,7 @@ fn a_type_forking_reader_daemon_started_after_the_agent_stays_spared() {
     let _gone = Gone(dir.clone(), unit.clone(), pid_file.clone());
     let clamd = dir.join("clamd");
     std::fs::copy("/bin/bash", &clamd).expect("seed the daemon's binary");
+    label_as_a_system_binary(&clamd);
 
     // the agent first: the daemon starts after it
     let fx = CanaryFixture::setup(&[]);
@@ -914,11 +970,7 @@ fn a_type_forking_reader_daemon_started_after_the_agent_stays_spared() {
     std::thread::sleep(Duration::from_secs(7));
     let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
     assert_eq!(canary_id.len(), 32);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&go)
-        .and_then(|mut f| f.write_all(b"go\n"))
-        .expect("tell the daemon to read");
+    tell_the_daemon(&go, pid);
     let rows = fx.wait_access(1);
     assert_eq!(
         rows[0]["accessor_pid"].as_u64(),

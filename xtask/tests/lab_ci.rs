@@ -27,12 +27,13 @@ const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 
 /// The guests a pull request runs, and those the nightly and a dispatch run.
 const PR_GUESTS: [&str; 2] = ["ubuntu2404", "ubuntu2204"];
-const NIGHTLY_GUESTS: [&str; 5] = [
+const NIGHTLY_GUESTS: [&str; 6] = [
     "ubuntu2404",
     "ubuntu2204",
     "debian12",
     "debian13",
     "ubuntu2604",
+    "alma9",
 ];
 
 fn repo_root() -> PathBuf {
@@ -365,12 +366,13 @@ fn matrix_lists() -> (Vec<String>, Vec<String>) {
     (lists[0].clone(), lists[1].clone())
 }
 
-/// Ubuntu 24.04 and 22.04 on a pull request; the lab's four guests and
-/// Ubuntu 26.04 (lab PR 229: the runners' release, uutils coreutils) at
-/// night and on a dispatch; nothing else starts it. Every guest is one nn-lab.sh
+/// Ubuntu 24.04 and 22.04 on a pull request; the lab's four guests,
+/// Ubuntu 26.04 (lab PR 229: the runners' release, uutils coreutils) and
+/// AlmaLinux 9 (lot 1.10: the RHEL family, SELinux enforcing) at night and
+/// on a dispatch; nothing else starts it. Every guest is one nn-lab.sh
 /// knows, one job each, and a failing guest does not cancel the others.
 #[test]
-fn lab_vm_matrix_two_ubuntu_kernels_on_prs_five_guests_nightly() {
+fn lab_vm_matrix_two_ubuntu_kernels_on_prs_six_guests_nightly() {
     let (pr, nightly) = matrix_lists();
     assert_eq!(pr, PR_GUESTS);
     assert_eq!(nightly, NIGHTLY_GUESTS);
@@ -1764,4 +1766,574 @@ fn case_dir_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("lab-ci")
         .join(name)
+}
+
+// ── lot 1.10: the CI eBPF object in the lab, the guest's builds, its disk ──
+
+/// The text between `# >>> {name}` and `# <<< {name}` in nn-lab.sh.
+fn nn_lab_block(name: &str) -> String {
+    let text = read(NN_LAB);
+    let start = text
+        .find(&format!("# >>> {name}"))
+        .unwrap_or_else(|| panic!("{NN_LAB}: no `# >>> {name}` block"));
+    let end = text[start..]
+        .find(&format!("# <<< {name}"))
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("{NN_LAB}: `{name}` block not closed"));
+    text[start..end].to_string()
+}
+
+/// A shell function of nn-lab.sh, from `name() {` to its closing `}`.
+fn nn_lab_fn(name: &str) -> String {
+    let text = read(NN_LAB);
+    let start = text
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{NN_LAB}: no function {name}"))
+        + 1;
+    let end = text[start..].find("\n}\n").unwrap() + start + 3;
+    text[start..end].to_string()
+}
+
+/// An `ebpf-object` artefact as `gh run download <run> -n ebpf-object`
+/// writes it: the object, its build stamp (v2: magic, source hash, the
+/// object's sha256) and its sha256 line. Returns the object's sha256.
+fn fake_ebpf_artifact(
+    dir: &Path,
+    object: &[u8],
+    sha_file: Option<&str>,
+    stamp_obj: Option<&str>,
+) -> String {
+    fs::create_dir_all(dir).unwrap();
+    let sha = ebpf_guard::sha256_hex(object);
+    fs::write(dir.join("northnarrow-agent-ebpf"), object).unwrap();
+    fs::write(
+        dir.join("northnarrow-agent-ebpf.buildhash"),
+        format!(
+            "{}\n{}\n{}\n",
+            ebpf_guard::STAMP_VERSION,
+            "0".repeat(64),
+            stamp_obj.unwrap_or(&sha)
+        ),
+    )
+    .unwrap();
+    if let Some(line) = sha_file {
+        fs::write(
+            dir.join("northnarrow-agent-ebpf.sha256"),
+            format!("{line}  northnarrow-agent-ebpf\n"),
+        )
+        .unwrap();
+    }
+    sha
+}
+
+/// One refused artefact: what it is, the environment, what the refusal says.
+type ArtifactCase = (&'static str, Vec<(&'static str, String)>, String);
+
+/// Lot 1.10 (P2-1 of the review of #618): `sync` takes the eBPF object a CI
+/// run built (`NN_LAB_EBPF_ARTIFACT`, the directory `gh run download <run>
+/// -n ebpf-object` wrote) only with the sha256 the run printed
+/// (`NN_LAB_EBPF_SHA256`), and refuses it — exit 1, before the guest is
+/// even looked at — when that sha256 is missing or malformed, when the
+/// object's is another, when the artefact's own `.sha256` or its build
+/// stamp names another object; a sha256 without an artefact is refused too
+/// (the host build is never checked against one). A good artefact passes
+/// the check and only then meets the guest (none here: "not running").
+#[test]
+fn nn_lab_sync_takes_a_ci_ebpf_object_only_with_its_run_s_sha256() {
+    let base = case_dir("ebpf-artifact");
+    let good = base.join("good");
+    let object = b"\x7fELF the object CI tested";
+    let sha = ebpf_guard::sha256_hex(object);
+    fake_ebpf_artifact(&good, object, Some(&sha), None);
+    let other = ebpf_guard::sha256_hex(b"another object");
+    let tampered = base.join("tampered");
+    fake_ebpf_artifact(
+        &tampered,
+        b"\x7fELF the object, one byte changed",
+        Some(&sha),
+        Some(&sha),
+    );
+    let own_sha = base.join("own-sha");
+    let t = fake_ebpf_artifact(
+        &own_sha,
+        b"\x7fELF swapped with its own sha256",
+        Some(&sha),
+        None,
+    );
+    let stamp = base.join("stamp");
+    let s = fake_ebpf_artifact(
+        &stamp,
+        b"\x7fELF a stamp of another object",
+        None,
+        Some(&other),
+    );
+    let empty = base.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let cases: Vec<ArtifactCase> = vec![
+        (
+            "no sha256",
+            vec![("NN_LAB_EBPF_ARTIFACT", good.display().to_string())],
+            "NN_LAB_EBPF_ARTIFACT needs NN_LAB_EBPF_SHA256".to_string(),
+        ),
+        (
+            "not a sha256",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", good.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", sha.to_uppercase()),
+            ],
+            "is not a sha256".to_string(),
+        ),
+        (
+            "another object",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", good.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", other.clone()),
+            ],
+            format!("has sha256 {sha}, not {other}; nothing synced"),
+        ),
+        (
+            "an object changed after the run",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", tampered.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", sha.clone()),
+            ],
+            "eBPF artefact refused: ".to_string(),
+        ),
+        (
+            "an object swapped, the given sha256 its own",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", own_sha.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", t.clone()),
+            ],
+            format!("its .sha256 names {sha}, not {t}"),
+        ),
+        (
+            "a stamp of another object",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", stamp.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", s.clone()),
+            ],
+            format!("its build stamp names object {other}, not {s}"),
+        ),
+        (
+            "no object",
+            vec![
+                ("NN_LAB_EBPF_ARTIFACT", empty.display().to_string()),
+                ("NN_LAB_EBPF_SHA256", sha.clone()),
+            ],
+            "no northnarrow-agent-ebpf and its .buildhash".to_string(),
+        ),
+        (
+            "a sha256 for the host build",
+            vec![("NN_LAB_EBPF_SHA256", sha.clone())],
+            "NN_LAB_EBPF_SHA256 without NN_LAB_EBPF_ARTIFACT".to_string(),
+        ),
+    ];
+    for (what, env, want) in &cases {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let out = nn_lab(&["sync"], &env, "ebpf-artifact-run");
+        assert_eq!(out.status.code(), Some(1), "{what}: {}", text(&out));
+        assert!(
+            text(&out).contains(want.as_str()),
+            "{what}: no `{want}` in {}",
+            text(&out)
+        );
+        assert!(
+            !text(&out).contains("guest is not running"),
+            "{what}: refused before the guest is looked at: {}",
+            text(&out)
+        );
+    }
+    let out = nn_lab(
+        &["sync"],
+        &[
+            ("NN_LAB_EBPF_ARTIFACT", good.display().to_string().as_str()),
+            ("NN_LAB_EBPF_SHA256", sha.as_str()),
+        ],
+        "ebpf-artifact-run",
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("guest is not running") && !text(&out).contains("refused"),
+        "a good artefact passes the check: {}",
+        text(&out)
+    );
+}
+
+/// Lot 1.10: `verifier-check synced` loads the object the last `sync` sent
+/// and checks that it is the one: against NN_LAB_EBPF_SHA256 (the CI
+/// run's) or, without it, the sha256 that sync recorded. The guest's copy
+/// is checked before any agent is stopped or anything loaded, and the
+/// report's own `object: …, sha256 …` line after the run; either one
+/// another object fails the check (exit 1). With nothing to compare
+/// against, `synced` is refused.
+#[test]
+fn verifier_check_synced_fails_on_an_object_that_is_not_the_one_synced() {
+    let f = nn_lab_fn("cmd_verifier_check");
+    let art = nn_lab_block("ebpf-artifact");
+    let teardown = nn_lab_block("verifier-check-teardown");
+    let good = "a".repeat(64);
+    let bad = "b".repeat(64);
+    let run = |name: &str,
+               guest: &str,
+               report: &str,
+               env_sha: Option<&str>,
+               recorded: Option<&str>| {
+        let dir = case_dir(&format!("vc-synced-{name}"));
+        let calls = dir.join("calls");
+        if let Some(r) = recorded {
+            fs::write(dir.join("synced-ebpf"), format!("{r} artifact /x\n")).unwrap();
+        }
+        let script = format!(
+            "set -euo pipefail\nlog() {{ printf 'nn-lab: %s\\n' \"$*\" >&2; }}\ndie() {{ log \"ERROR: $*\"; exit 1; }}\n\
+             LAB_DIR={dir:?}; DISTRO=alma9; REPO=/nonexistent\n{art}\n{teardown}\n\
+             vm_running() {{ return 0; }}\nlab_purge_pins() {{ echo purge >> {calls:?}; }}\n\
+             vssh() {{ echo \"vssh: $*\" >> {calls:?}; case \"$*\" in\n\
+               *--verifier-check*) printf 'object: x, sha256 %s, 10 bytes, 3 programs\\n' {report};;\n\
+               sha256sum*) printf '%s  x\\n' {guest};;\n\
+               *is-active*) return 1;;\n\
+             esac; }}\n{f}\ncmd_verifier_check synced\n",
+            dir = dir.display().to_string(),
+            calls = calls.display().to_string(),
+        );
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(&script).stdin(Stdio::null());
+        cmd.env_remove("NN_LAB_EBPF_SHA256");
+        if let Some(s) = env_sha {
+            cmd.env("NN_LAB_EBPF_SHA256", s);
+        }
+        let out = cmd.output().unwrap();
+        let calls = fs::read_to_string(&calls).unwrap_or_default();
+        (out, calls)
+    };
+    // the CI run's sha256, or the one sync recorded: the same object passes
+    for (env, rec) in [(Some(good.as_str()), None), (None, Some(good.as_str()))] {
+        let (out, calls) = run("same", &good, &good, env, rec);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(calls.contains("--verifier-check"), "{calls}");
+        assert!(text(&out).contains("as expected"), "{}", text(&out));
+    }
+    // the guest's copy another object: refused before anything is loaded
+    let (out, calls) = run("guest", &bad, &bad, Some(&good), None);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains(&format!("the guest's object has sha256 {bad}, not {good}")));
+    assert!(
+        !calls.contains("--verifier-check"),
+        "nothing loaded: {calls}"
+    );
+    // the report names another object: the run fails
+    let (out, calls) = run("report", &good, &bad, None, Some(&good));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(calls.contains("--verifier-check"));
+    assert!(text(&out).contains(&format!("the report names object sha256 {bad}, not {good}")));
+    // nothing to compare against
+    let (out, calls) = run("none", &good, &good, None, None);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("no sha256 to check the guest's object against"));
+    assert!(!calls.contains("--verifier-check"));
+}
+
+/// Lot 1.10 (26/11): every cargo run in the guest gets one release LTO and
+/// a bounded number of jobs. The test builds (`cargo test --release`) used
+/// Cargo.toml's fat LTO while `build` used thin: two release trees on the
+/// guest's disk, and fat-LTO links of several test binaries at once on
+/// 8 GiB, which left the 24.04 guest's ssh unanswered. The knobs are set in
+/// vcargo only; every `cargo build` / `cargo test` of nn-lab.sh runs
+/// through it (directly or by lab_ignored_run); thin and half the vCPUs
+/// in the lab, all of them in CI mode; a bad value is a usage error. The
+/// lab user's cargo and rustup homes are named too, as `$HOME` expands in
+/// the guest before sudo: the RHEL family's sudo sets HOME=/root, and root's
+/// `cargo test` on the AlmaLinux guest installed a second toolchain and
+/// rebuilt the workspace beside `build`'s.
+#[test]
+fn every_cargo_run_in_the_guest_gets_one_lto_and_bounded_jobs() {
+    let block = nn_lab_block("guest-cargo");
+    let env_of = |ci: &str, cpus: &str, extra: &[(&str, &str)]| {
+        // the stub takes the command apart as the guest's shell would: `bash -c <inner>`
+        let script = format!(
+            "set -euo pipefail\nCI_MODE={ci}; CPUS={cpus}\n{block}\n\
+             vssh() {{ eval \"set -- $*\"; printf '%s\\n' \"$3\"; }}\nvcargo 'cargo build --release'\n"
+        );
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(&script).stdin(Stdio::null());
+        for v in ["NN_LAB_LTO", "NN_LAB_JOBS"] {
+            cmd.env_remove(v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    };
+    for (ci, cpus, extra, want) in [
+        (
+            "0",
+            "4",
+            vec![],
+            "CARGO_PROFILE_RELEASE_LTO=thin CARGO_BUILD_JOBS=2",
+        ),
+        (
+            "0",
+            "1",
+            vec![],
+            "CARGO_PROFILE_RELEASE_LTO=thin CARGO_BUILD_JOBS=1",
+        ),
+        (
+            "1",
+            "4",
+            vec![],
+            "CARGO_PROFILE_RELEASE_LTO=thin CARGO_BUILD_JOBS=4",
+        ),
+        (
+            "0",
+            "4",
+            vec![("NN_LAB_LTO", "fat"), ("NN_LAB_JOBS", "3")],
+            "CARGO_PROFILE_RELEASE_LTO=fat CARGO_BUILD_JOBS=3",
+        ),
+    ] {
+        let out = env_of(ci, cpus, &extra);
+        assert!(out.status.success(), "{}", text(&out));
+        let cmd = text_of(&out);
+        assert!(
+            cmd.contains(&format!(
+                "; export {want} CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup; "
+            )),
+            "CI_MODE={ci} CPUS={cpus} {extra:?}: {cmd}"
+        );
+        let env_at = cmd.find("CARGO_PROFILE_RELEASE_LTO").unwrap();
+        let cd_at = cmd
+            .find("cd ~/northnarrow && cargo build --release")
+            .expect(&cmd);
+        assert!(env_at < cd_at, "set before the command: {cmd}");
+    }
+    for (k, v) in [
+        ("NN_LAB_LTO", "yes"),
+        ("NN_LAB_JOBS", "0"),
+        ("NN_LAB_JOBS", "many"),
+    ] {
+        let out = env_of("0", "4", &[(k, v)]);
+        assert_eq!(out.status.code(), Some(2), "{k}={v}: {}", text(&out));
+    }
+    // one place: the knobs are vcargo's, and every guest cargo build or test goes through it
+    let text = read(NN_LAB);
+    let (start, end) = (
+        text.find("# >>> guest-cargo").unwrap(),
+        text.find("# <<< guest-cargo").unwrap(),
+    );
+    for (n, l) in text.lines().enumerate() {
+        let at = text.lines().take(n).map(|l| l.len() + 1).sum::<usize>();
+        let code = l.trim_start();
+        if code.starts_with('#') || (start..end).contains(&at) {
+            continue;
+        }
+        for knob in ["CARGO_PROFILE_RELEASE_LTO", "CARGO_BUILD_JOBS"] {
+            assert!(
+                !code.contains(knob),
+                "{NN_LAB}:{}: {knob} outside vcargo",
+                n + 1
+            );
+        }
+        if code.contains("cargo build") || code.contains("cargo test") {
+            assert!(
+                code.starts_with("vcargo \"") || code.starts_with("lab_ignored_run "),
+                "{NN_LAB}:{}: a guest cargo run outside vcargo: {code}",
+                n + 1
+            );
+        }
+    }
+    let runner = nn_lab_fn("lab_ignored_run");
+    assert!(runner.contains("vcargo \"$3\""), "{runner}");
+}
+
+/// Lot 1.10 (26/11, the 24.04 guest down to 2.9 GB free): `build` first
+/// makes room on the guest's disk. At NN_LAB_MIN_FREE_GB or more nothing is
+/// removed; below, what no lab command reuses goes first, then the release
+/// tree (with sudo: the privileged runs leave root's files there), and a
+/// guest still below is refused with the grow-disk hint.
+#[test]
+fn the_guest_disk_gets_room_before_a_build_or_the_build_is_refused() {
+    let block = nn_lab_block("guest-disk");
+    let build = nn_lab_fn("cmd_build");
+    assert!(
+        build.find("\n    guest_disk_room\n").unwrap() < build.find("\n    vcargo \"").unwrap(),
+        "the room is made before the build: {build}"
+    );
+    let run = |name: &str, frees: &[u32]| {
+        let dir = case_dir(&format!("guest-disk-{name}"));
+        let calls = dir.join("calls");
+        let left = dir.join("frees");
+        fs::write(
+            &left,
+            frees.iter().map(|f| format!("{f}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let script = format!(
+            "set -euo pipefail\nlog() {{ printf 'nn-lab: %s\\n' \"$*\" >&2; }}\ndie() {{ log \"ERROR: $*\"; exit 1; }}\n\
+             {block}\n\
+             vssh() {{ case \"$*\" in\n\
+               *df\\ -P*) head -1 {left:?}; sed -i 1d {left:?};;\n\
+               *) echo \"vssh: $*\" >> {calls:?}; cat >/dev/null;;\n\
+             esac; }}\nvcargo() {{ echo \"vcargo: $*\" >> {calls:?}; }}\nguest_disk_room\n",
+            left = left.display().to_string(),
+            calls = calls.display().to_string(),
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("NN_LAB_MIN_FREE_GB")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out, fs::read_to_string(&calls).unwrap_or_default())
+    };
+    let (out, calls) = run("enough", &[20]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(calls.is_empty(), "nothing removed: {calls}");
+    let (out, calls) = run("first-pass", &[3, 9]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        calls.contains("vssh: bash -s") && !calls.contains("rm -rf ~/northnarrow/target"),
+        "{calls}"
+    );
+    let (out, calls) = run("release-tree", &[3, 5, 12]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        calls.contains("vssh: sudo rm -rf ~/northnarrow/target"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("cargo clean"),
+        "cargo clean cannot remove root's files: {calls}"
+    );
+    let (out, _) = run("full", &[3, 4, 5]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("nn-lab.sh grow-disk +10G"),
+        "{}",
+        text(&out)
+    );
+    // the first pass keeps the release tree and the tests' tmp dir, with sudo
+    assert!(block.contains("release | tmp) ;; *) sudo rm -rf \"$d\""));
+}
+
+/// Lot 1.10: lab-vm.yml's guest loads the object its host build made and
+/// its evidence names, through nn-lab.sh's artefact check (no second
+/// build in `sync`, the sha256 compared where the object is used), and
+/// still downloads no other run's artefact (its token reads the
+/// repository and nothing else).
+#[test]
+fn lab_vm_syncs_the_object_its_evidence_names() {
+    let steps = steps();
+    let host = step_running(&steps, "cargo --locked xtask build-ebpf --locked");
+    let sync = step_running(&steps, "deploy/lab/nn-lab.sh sync");
+    assert!(host < sync);
+    let run = run_of(&steps[sync]);
+    assert!(
+        run.contains("NN_LAB_EBPF_ARTIFACT=\"$GITHUB_WORKSPACE/agent-ebpf/target/bpfel-unknown-none/release\""),
+        "{run}"
+    );
+    assert!(
+        run.contains("NN_LAB_EBPF_SHA256=$(cut -d' ' -f1 \"$GATE_OUT/ebpf-object.sha256\")"),
+        "{run}"
+    );
+    assert!(run_of(&steps[host]).contains("tee \"$GATE_OUT/ebpf-object.sha256\""));
+    assert!(step_using(&steps, "actions/download-artifact").is_empty());
+}
+
+/// Lot 1.10 (#604): `rpm-release-check FROM NEW` sends nothing to the guest
+/// before the host has checked what it got: one package, key, checksum list
+/// and signature in FROM, one package and list in NEW; FROM's key is the
+/// repository's byte for byte, its SHA256SUMS carries a good signature by
+/// install.sh's release key, and each package is the one its list names.
+/// Each refusal is exit 1 before the guest is looked at.
+#[test]
+fn rpm_release_check_refuses_what_the_host_cannot_vouch_for() {
+    let base = case_dir("rpm-release");
+    let key = repo_root().join("deploy/release/RPM-GPG-KEY-northnarrow.asc");
+    let mk = |name: &str, key_bytes: &[u8], sig: &str, rpm: &[u8], listed: Option<&[u8]>| {
+        let from = base.join(name).join("from");
+        let new = base.join(name).join("new");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        let rpm_name = "northnarrow-0.1.0-alpha-1.x86_64.rpm";
+        fs::write(from.join(rpm_name), rpm).unwrap();
+        fs::write(new.join(rpm_name), rpm).unwrap();
+        fs::write(from.join("RPM-GPG-KEY-northnarrow.asc"), key_bytes).unwrap();
+        let sums = format!(
+            "{}  {rpm_name}\n",
+            ebpf_guard::sha256_hex(listed.unwrap_or(rpm))
+        );
+        fs::write(from.join("SHA256SUMS"), &sums).unwrap();
+        fs::write(new.join("SHA256SUMS"), &sums).unwrap();
+        fs::write(from.join("SHA256SUMS.asc"), sig).unwrap();
+        (from, new)
+    };
+    let real_key = fs::read(&key).unwrap();
+    let run = |from: &Path, new: &Path| {
+        nn_lab(
+            &[
+                "rpm-release-check",
+                from.to_str().unwrap(),
+                new.to_str().unwrap(),
+            ],
+            &[],
+            "rpm-release-run",
+        )
+    };
+    // NEW missing: usage
+    let (from, _) = mk("usage", &real_key, "", b"rpm", None);
+    let out = run(&from, &base.join("usage/none"));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("usage: nn-lab.sh rpm-release-check FROM NEW"));
+    // a key that is not the repository's
+    let (from, new) = mk(
+        "key",
+        b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nother\n",
+        "",
+        b"rpm",
+        None,
+    );
+    let out = run(&from, &new);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("is not deploy/release/RPM-GPG-KEY-northnarrow.asc: refused"));
+    // two packages in FROM
+    let (from, new) = mk("two", &real_key, "", b"rpm", None);
+    fs::write(from.join("northnarrow-0.0.9-1.x86_64.rpm"), b"old").unwrap();
+    let out = run(&from, &new);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("2 files northnarrow-*.x86_64.rpm"),
+        "{}",
+        text(&out)
+    );
+    if have("gpg") {
+        // the checksum list not signed by the release key
+        let (from, new) = mk("sig", &real_key, "not a signature\n", b"rpm", None);
+        let out = run(&from, &new);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(
+            text(&out).contains("no good signature by the release key"),
+            "{}",
+            text(&out)
+        );
+    }
+    assert!(
+        !text(&out).contains("guest is not running"),
+        "refused before the guest: {}",
+        text(&out)
+    );
+    // the release key named is install.sh's
+    let nn_lab_text = read(NN_LAB);
+    assert!(nn_lab_text.contains(
+        "fpr=$(sed -n 's/^RELEASE_KEY_FPR=\\([0-9A-F]\\{40\\}\\)$/\\1/p' \"$REPO/deploy/install.sh\")"
+    ));
+    assert!(read("deploy/install.sh").contains("\nRELEASE_KEY_FPR="));
+    // the guest side is the repository's script, every phase
+    let body = nn_lab_fn("cmd_rpm_release_check");
+    for phase in ["install", "boot", "remove"] {
+        assert!(
+            body.contains(&format!("release-rpm-check.sh {phase} ")),
+            "phase {phase}"
+        );
+    }
+    assert!(body.find("cmd_down").unwrap() < body.find("release-rpm-check.sh boot").unwrap());
 }

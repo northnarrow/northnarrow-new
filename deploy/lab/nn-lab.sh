@@ -49,6 +49,7 @@
 #   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
+#   deploy/lab/nn-lab.sh rpm-release-check FROM NEW # an RPM guest: a release's signed .rpm installed, NEW over it, cold boot, removed, nothing left
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
 #   deploy/lab/nn-lab.sh verifier-check [synced] # every program of the eBPF object through this kernel's verifier
 #                                      # (OK / REFUSED per program, logs of the refused ones); `synced`: the
@@ -85,6 +86,7 @@
 #   deploy/lab/nn-lab.sh respawn-check # agent death via systemd in a window, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
+#   deploy/lab/nn-lab.sh grow-disk +10G  # the guest's disk bigger (guest down; the root fs grows at the next boot)
 #   deploy/lab/nn-lab.sh status | down | destroy
 #   deploy/lab/nn-lab.sh trust-host-key  # record the running guest's ssh host key again (a guest recreated
 #                                      # by an older nn-lab.sh); `up` records it for a new guest (generated
@@ -377,7 +379,7 @@ whpx_dir() { wslpath -u "$(whpx_dir_win)"; }
 # piped into nn-lab.sh to its end.
 win() { (cd /mnt/c && PATH="$PATH:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" "$@" </dev/null); }
 whpx_host_ip() { ip route | awk '/default/ {print $3; exit}'; }
-whpx_pid() { tr -d '\r ' < "$(whpx_dir)/qemu.pid" 2>/dev/null || true; }
+whpx_pid() { tr -d '\r ' 2>/dev/null < "$(whpx_dir)/qemu.pid" || true; }
 # This guest's QEMU for Windows: 0 running, 1 not running (no pid file, or
 # tasklist.exe answered without it), 2 cannot tell (tasklist.exe did not
 # run: no Windows interop here).
@@ -631,12 +633,38 @@ record_existing_host_key() {
 # ssh joins its arguments with spaces and hands the string to the remote
 # login shell, so the inner command must be re-quoted (printf %q) or the
 # `bash -c "…"` boundary is lost on the way.
+# >>> guest-cargo (xtask/tests/lab_ci.rs runs this block)
+# Lot 1.10 (26/11): every cargo run in the guest — `build`, the test
+# builds of test-e2e, test-ignored and test-one, the perf build — gets the
+# same release LTO and a bounded number of jobs, here and only here. The
+# test builds (`cargo test --release`) used Cargo.toml's fat LTO while
+# `build` used thin: two release target trees on the guest's disk (the
+# 24.04 guest was down to 2.9 GB free), and fat-LTO links of 4 test
+# binaries at once on 8 GiB that left the guest's ssh unanswered.
+#   NN_LAB_LTO   thin (default) | fat (production's, for a guest with the
+#                memory) | off — CARGO_PROFILE_RELEASE_LTO;
+#   NN_LAB_JOBS  cargo's jobs (CARGO_BUILD_JOBS): half the guest's vCPUs in
+#                the lab (2 of 4), all of them in CI mode (a hosted runner's
+#                guest runs alone, 12 GiB).
+# `sudo -E` (the privileged runs) keeps both, and the lab user's cargo and
+# rustup homes, named here: the RHEL family's sudo sets HOME=/root
+# (always_set_home), so root's `cargo test` on the AlmaLinux guest
+# installed a second toolchain under /root/.rustup, fetched the crates
+# again under /root/.cargo and rebuilt the whole workspace beside `build`'s
+# (lot 1.10's round: 780 MB and a second tree). Elsewhere sudo -E keeps
+# HOME, and these are the homes cargo already used.
+LAB_LTO=${NN_LAB_LTO:-thin}
+case "$LAB_LTO" in thin | fat | off) ;; *) echo "nn-lab: unknown NN_LAB_LTO=$LAB_LTO (thin | fat | off)" >&2; exit 2 ;; esac
+if [[ $CI_MODE == 1 ]]; then LAB_JOBS=${NN_LAB_JOBS:-$CPUS}; else LAB_JOBS=${NN_LAB_JOBS:-$(( CPUS > 1 ? CPUS / 2 : 1 ))}; fi
+[[ $LAB_JOBS =~ ^[1-9][0-9]?$ ]] || { echo "nn-lab: NN_LAB_JOBS=$LAB_JOBS is not a number of jobs (1-99)" >&2; exit 2; }
+LAB_CARGO_ENV="export CARGO_PROFILE_RELEASE_LTO=$LAB_LTO CARGO_BUILD_JOBS=$LAB_JOBS CARGO_HOME=\$HOME/.cargo RUSTUP_HOME=\$HOME/.rustup"
 vcargo() {
     # Debian's non-root PATH has no sbin dirs: the privileged tests spawn
     # iptables-restore through `sudo -E env PATH=$PATH`, so add them here.
-    local inner="export PATH=\$PATH:/usr/sbin:/sbin; source ~/.cargo/env 2>/dev/null; cd ~/northnarrow && $*"
+    local inner="export PATH=\$PATH:/usr/sbin:/sbin; $LAB_CARGO_ENV; source ~/.cargo/env 2>/dev/null; cd ~/northnarrow && $*"
     vssh "bash -c $(printf '%q' "$inner")"
 }
+# <<< guest-cargo
 
 # >>> guest-boot (xtask/tests/lab_host_safety.rs runs this block)
 # Is the guest past its provisioning boot (lab PR 274)? The templates' last
@@ -820,6 +848,12 @@ if [ -n "${NN_WANT_LOCKDOWN:-}" ]; then
     esac
 fi
 mount | grep -q ' /sys/fs/bpf ' && echo "bpffs       : mounted" || echo "bpffs       : NOT mounted"
+# lot 1.10: the kernel's own BTF, which the agent's CO-RE offsets need
+# (docs/operator/KERNEL_COMPATIBILITY.md); the RHEL family ships it, no BTFHub
+[ -r /sys/kernel/btf/vmlinux ] && echo "btf         : /sys/kernel/btf/vmlinux" || { echo "btf         : MISSING (/sys/kernel/btf/vmlinux)"; exit 1; }
+echo "systemd     : $(systemctl --version | head -1)"
+if command -v getenforce >/dev/null 2>&1; then echo "selinux     : $(getenforce)"; fi
+echo "disk        : $(df -P -BG ~ | awk 'NR == 2 {print $4}') free in ~"
 command -v iptables-restore >/dev/null && echo "iptables    : $(iptables --version)" || { echo "iptables    : MISSING"; exit 1; }
 command -v nft >/dev/null && echo "nft         : $(nft --version 2>/dev/null)" || echo "nft         : MISSING (install.sh refuses; nn-lab.sh install provisions it)"
 # `command -v` is not enough: Ubuntu's bpftool is a wrapper that fails
@@ -884,37 +918,140 @@ guest_require_bpftool() {
         || die "'sudo bpftool version' fails in the guest: the privileged fixtures could not stop their agents — refusing to start (Ubuntu: sudo apt-get install linux-tools-\$(uname -r))"
 }
 
+# >>> ebpf-artifact (xtask/tests/lab_ci.rs runs this block)
+# Lot 1.10 (P2-1 of the review of #618): the lab can use the eBPF object a CI
+# run built and tested — ci.yml's artefact `ebpf-object` — instead of
+# building one on the host, and checks its sha256 before anything reaches
+# the guest:
+#   gh run download <run> -n ebpf-object -D <dir>
+#   NN_LAB_EBPF_ARTIFACT=<dir> NN_LAB_EBPF_SHA256=<sha256> nn-lab.sh sync
+# NN_LAB_EBPF_SHA256 is the sha256 the run itself printed (its summary,
+# "eBPF object: <sha256>", or the ebpf-build log's build stamp line): the
+# artefact's own .sha256 travels with the object, so it names the object but
+# cannot vouch for it. Refused (exit 1, nothing sent): no sha256 given, the
+# object's sha256 not the one given, the artefact's .sha256 or its build stamp
+# naming another object. Then `verifier-check synced` loads that object and
+# fails when its report names another sha256.
+LAB_EBPF_REL=agent-ebpf/target/bpfel-unknown-none/release
+# The record of what the last `sync` sent (host-build or artifact, sha256).
+LAB_EBPF_SYNCED="$LAB_DIR/synced-ebpf"
+lab_ebpf_artifact_check() {   # <dir> <expected sha256> -> prints the object's path
+    local dir=$1 want=$2 obj got line stamp
+    [[ -n $want ]] || die "NN_LAB_EBPF_ARTIFACT needs NN_LAB_EBPF_SHA256: the sha256 the CI run printed (its summary, or the ebpf-build log), not the artefact's own .sha256"
+    [[ $want =~ ^[0-9a-f]{64}$ ]] || die "NN_LAB_EBPF_SHA256 is not a sha256 (64 lowercase hex digits): $want"
+    obj="$dir/northnarrow-agent-ebpf"
+    [[ -f $obj && -f $obj.buildhash ]] || die "$dir: no northnarrow-agent-ebpf and its .buildhash (gh run download <run> -n ebpf-object -D $dir)"
+    got=$(sha256sum "$obj" | cut -d' ' -f1)
+    [[ $got == "$want" ]] || die "eBPF artefact refused: $obj has sha256 $got, not $want; nothing synced"
+    if [[ -f $obj.sha256 ]]; then
+        line=$(cut -d' ' -f1 "$obj.sha256")
+        [[ $line == "$want" ]] || die "eBPF artefact refused: its .sha256 names $line, not $want; nothing synced"
+    fi
+    # the build stamp (nn-ebpf-buildhash-v2: magic, source hash, object sha256)
+    stamp=$(sed -n 3p "$obj.buildhash")
+    [[ $stamp == "$want" ]] || die "eBPF artefact refused: its build stamp names object ${stamp:-none}, not $want; nothing synced"
+    printf '%s\n' "$obj"
+}
+# <<< ebpf-artifact
+
 cmd_sync() {
+    local obj="$REPO/$LAB_EBPF_REL/northnarrow-agent-ebpf" art=${NN_LAB_EBPF_ARTIFACT:-} sha source
+    # the artefact is checked before the guest is looked at: a refused one
+    # stops here whatever the guest's state
+    if [[ -n $art ]]; then
+        obj=$(lab_ebpf_artifact_check "$art" "${NN_LAB_EBPF_SHA256:-}") || exit 1
+    elif [[ -n ${NN_LAB_EBPF_SHA256:-} ]]; then
+        die "NN_LAB_EBPF_SHA256 without NN_LAB_EBPF_ARTIFACT: the host build is not checked against a sha256"
+    fi
     vm_running || die "guest is not running"
-    local obj="$REPO/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf"
-    command -v bpf-linker >/dev/null 2>&1 || die "bpf-linker not on PATH (cargo install bpf-linker --version 0.10.3 --locked)"
-    log "building eBPF object on host (cargo xtask build-ebpf)"
-    (cd "$REPO" && cargo ${LAB_CARGO_LOCKED:+--locked} xtask build-ebpf ${LAB_CARGO_LOCKED:+--locked} >/dev/null)
-    [[ -f "$obj" && -f "$obj.buildhash" ]] || die "eBPF object/stamp missing after build: $obj"
+    if [[ -n $art ]]; then
+        sha=$NN_LAB_EBPF_SHA256 source="artifact $art"
+        log "eBPF object: the CI artefact in $art, sha256 $sha (checked; no host build)"
+    else
+        command -v bpf-linker >/dev/null 2>&1 || die "bpf-linker not on PATH (cargo install bpf-linker --version 0.10.3 --locked)"
+        log "building eBPF object on host (cargo xtask build-ebpf)"
+        (cd "$REPO" && cargo ${LAB_CARGO_LOCKED:+--locked} xtask build-ebpf ${LAB_CARGO_LOCKED:+--locked} >/dev/null)
+        [[ -f "$obj" && -f "$obj.buildhash" ]] || die "eBPF object/stamp missing after build: $obj"
+        sha=$(sha256sum "$obj" | cut -d' ' -f1) source="host-build $REPO"
+    fi
     # (target/kb, the LLM advisor's knowledge base, rode along until the
     # advisor was removed in Wave 4, lab PR 214.)
-    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included)"
+    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object sent on its own)"
     # Compare by content and let changed files take the guest's clock. With
     # the host's mtimes preserved, a sync from another checkout or worktree
     # can land sources older than the guest's last build: cargo's mtime
     # fingerprint then keeps the stale crate and the build fails, or worse,
-    # links the old code.
+    # links the old code. The eBPF object is not taken from the tree's
+    # target/ by the filter: it goes on its own below, from the host build or
+    # the artefact, and the guest's copy is checked against its sha256.
     vrsync -az --checksum --no-times --delete \
         --exclude='/fuzz/artifacts/' \
         --exclude='/fuzz/corpus/' \
         --exclude='/fuzz/target/' \
         --exclude='/target/' \
-        --include='/agent-ebpf/target/' \
-        --include='/agent-ebpf/target/bpfel-unknown-none/' \
-        --include='/agent-ebpf/target/bpfel-unknown-none/release/' \
-        --include='/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf' \
-        --include='/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.buildhash' \
-        --exclude='/agent-ebpf/target/bpfel-unknown-none/release/*' \
-        --exclude='/agent-ebpf/target/bpfel-unknown-none/*' \
-        --exclude='/agent-ebpf/target/*' \
+        --exclude='/agent-ebpf/target/' \
         --exclude='target/' --exclude='.git/' \
         "$REPO/" "$GUEST:northnarrow/"
+    vssh "mkdir -p ~/northnarrow/$LAB_EBPF_REL"
+    # --copy-links: an object given as a symlink arrives as the file it names
+    # (checked against the sha256 right below either way)
+    vrsync -a --copy-links --checksum --no-times "$obj" "$obj.buildhash" "$GUEST:northnarrow/$LAB_EBPF_REL/"
+    local there
+    there=$(vssh "sha256sum ~/northnarrow/$LAB_EBPF_REL/northnarrow-agent-ebpf" </dev/null | cut -d' ' -f1) || true
+    [[ $there == "$sha" ]] || die "the guest's eBPF object has sha256 ${there:-unknown}, not the $sha sent"
+    mkdir -p "$LAB_DIR"
+    printf '%s %s\n' "$sha" "$source" > "$LAB_EBPF_SYNCED"
+    log "eBPF object in the guest: sha256 $sha ($source)"
 }
+
+# >>> guest-disk (xtask/tests/lab_ci.rs runs this block)
+# Lot 1.10 (26/11): the guest's disk is checked before a build. A 30 GB
+# guest that had built several branches was down to 2.9 GB free, and a
+# release build there fills it halfway through. Below NN_LAB_MIN_FREE_GB
+# (default 8) free in the lab user's home, what no lab command reuses goes
+# first: the debug and other profiles' trees of ~/northnarrow/target (the
+# lab builds and tests release only), stale verifier-check logs, cargo's
+# extracted registry sources (re-extracted from its cache on demand), the
+# package cache and the journal beyond 200 MB. Still below, the release
+# tree goes too (the next build is a full one; `sudo rm`, as the privileged
+# test runs leave root's files in it, which `cargo clean` cannot remove). Still below,
+# the build is refused: `nn-lab.sh grow-disk +10G` with the guest down.
+LAB_MIN_FREE_GB=${NN_LAB_MIN_FREE_GB:-8}
+[[ $LAB_MIN_FREE_GB =~ ^[0-9]{1,3}$ ]] || { echo "nn-lab: NN_LAB_MIN_FREE_GB=$LAB_MIN_FREE_GB is not a number of GB" >&2; exit 2; }
+guest_free_gb() { vssh 'df -P -BG ~ | awk "NR == 2 { sub(/G\$/, \"\", \$4); print \$4 }"' </dev/null; }
+guest_disk_room() {
+    local free
+    free=$(guest_free_gb) || die "could not read the guest's free disk space"
+    [[ $free =~ ^[0-9]+$ ]] || die "the guest's free disk space is not a number: $free"
+    if ((free >= LAB_MIN_FREE_GB)); then
+        log "guest disk: ${free} GB free (at least $LAB_MIN_FREE_GB)"
+        return 0
+    fi
+    log "guest disk: ${free} GB free, under $LAB_MIN_FREE_GB: removing what no lab command reuses"
+    vssh 'bash -s' <<'REMOTE' >&2 || true
+t=~/northnarrow/target
+if [ -d "$t" ]; then
+    for d in "$t"/*/; do
+        case "$(basename "$d")" in release | tmp) ;; *) sudo rm -rf "$d" && echo "removed $d" ;; esac
+    done
+    sudo rm -rf "$t/release/incremental"
+fi
+sudo rm -rf /var/tmp/nn-verifier-check.* /root/.cargo/registry/src 2>/dev/null
+sudo rm -rf ~/.cargo/registry/src ~/.cargo/git/checkouts 2>/dev/null
+if command -v apt-get >/dev/null 2>&1; then sudo apt-get clean -qq; else sudo dnf clean -q all; fi 2>/dev/null
+sudo journalctl --vacuum-size=200M -q 2>/dev/null
+exit 0
+REMOTE
+    free=$(guest_free_gb) || die "could not read the guest's free disk space"
+    if ((free < LAB_MIN_FREE_GB)); then
+        log "guest disk: ${free} GB free, still under $LAB_MIN_FREE_GB: removing the release tree (a full build follows)"
+        vssh 'sudo rm -rf ~/northnarrow/target' </dev/null >&2 || true
+        free=$(guest_free_gb) || die "could not read the guest's free disk space"
+    fi
+    ((free >= LAB_MIN_FREE_GB)) || die "the guest has ${free} GB free, under $LAB_MIN_FREE_GB, after the cleanup: power it off and grow its disk (nn-lab.sh grow-disk +10G)"
+    log "guest disk: ${free} GB free after the cleanup"
+}
+# <<< guest-disk
 
 # The features of the lab's agent build (the e2e fixtures need both); the
 # perf baseline records them (lab PR 228).
@@ -922,14 +1059,14 @@ LAB_AGENT_FEATURES=test-privileged,debug-trigger
 cmd_build() {
     vm_running || die "guest is not running"
     # LTO "fat" (Cargo.toml release profile) can peak 6-8 GiB at link;
-    # the guest has ~7 GiB, so default to thin here (NN_LAB_LTO=fat to
-    # mirror production exactly on a bigger guest).
-    local lto=${NN_LAB_LTO:-thin}
+    # the guest has ~7 GiB, so the lab builds thin (vcargo: NN_LAB_LTO=fat
+    # mirrors production exactly on a bigger guest; NN_LAB_JOBS).
+    guest_disk_room
     # NN_LAB_CARGO_ENV: extra variables for this build, e.g. a profiling
     # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
     # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
     # agent's functions (the release profile strips them).
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features $LAB_AGENT_FEATURES -p northnarrow-agent -p northnarrow-watchdog -p northnarrow-scan 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    vcargo "${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features $LAB_AGENT_FEATURES -p northnarrow-agent -p northnarrow-watchdog -p northnarrow-scan 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review
@@ -1378,7 +1515,7 @@ cmd_perf() {
         cmd_sync
         cmd_install
         tree_src="host checkout, synced and installed by this run"
-        features=$LAB_AGENT_FEATURES lto=${NN_LAB_LTO:-thin}
+        features=$LAB_AGENT_FEATURES lto=$LAB_LTO
     fi
     # Root runs them: root-owned copies outside the lab user's home (R009
     # kills a root exec from a user-writable path).
@@ -1481,6 +1618,81 @@ cmd_pkg_check() {
     return "$rc"
 }
 
+# >>> rpm-release-check
+# Lot 1.10 (#604): the release .rpm on an RPM guest (alma9). FROM holds a
+# released package with its signed checksums and key (`gh release download
+# v<ver> -p '*.rpm' -p 'RPM-GPG-KEY-northnarrow.asc' -p 'SHA256SUMS*'`), NEW
+# the build under test (`gh run download <release run> -D NEW`: its .rpm and
+# SHA256SUMS). On the host, before anything reaches the guest: FROM's key is
+# deploy/release/RPM-GPG-KEY-northnarrow.asc byte for byte, its SHA256SUMS
+# carries a good signature by install.sh's release key, and each .rpm is the
+# one its SHA256SUMS lists. On the guest (deploy/lab/pkg/release-rpm-check.sh):
+# the key's fingerprint, rpm -K of both packages (an altered copy refused by
+# dnf), FROM installed with dnf's signature check and enabled as an operator
+# does, NEW over it in place (refused without NN_GRANT_KEY), a cold boot,
+# then rpm -e (refused without the key) and uninstall.sh --package --purge,
+# and nothing of NorthNarrow's left against the inventory taken first. The
+# lab's install.sh layout is purged first and put back at the end.
+lab_one_file() {   # <dir> <glob> <what>: the one file of <dir> matching <glob>
+    local f n
+    n=$(find "$1" -maxdepth 2 -type f -name "$2" | wc -l)
+    ((n == 1)) || die "$1: $n files $2 (expected one: $3)"
+    f=$(find "$1" -maxdepth 2 -type f -name "$2")
+    printf '%s\n' "$f"
+}
+lab_rpm_sums_ok() {   # <sums> <file>: <file>'s name is listed once in <sums>, with its sha256
+    local want got
+    want=$(awk -v n="$(basename "$2")" '$2 == n || $2 == "*" n {print $1}' "$1")
+    [[ $(grep -c . <<<"$want") == 1 && $want =~ ^[0-9a-f]{64}$ ]] || return 1
+    got=$(sha256sum "$2" | cut -d' ' -f1)
+    [[ $got == "$want" ]]
+}
+cmd_rpm_release_check() {
+    local from=${1:-} new=${2:-}
+    [[ -d $from && -d $new ]] || die "usage: nn-lab.sh rpm-release-check FROM NEW (FROM: a release's .rpm, RPM-GPG-KEY-northnarrow.asc, SHA256SUMS, SHA256SUMS.asc; NEW: the build's .rpm and SHA256SUMS)"
+    local frpm fkey fsums fsig nrpm nsums fpr g
+    frpm=$(lab_one_file "$from" 'northnarrow-*.x86_64.rpm' "the released .rpm") || exit 1
+    fkey=$(lab_one_file "$from" RPM-GPG-KEY-northnarrow.asc "the release's key") || exit 1
+    fsums=$(lab_one_file "$from" SHA256SUMS "the release's checksums") || exit 1
+    fsig=$(lab_one_file "$from" SHA256SUMS.asc "their signature") || exit 1
+    nrpm=$(lab_one_file "$new" 'northnarrow-*.x86_64.rpm' "the build's .rpm") || exit 1
+    nsums=$(lab_one_file "$new" SHA256SUMS "the build's checksums") || exit 1
+    cmp -s "$fkey" "$REPO/deploy/release/RPM-GPG-KEY-northnarrow.asc" \
+        || die "$fkey is not deploy/release/RPM-GPG-KEY-northnarrow.asc: refused"
+    fpr=$(sed -n 's/^RELEASE_KEY_FPR=\([0-9A-F]\{40\}\)$/\1/p' "$REPO/deploy/install.sh")
+    [[ -n $fpr ]] || die "no RELEASE_KEY_FPR in deploy/install.sh"
+    command -v gpg >/dev/null 2>&1 || die "gpg not on the host (sudo apt install gnupg)"
+    g=$(mktemp -d)
+    gpg --homedir "$g" --batch -q --import "$fkey" 2>/dev/null
+    if ! gpg --homedir "$g" --batch --status-fd 1 --verify "$fsig" "$fsums" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $fpr "; then
+        rm -rf "$g"; die "$fsums: no good signature by the release key $fpr: refused"
+    fi
+    rm -rf "$g"
+    lab_rpm_sums_ok "$fsums" "$frpm" || die "$frpm is not the one $fsums lists: refused"
+    lab_rpm_sums_ok "$nsums" "$nrpm" || die "$nrpm is not the one $nsums lists: refused"
+    log "host: the key is the repository's, SHA256SUMS signed by $fpr, both packages as listed"
+    vm_running || die "guest is not running"
+    vssh 'command -v rpm >/dev/null && command -v dnf >/dev/null' </dev/null || die "rpm-release-check needs an RPM guest (NN_LAB_DISTRO=alma9)"
+    local d rc=0
+    d=$(vssh 'mktemp -d' </dev/null) || die "mktemp on the guest"
+    vrsync -a --copy-links "$frpm" "$GUEST:$d/from.rpm"
+    vrsync -a --copy-links "$nrpm" "$GUEST:$d/new.rpm"
+    vrsync -a --copy-links "$fkey" "$GUEST:$d/RPM-GPG-KEY-northnarrow.asc"
+    log "the lab's install.sh layout purged first"
+    vssh "cd ~/northnarrow && if systemctl is-active -q northnarrow-agent || test -e /etc/northnarrow; then script -qec 'sudo ./deploy/uninstall.sh --purge --yes --grant-key /root/northnarrow-admin.key' /dev/null </dev/null | tail -1; fi" </dev/null || true
+    vssh "bash ~/northnarrow/deploy/lab/pkg/release-rpm-check.sh install $(printf %q "$d")" </dev/null || rc=1
+    log "rpm-release-check: cold boot (down, up)"
+    cmd_down
+    cmd_up >/dev/null
+    vssh "bash ~/northnarrow/deploy/lab/pkg/release-rpm-check.sh boot $(printf %q "$d")" </dev/null || rc=1
+    vssh "bash ~/northnarrow/deploy/lab/pkg/release-rpm-check.sh remove $(printf %q "$d")" </dev/null || rc=1
+    vssh "sudo rm -rf $(printf %q "$d")" </dev/null || true
+    log "restoring the lab layout (nn-lab.sh install)"
+    cmd_install >/dev/null 2>&1 || { log "restore failed — run nn-lab.sh install"; rc=1; }
+    return "$rc"
+}
+# <<< rpm-release-check
+
 cmd_release_check() {
     # Tappa 10.8 demo — the SAME release tarball, built and attested by CI,
     # installed and verified on this guest (deploy/lab/release/release-check.sh):
@@ -1551,6 +1763,20 @@ cmd_verifier_check() {
         synced) obj_env='NN_VERIFIER_CHECK_OBJECT=$HOME/northnarrow/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf ' ;;
         *) die "verifier-check: unknown argument ${1} (expected: synced)" ;;
     esac
+    # Lot 1.10: `synced` loads the object the last `sync` sent, and the run
+    # checks that it is: the sha256 NN_LAB_EBPF_SHA256 names (the CI run's),
+    # else the one that sync recorded. The guest's copy is checked before
+    # anything is stopped, the report's own `object: … sha256` line after.
+    local want_sha=""
+    if [[ -n $obj_env ]]; then
+        want_sha=${NN_LAB_EBPF_SHA256:-$(cut -d' ' -f1 "$LAB_EBPF_SYNCED" 2>/dev/null || true)}
+        [[ -n $want_sha ]] || die "verifier-check synced: no sha256 to check the guest's object against (no NN_LAB_EBPF_SHA256 and no record of a sync in $LAB_EBPF_SYNCED: run sync first)"
+        [[ $want_sha =~ ^[0-9a-f]{64}$ ]] || die "NN_LAB_EBPF_SHA256 is not a sha256 (64 lowercase hex digits): $want_sha"
+        local there
+        there=$(vssh "sha256sum ~/northnarrow/$LAB_EBPF_REL/northnarrow-agent-ebpf" </dev/null | cut -d' ' -f1) || true
+        [[ $there == "$want_sha" ]] || die "verifier-check synced refused: the guest's object has sha256 ${there:-unknown}, not $want_sha (sync again); nothing loaded"
+        log "verifier-check synced: the guest's object is sha256 $want_sha"
+    fi
     local only=${NN_VERIFIER_CHECK_ONLY:-} budget=${NN_VERIFIER_CHECK_BUDGET:-}
     if vssh 'systemctl is-active --quiet northnarrow-agent'; then
         was_active=1
@@ -1575,6 +1801,16 @@ cmd_verifier_check() {
     if [[ $was_active == 1 ]]; then
         vssh 'sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog' \
             || { log "agent restart failed — run nn-lab.sh install"; rc=1; }
+    fi
+    if [[ -n $want_sha ]]; then
+        local loaded
+        loaded=$(sed -n 's/^object: .*, sha256 \([0-9a-f]\{64\}\), .*/\1/p' "$out" | head -1)
+        if [[ $loaded == "$want_sha" ]]; then
+            log "verifier-check synced: the report's object is sha256 $want_sha (as expected)"
+        else
+            log "ERROR: verifier-check synced: the report names object sha256 ${loaded:-none}, not $want_sha"
+            rc=1
+        fi
     fi
     log "verifier-check report: $out"
     return "$rc"
@@ -1986,6 +2222,23 @@ guest_down_or_die() {
         vm_running && die "stop the guest first (nn-lab.sh down)"
     fi
     return 0
+}
+
+# Lot 1.10: a guest's disk made bigger (`grow-disk +10G`, guest down). The
+# qcow2 overlay grows; the cloud images grow their root partition and file
+# system at the next boot (cloud-init growpart and resizefs, every boot).
+cmd_grow_disk() {
+    local size=${1:-}
+    [[ $size =~ ^\+[1-9][0-9]{0,2}G$ ]] || die "usage: nn-lab.sh grow-disk +<N>G (e.g. +10G; the guest powered off)"
+    guest_down_or_die
+    if [[ $ACCEL == whpx ]]; then
+        win "$(wslpath -u "$WIN_QEMU_IMG")" resize -q "$(whpx_dir_win)\\disk.qcow2" "$size" || die "qemu-img resize failed"
+        win "$(wslpath -u "$WIN_QEMU_IMG")" info "$(whpx_dir_win)\\disk.qcow2" | grep -i 'virtual size' >&2 || true
+    else
+        qemu-img resize -q "$DISK" "$size" || die "qemu-img resize failed"
+        qemu-img info "$DISK" | grep -i 'virtual size' >&2 || true
+    fi
+    log "$GUEST_NAME's disk grown by ${size#+}: the root file system follows at the next boot (nn-lab.sh up; check prints the space)"
 }
 
 cmd_snapshot() {
@@ -2613,6 +2866,7 @@ case "${1:-help}" in
     pkgmgr-check)  cmd_pkgmgr_check ;;
     pkg-check)     cmd_pkg_check ;;
     release-check) shift; cmd_release_check "$@" ;;
+    rpm-release-check) shift; cmd_rpm_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
     verifier-check) shift; cmd_verifier_check "$@" ;;
     btrfs-check)   cmd_btrfs_check ;;
@@ -2647,6 +2901,7 @@ case "${1:-help}" in
     trust-host-key) cmd_trust_host_key ;;
     down)          cmd_down ;;
     snapshot)      cmd_snapshot "${2:-}" ;;
+    grow-disk)     cmd_grow_disk "${2:-}" ;;
     restore)       cmd_restore "${2:-}" ;;
     destroy)       cmd_destroy ;;
     verify-image)  cmd_verify_image ;;

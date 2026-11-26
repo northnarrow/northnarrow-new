@@ -30,7 +30,7 @@ today's counts on a host.
 | Ubuntu 24.04 LTS | 6.8.0-142-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41 at the date shown, 0 drift) | 2026-10-09 |
 | Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets (at the date shown) resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
 | Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
-| AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-687 el9_8 | yes (default list includes `bpf`) | yes | **supported** — e2e agent 6/6, FIM 4/4, watchdog 4/4 with SELinux **enforcing** (no AVC denial); `--btf-check` = SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-10-10 (lab PR 20) |
+| AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-741.22.1 el9_9 (AlmaLinux 9.9) | yes (default list includes `bpf`; the lab template also sets `lsm=…,selinux,bpf` with `grubby`) | yes | **supported**, SELinux **enforcing**, re-verified by lot 1.10 (in the nightly since): `verifier-check` 128 of 130 OK, 2 not counted (no `bpf_override_return` on el9: optional), 0 failing, the highest `execmap_check` at 33.9% of the 900k gate, stack within 448; 28 of 28 deny hooks (el9 backports the ACL hooks), trust level L3, no degradation; privileged suites 179 passed and 5 failed in 165 suites: a canary test's daemon that SELinux kept from its fifo (the test fixed), R018 rating a staged-tree module load High where kmod loads the `.ko.xz` through `init_module` (an expected failure on this guest), and exec quarantine's stop leaving about a thousand processes of a burst stopped (a follow-up); these suites ran with the guest's earlier `lsm=` list, which lacked `landlock` (the template is fixed); with it, `nn-lab.sh rpm-release-check` passed: the release `.rpm` installed signed, upgraded in place, back after a cold boot, removed and purged with nothing left, 0 AVC denials. Earlier (2026-10-10, lab PR 20, 5.14.0-687): e2e agent 6/6, FIM 4/4, watchdog 4/4, `--btf-check` SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-11-26 (lot 1.10) |
 | Ubuntu 26.04 LTS | 7.0.0-38-generic | needs `lsm=…,bpf` (the lab template sets it) | yes | the hosted CI runners' release, with uutils coreutils (lab PR 229): `verifier-check` 77 of 77 OK, privileged suites 80 of 80 (the gate's `test-ignored`); `install.sh --upgrade` needed the immutable state directory unlocked before `install -d` (fixed); `malsim/exec-check.sh` passes except its two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su), which drew no record — a follow-up | 2026-10-22 (lab PR 229) |
 | Debian 13 (trixie) | 6.12 | `lsm=…,bpf` set by the lab template | yes | the first guest from 6.9: `inode_setattr`'s dentry is argument 1, read from the prototype (see "Kernels from 6.9" below); verified there: chmod, chown and touch of a protected file refused (allowed on `main`), the FIM setattr observer records; privileged suites 81 of 82 — DNS attribution fails on `main` too, the guest resolves through `nss-resolve` | 2026-10-16 (lab PR 164) |
 
@@ -163,13 +163,22 @@ To undo it: on Debian and Ubuntu, remove the drop-in (or put
 on the RHEL family, `grubby --update-kernel=ALL --remove-args="lsm=$new"`
 when there was no `lsm=` before, `--args="lsm=<previous list>"` otherwise.
 
-Status: written in lab PR 209 (external audit DEP-013), not yet run as
-written on a lab guest. The lab templates set the same kind of list
+Status: written in lab PR 209 (external audit DEP-013). Run as written on
+the RHEL family by lot 1.10, on AlmaLinux 9.9 (5.14.0-741.22.1 el9_9,
+SELinux enforcing): the guest given an `lsm=` list without `bpf`
+(`lockdown,capability,yama,integrity,selinux`) booted without `bpf` in its list; steps 1, 2 and 4 gave
+`$new=lockdown,capability,yama,integrity,selinux,bpf` with every running
+module kept and one value on every boot entry. `grubby --update-kernel=ALL`
+writes the same `lsm=` into `/etc/default/grub`'s `GRUB_CMDLINE_LINUX`
+itself there, so the `grep` of step 4 shows `$new`. After the reboot,
+step 5: the list ends with `bpf`, the `diff` shows only `> bpf`, and
+`getenforce` still says Enforcing. Not yet run as written on the Ubuntu
+24.04 and 22.04 guests. The lab templates set the same kind of list
 (`deploy/lab/user-data*.tmpl`: a grub drop-in on Ubuntu and Debian,
-`grubby` on AlmaLinux 9, SELinux enforcing). The check to run: the Ubuntu
-24.04 and 22.04 guests, and an AlmaLinux 9 guest given an `lsm=` without
-`bpf`; after the reboot the list keeps `apparmor` or `selinux` and adds
-`bpf`, and `getenforce` still says Enforcing.
+`grubby` on AlmaLinux 9, SELinux enforcing); el9's built-in list
+(`CONFIG_LSM`, `landlock,lockdown,yama,integrity,selinux,bpf` on 9.9)
+already ends with `bpf`, and since lot 1.10 the AlmaLinux template's list
+names `landlock` too (it was missing, so the guest ran without it).
 
 ## Computed matrix (`northnarrow-agent --btf-check <btf>`)
 
@@ -885,8 +894,10 @@ Lab notes for 22.04-era userland:
 - systemd 249 (22.04) knows `systemctl kill --kill-who=`, not the newer
   `--kill-whom=` spelling; the lab uses the old one, accepted by both.
 - RHEL-family sudo sets `HOME=/root` (`always_set_home`), so the root `cargo test`
-  of the lab's privileged suites resolves root's own rustup and downloads a
-  second toolchain on first use; harmless, just slow once.
+  of the lab's privileged suites resolved root's own rustup, downloaded a
+  second toolchain and rebuilt the workspace beside the lab user's build.
+  Since lot 1.10 nn-lab.sh names the lab user's `CARGO_HOME` and
+  `RUSTUP_HOME` for every cargo run in the guest, which `sudo -E` keeps.
 
 ## Verifier headroom (lot 332)
 
