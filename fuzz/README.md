@@ -48,8 +48,8 @@ at exit — WDG-R09).
   An executable or object file goes in text form (lot M3: OpenSSF
   Scorecard's Binary-Artifacts counts a committed one): a `.hex` file whose
   first line is `# nn-fuzz-seed hex`, then hex digit pairs (`#` to the end
-  of a line a comment), which the target decodes with
-  `fuzz_api::text_seed` and reads besides the text itself. The
+  of a line a comment), which the target reads both as it is and decoded
+  (`fuzz_api::raw_and_decoded`, through `fuzz_api::text_seed`). The
   `elf_audit` seeds are two ELF files in that form
   (`names-auditor.elf.hex`, `names-none.elf.hex`); `fuzz_api::tests`
   checks that they spell the files they replace (their sha256), and

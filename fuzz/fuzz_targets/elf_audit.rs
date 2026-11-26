@@ -10,7 +10,7 @@
 //! file). An input that is one is also read as the bytes it spells, the
 //! ELF files the seeds were (`fuzz_api::tests` checks their sha256).
 use libfuzzer_sys::fuzz_target;
-use northnarrow_agent::fuzz_api::{elf_audit_read, text_seed, ELF_AUDIT_READ_BOUND};
+use northnarrow_agent::fuzz_api::{elf_audit_read, raw_and_decoded, ELF_AUDIT_READ_BOUND};
 
 fn check(data: &[u8]) {
     let (found, most) = elf_audit_read(data);
@@ -20,9 +20,4 @@ fn check(data: &[u8]) {
     }
 }
 
-fuzz_target!(|data: &[u8]| {
-    check(data);
-    if let Some(bytes) = text_seed(data) {
-        check(&bytes);
-    }
-});
+fuzz_target!(|data: &[u8]| raw_and_decoded(data, check));

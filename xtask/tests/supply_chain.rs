@@ -2629,12 +2629,19 @@ fn no_lockfile_holds_a_yaml_reader_translated_from_c() {
             .collect::<Vec<_>>()
     };
     // the check, on main's Cargo.lock before lot M3
-    let before: std::collections::BTreeMap<String, Vec<String>> = [("serde_yaml_ng", "0.10.0"), ("unsafe-libyaml", "0.2.11"), ("serde", "1.0.229")]
-        .map(|(n, v)| (n.to_string(), vec![v.to_string()]))
-        .into();
+    let before: std::collections::BTreeMap<String, Vec<String>> = [
+        ("serde_yaml_ng", "0.10.0"),
+        ("unsafe-libyaml", "0.2.11"),
+        ("serde", "1.0.229"),
+    ]
+    .map(|(n, v)| (n.to_string(), vec![v.to_string()]))
+    .into();
     assert_eq!(
         found("Cargo.lock", &before),
-        ["Cargo.lock: unsafe-libyaml 0.2.11", "Cargo.lock: serde_yaml_ng 0.10.0"]
+        [
+            "Cargo.lock: unsafe-libyaml 0.2.11",
+            "Cargo.lock: serde_yaml_ng 0.10.0"
+        ]
     );
     let root = repo_root();
     let mut bad = Vec::new();
@@ -3299,17 +3306,29 @@ fn no_committed_file_is_an_executable_or_an_object_file() {
         ("x/lib.so", b"text".as_slice(), true),
         ("x/A.CLASS", b"text".as_slice(), true),
         ("x/seed.bin", b"\x7fELF\x02\x01\x01\0".as_slice(), true),
-        ("x/seed.bin", b"\xcf\xfa\xed\xfe\x07\0\0\x01".as_slice(), true),
+        (
+            "x/seed.bin",
+            b"\xcf\xfa\xed\xfe\x07\0\0\x01".as_slice(),
+            true,
+        ),
         ("x/seed.bin", b"\0asm\x01\0\0\0".as_slice(), true),
         ("x/seed.bin", b"!<arch>\ndebian-binary".as_slice(), true),
         ("x/seed.bin", pe.as_slice(), true),
         ("x/seed.bin", mz_text.as_slice(), false),
         ("x/seed.bin", b"MZ".as_slice(), false),
-        ("x/names-none.elf.hex", b"# nn-fuzz-seed hex\n7f454c46".as_slice(), false),
+        (
+            "x/names-none.elf.hex",
+            b"# nn-fuzz-seed hex\n7f454c46".as_slice(),
+            false,
+        ),
         ("x/ELF.md", b"ELF files".as_slice(), false),
         ("x/seed.bin", b"\x16\x03\x01\x02\0\x01".as_slice(), false),
     ] {
-        assert_eq!(binary_artifact(rel, head).is_some(), counted, "{rel} {head:?}");
+        assert_eq!(
+            binary_artifact(rel, head).is_some(),
+            counted,
+            "{rel} {head:?}"
+        );
     }
 
     let root = repo_root();
@@ -3339,8 +3358,9 @@ fn no_committed_file_is_an_executable_or_an_object_file() {
 
 /// Lot M3: a fuzz input in text form (`*.hex` under `fuzz/seeds/<target>/`
 /// or `fuzz/regressions/<target>/`) is one (`fuzz_api::text_seed`'s
-/// header first), and its target decodes it: libFuzzer gives the target
-/// the file as it is, and a target that does not decode it fuzzes text.
+/// header first), and its target decodes it (`fuzz_api::raw_and_decoded`):
+/// libFuzzer gives the target the file as it is, and a target that does
+/// not decode it fuzzes text.
 #[test]
 fn a_text_seed_is_decoded_by_its_target() {
     let root = repo_root();
@@ -3366,10 +3386,10 @@ fn a_text_seed_is_decoded_by_its_target() {
             }
             let src = read(&root.join(format!("fuzz/fuzz_targets/{target}.rs")));
             let code = support::strip_comments(&src);
-            if !code.contains("text_seed(data)") {
+            if !code.contains("raw_and_decoded(data,") {
                 bad.push(format!(
                     "fuzz/fuzz_targets/{target}.rs: does not decode its text inputs \
-                     (`text_seed(data)`)"
+                     (`fuzz_api::raw_and_decoded(data, …)`)"
                 ));
             }
             for p in texts {

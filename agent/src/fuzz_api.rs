@@ -83,6 +83,16 @@ pub fn text_seed(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What a target with seeds in text form checks: `data` as it is, and when
+/// it is a text seed ([`text_seed`]), the bytes it spells too.
+#[doc(hidden)]
+pub fn raw_and_decoded(data: &[u8], mut check: impl FnMut(&[u8])) {
+    check(data);
+    if let Some(bytes) = text_seed(data) {
+        check(&bytes);
+    }
+}
+
 /// Chain-log terminator line parser (JSON line → entry hash).
 #[doc(hidden)]
 pub fn chainlog_terminator_entry_hash(line: &str) -> Option<String> {
@@ -974,5 +984,23 @@ mod tests {
         }
         assert_eq!(text_seed(b"# nn-fuzz-seed hex\n\xff\xfe\n"), None);
         assert_eq!(text_seed(b"\x7fELF\x02\x01\x01\0"), None);
+    }
+
+    /// A target reads a text seed twice, as it is and decoded; any other
+    /// input once.
+    #[test]
+    fn a_target_reads_a_text_seed_as_given_and_decoded() {
+        let seen = |data: &[u8]| {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            raw_and_decoded(data, |b| out.push(b.to_vec()));
+            out
+        };
+        let text = b"# nn-fuzz-seed hex\n7f45 4c46\n";
+        assert_eq!(seen(text), [text.to_vec(), b"\x7fELF".to_vec()]);
+        assert_eq!(seen(b"\x7fELF"), [b"\x7fELF".to_vec()]);
+        assert_eq!(
+            seen(b"# nn-fuzz-seed hex\n7\n"),
+            [b"# nn-fuzz-seed hex\n7\n".to_vec()]
+        );
     }
 }

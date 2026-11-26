@@ -27,10 +27,23 @@ fn only_true_and_false_are_booleans() {
     assert_eq!(keys, [&Value::String("on".into())]);
     assert!(v.get("on").is_some_and(Value::is_mapping));
     for word in ["yes", "no", "on", "off", "y", "n", "Yes", "NO", "On", "OFF"] {
-        assert_eq!(parse(&format!("k: {word}\n"))["k"], Value::String(word.into()), "{word}");
+        assert_eq!(
+            parse(&format!("k: {word}\n"))["k"],
+            Value::String(word.into()),
+            "{word}"
+        );
     }
-    for (word, b) in [("true", true), ("True", true), ("TRUE", true), ("false", false)] {
-        assert_eq!(parse(&format!("k: {word}\n"))["k"], Value::Bool(b), "{word}");
+    for (word, b) in [
+        ("true", true),
+        ("True", true),
+        ("TRUE", true),
+        ("false", false),
+    ] {
+        assert_eq!(
+            parse(&format!("k: {word}\n"))["k"],
+            Value::Bool(b),
+            "{word}"
+        );
     }
 }
 
@@ -85,7 +98,10 @@ fn a_missing_key_or_index_is_null_and_a_mapping_can_be_changed() {
     assert_eq!(v["jobs"]["a"]["steps"][0], Value::String("x".into()));
     let jobs = v.get_mut("jobs").and_then(Value::as_mapping_mut).unwrap();
     assert_eq!(jobs.insert("b".into(), Value::Null), None);
-    assert_eq!(jobs.insert("a".into(), Value::Bool(true)), Some(parse("steps: [x]\n")));
+    assert_eq!(
+        jobs.insert("a".into(), Value::Bool(true)),
+        Some(parse("steps: [x]\n"))
+    );
     let keys: Vec<&str> = jobs.keys().map(|k| k.as_str().unwrap()).collect();
     assert_eq!(keys, ["a", "b"]);
 }
@@ -94,7 +110,10 @@ fn a_missing_key_or_index_is_null_and_a_mapping_can_be_changed() {
 /// literal block, its lines as they are; a long line not folded.
 #[test]
 fn a_node_written_back_keeps_each_line_whole() {
-    let long = format!("if: {}\n", "needs.a.result == 'success' && ".repeat(6) + "true");
+    let long = format!(
+        "if: {}\n",
+        "needs.a.result == 'success' && ".repeat(6) + "true"
+    );
     let text = format!("{long}run: |\n  sign.sh \"$fpr\" dist/SUMS\n  echo 'done'\n");
     let v = parse(&text);
     let back = yaml::to_string(&v).unwrap();
