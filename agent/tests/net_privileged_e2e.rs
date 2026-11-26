@@ -1500,4 +1500,21 @@ except Exception:
             mine(pid)
         );
     }
+    // Review of #629 (P2): a query seen with its answer lost leaves
+    // NN-L-NET-028 silent too, so the absence above does not prove the
+    // answer was read. The flow rows must say the address came from this
+    // client's own resolution.
+    for (how, pid) in [("recv", by_recv), ("recvfrom", by_recvfrom)] {
+        let rows = fx.wait_netflow_matching(1, |r| {
+            r["pid"].as_u64() == Some(pid)
+                && r["dst_addr"].as_str() == Some("198.51.100.212")
+                && r["dst_port"].as_u64() == Some(9)
+        });
+        assert!(
+            rows.iter()
+                .any(|r| r["dns_resolution"].as_str() == Some("lineage")),
+            "the connect after an answer read with {how} on a connected socket \
+             must be judged resolved by its own lineage: {rows:?}"
+        );
+    }
 }
