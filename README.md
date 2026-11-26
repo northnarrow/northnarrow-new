@@ -7,6 +7,8 @@
 **Sovereign endpoint defence for Linux.**<br/>
 Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic on the host · verified in a lab you can rerun.
 
+🆕 **Since the alpha:** Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors. [What's new →](#whats-new-since-the-alpha)
+
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/northnarrow/northnarrow-new/badge)](https://scorecard.dev/viewer/?uri=github.com/northnarrow/northnarrow-new)
@@ -15,6 +17,8 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
+[What's new](#whats-new-since-the-alpha) ·
+[Working on now](#working-on-now) ·
 [Today](#what-it-does-today-and-what-it-does-not) ·
 [Architecture](#architecture) ·
 [Defence in depth](#defence-in-depth) ·
