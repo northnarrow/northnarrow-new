@@ -1274,14 +1274,14 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
 /// (libtest skips a name it does not find in silence).
 #[test]
 fn the_ebpf_job_runs_the_check_cfg_tests_and_counts_them() {
-    let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+    let ci: support::yaml::Value = support::yaml::from_str(
         &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
     )
     .unwrap();
     let steps = ci["jobs"]["ebpf-build"]["steps"]
         .as_sequence()
         .expect("ci.yml has the ebpf-build job's steps");
-    let name = |s: &serde_yaml_ng::Value| s["name"].as_str().unwrap_or_default().to_string();
+    let name = |s: &support::yaml::Value| s["name"].as_str().unwrap_or_default().to_string();
     let built = steps
         .iter()
         .position(|s| name(s) == "cargo xtask build-ebpf")

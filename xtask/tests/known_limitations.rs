@@ -441,7 +441,7 @@ fn the_issue_forms_are_the_ones_the_guide_names() {
         ("detection_gap.yml", "Detection gap"),
     ] {
         let path = dir.join(file);
-        let form: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        let form: support::yaml::Value = support::yaml::from_str(
             &fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
         )
         .unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -462,8 +462,8 @@ fn the_issue_forms_are_the_ones_the_guide_names() {
             "the guide names the form {name}"
         );
     }
-    let config: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&read(&format!("{FORMS}/config.yml"))).unwrap();
+    let config: support::yaml::Value =
+        support::yaml::from_str(&read(&format!("{FORMS}/config.yml"))).unwrap();
     assert!(
         config["contact_links"]
             .as_sequence()
