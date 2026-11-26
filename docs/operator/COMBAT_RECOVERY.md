@@ -287,7 +287,7 @@ payload ships in the same release as the agent.
   only when both families are isolated, else `failure: …` — a family this
   host cannot isolate, e.g. without `ip6tables`, is named there as a hole). The stage reads ISOLATE only once IPv4 is isolated; an
   attempt that left a family not isolated is retried after 5 s, then 10 s —
-  three attempts per episode — each one signed. `nn-admin audit read --key …
+  three attempts per episode — each one signed. `nn-admin audit read --json
   | grep combat_outcome` lists them.
 - **NEUTRALIZE** handles every offender — one it cannot contain no longer
   stops the kill of the others — and signs one `combat_outcome` row (`stage`
