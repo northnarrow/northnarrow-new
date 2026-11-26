@@ -23,7 +23,7 @@
 //! - a merge key (`<<`) refuses the file: serde_yaml_ng kept it as an
 //!   ordinary key, a tree no runner reads; no committed file has one.
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use std::fmt;
 use std::ops;
@@ -383,10 +383,8 @@ impl<'de> Deserialize<'de> for Value {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
                 let mut m = Mapping::new();
+                // a key given twice is refused before (`options`)
                 while let Some((k, v)) = a.next_entry::<Value, Value>()? {
-                    if m.contains_key(&k) {
-                        return Err(de::Error::custom(format!("duplicate key {k:?}")));
-                    }
                     m.insert(k, v);
                 }
                 Ok(Value::Mapping(m))
