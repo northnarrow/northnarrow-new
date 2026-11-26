@@ -1712,11 +1712,12 @@ fn every_dated_nightly_is_its_jobs_channel() {
 /// stamp and that sha256 (artefact `ebpf-object`), the one CI tested.
 /// release.yml's package job rebuilds the object and prints the sha256 of
 /// the one it embeds, and lab-vm.yml's guest job keeps the sha256 of the
-/// one its guest loads in its evidence. The lab does not load the
-/// artefact: `nn-lab.sh sync` rebuilds the object on the host and
-/// `verifier-check synced` loads the guest's synced copy (its report names
-/// the sha256). Loading the artefact there and checking its sha256 is lot
-/// 1.10's. All three build it alike: the nightly is one channel
+/// one its guest loads in its evidence. Lot 1.10: the lab loads the
+/// artefact (`NN_LAB_EBPF_ARTIFACT` with the run's `NN_LAB_EBPF_SHA256`:
+/// `nn-lab.sh sync` checks it and builds nothing, `verifier-check synced`
+/// checks the guest's copy and the report's sha256), and lab-vm.yml's
+/// `sync` sends its host build's object the same way
+/// (`lab_ci.rs::lab_vm_syncs_the_object_its_evidence_names`). All three build it alike: the nightly is one channel
 /// (`every_dated_nightly_is_its_jobs_channel`), and every `cargo install
 /// bpf-linker` of the workflows pins one version, the one xtask's and the
 /// lab's hints name. The gap, documented in release.yml: the release

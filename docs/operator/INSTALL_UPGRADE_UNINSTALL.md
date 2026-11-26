@@ -1776,10 +1776,24 @@ of kind `unit_shadowed`, `systemctl mask` included.
 ## 6. Distribution packages (`.deb` / `.rpm`)
 
 The `.deb` is tested in our lab (Ubuntu 24.04, Debian 13: install, remove
-and purge). The `.rpm` is built and signed by the release workflow, and
-its signature checked by a self-test there, but it has **not been tested in
-our lab** yet: there is no Fedora or RHEL-family guest. Prefer the tarball
-on those distributions for the alpha, and report what you see.
+and purge). The `.rpm` is built and signed by the release workflow, its
+signature checked by a self-test there, and since lot 1.10 tested in our
+lab on AlmaLinux 9.9 (5.14.0-741 el9_9, SELinux enforcing; 2026-11-26).
+The signed `v0.1.0-alpha` package was checked against the published key
+(§6.1: `rpm -K` "digests signatures OK", an altered copy refused) and
+installed with `dnf --setopt=localpkg_gpgcheck=1`; nothing started until
+the units were enabled, then both ran. A later build of the same version
+was installed over it with `rpm -U --replacepkgs` (the same
+version-release until the next release): refused without `NN_GRANT_KEY`,
+with it the units were restarted, the `%posttrans` health check passed,
+the keys and `agent_id` were kept and the binaries checked against the
+package manifest. Both units came back after a cold boot. `rpm -e` was
+refused without the key and, with it, stopped and detached everything and
+kept `/etc/northnarrow`; `uninstall.sh --package --purge` then left no file,
+unit, pin, BPF program, nft table or iptables chain of NorthNarrow's. No
+SELinux denial was logged. Not tested yet: Fedora, Rocky and RHEL itself,
+an upgrade between two released versions, and the attestation check on
+the host (§5). Report what you see on those.
 
 The packages install the package layout: binaries in `/usr/bin`, units in
 `/usr/lib/systemd/system`, and in `/usr/share/northnarrow` the data tree

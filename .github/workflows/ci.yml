@@ -353,14 +353,15 @@ jobs:
       # ebpf-object`), so every other build of it can be compared with the
       # one CI tested. What happens today: release.yml rebuilds the object
       # and prints the sha256 of the one it embeds (on lot 1.2's dry run it
-      # was this artefact's, byte for byte). The lab rebuilds too:
-      # `nn-lab.sh sync` builds the object on the host before it copies it
-      # to the guest, `verifier-check synced` loads that copy, and the
-      # report and lab-vm.yml's evidence record its sha256. Nothing loads
-      # this artefact in the lab or checks its sha256 where it is used: that
-      # is lot 1.10's (nn-lab.sh, lab-vm.yml). Same pins, same checkout
-      # path: the build is reproducible (two clean builds of a tree give one
-      # sha256).
+      # was this artefact's, byte for byte). The lab loads this artefact
+      # (lot 1.10): `NN_LAB_EBPF_ARTIFACT=<download dir>
+      # NN_LAB_EBPF_SHA256=<the sha256 below, from this run's summary>
+      # nn-lab.sh sync` checks it and builds nothing, and `verifier-check
+      # synced` checks the guest's copy and its report against the same
+      # sha256 (docs/integration-test-runbook.md). lab-vm.yml sends its own
+      # host build through that check: it holds no token that reads this
+      # run's artefacts. Same pins, same checkout path: the build is
+      # reproducible (two clean builds of a tree give one sha256).
       - name: eBPF object sha256
         run: |
           cd agent-ebpf/target/bpfel-unknown-none/release

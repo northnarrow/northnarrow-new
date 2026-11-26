@@ -96,8 +96,8 @@ Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#
   and the foreign BPF programs that could blind it;
 - keeps its evidence on the host: no telemetry to the vendor, no phone-home; an export to your
   own SIEM only when you sign an overlay for it ([`EXPORT.md`](docs/operator/EXPORT.md));
-- installs, upgrades with rollback and uninstalls cleanly, from a tarball or a `.deb`
-  (the `.rpm` is built and signed, but not yet tested in our lab), checked against the release's signed checksums and build provenance.
+- installs, upgrades with rollback and uninstalls cleanly, from a tarball, a `.deb` or an `.rpm`
+  (the `.rpm` tested in our lab on AlmaLinux 9 only), checked against the release's signed checksums and build provenance.
 
 **What it does not do today:**
 
@@ -270,7 +270,7 @@ against it on every `cargo test` by
 |---|---|---|
 | Rules | **95** rules the agent can record: 87 in the engine, 8 issued outside it (anti-tamper, exploit guard, exec policy and its environment checks, exec quarantine). Strongest test per rule: an end-to-end test or a lab script for 35, unit tests only for 55, no proof yet for 5 (the experimental exec-policy and quarantine records) | [`RULE_CATALOGUE.md`](docs/detection/RULE_CATALOGUE.md) |
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
-| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2). The eBPF object holds **130** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 124 of the latest pre-alpha release candidate (November 2026), the mount guard's six included, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
+| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2), 28 on AlmaLinux 9's 5.14 el9, which backports them. The eBPF object holds **130** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 124 of the latest pre-alpha release candidate (November 2026), the mount guard's six included, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
 | Host tests | more than **6,500** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
 | Privileged suites | run as root in 5 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 22 Nov 2026: 7 of 16 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
@@ -298,7 +298,7 @@ kernel, and a weekly CI job recomputes the matrix over BTFHub.
 | Ubuntu 24.04 LTS | 6.8 | 255 | supported | every night and on PRs | 28 |
 | Debian 13 | 6.12 | 257 | verified in the lab | every night | 28 |
 | Ubuntu 26.04 LTS | 7.0 | 259 | verified in the lab | every night | 28 |
-| AlmaLinux 9 | 5.14 (el9) | — | supported with SELinux enforcing; **not re-verified since Wave 4** | self-hosted lab only | not measured since |
+| AlmaLinux 9 | 5.14 (el9) | 252 | supported with SELinux enforcing; re-verified 2026-11-26 (lot 1.10), the `.rpm` too | every night | 28 |
 
 The full matrix, with its prerequisites, is in
 [`KERNEL_COMPATIBILITY.md`](docs/operator/KERNEL_COMPATIBILITY.md). Without the `bpf` LSM in the

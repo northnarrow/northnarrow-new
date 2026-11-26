@@ -11,9 +11,13 @@
 #   - dnf package names (`iptables-nft` provides iptables, `bpftool` is a
 #     separate package, no build-essential meta-package);
 #   - the kernel command line is edited with grubby, not grub.d;
-#   - the el9 default LSM list is lockdown,yama,integrity,selinux,bpf —
-#     `bpf` is already there, the explicit lsm= line keeps the guest equal
-#     to the documented production prerequisite;
+#   - el9's built-in LSM list (CONFIG_LSM, landlock,lockdown,yama,
+#     integrity,selinux,bpf on 9.9) already ends in `bpf`; the explicit
+#     lsm= line keeps the guest equal to the documented production
+#     prerequisite and names every module of that list. Lot 1.10: it had
+#     no `landlock`, so the guest ran without the Landlock LSM an
+#     AlmaLinux host without an lsm= runs (KERNEL_COMPATIBILITY.md: never
+#     write a list that drops a module);
 #   - SELinux stays ENFORCING on purpose: a RHEL-family host runs it, and
 #     the lab must surface what it denies (bpffs, /etc/northnarrow,
 #     the hardened units) instead of hiding it.
@@ -60,7 +64,7 @@ packages:
   - e2fsprogs
   - policycoreutils-python-utils
 runcmd:
-  - grubby --update-kernel=ALL --args="lsm=lockdown,capability,yama,integrity,selinux,bpf__NN_LAB_KARGS__"
+  - grubby --update-kernel=ALL --args="lsm=lockdown,capability,landlock,yama,integrity,selinux,bpf__NN_LAB_KARGS__"
   # rustup (stable, minimal) for the guest-side userland build. External
   # audit LAB-009: no `curl | sh`; a pinned rustup-init is checked against
   # its pinned SHA-256 before it runs (rustup then checks each toolchain
