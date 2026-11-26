@@ -15125,3 +15125,43 @@ number in parentheses is a lab PR.
       then starts clean (a new generation, 55 LSM programs), and the
       package purge leaves nothing. No operator action is needed, so
       there is no UPGRADE note.
+- **Lot M2 — the OpenSSF Scorecard workflow and its badge (CI and docs
+  only; no product file changes, no level change).**
+  - What changed: `.github/workflows/scorecard.yml` is scorecard-action's
+    example for a public repository (v2.6.0), with `workflow_dispatch`
+    added and the repository's pins (checkout v7.0.1, upload-artifact
+    v7.0.2, upload-sarif v4.39.2, scorecard-action v2.6.0, each by commit
+    SHA). It runs on every push to `main`, weekly, on a branch protection
+    rule change and on demand, from the default branch only. The top level
+    holds no permission (`{}`, stricter than the `read-all` of older
+    templates); its one job, `analysis`, holds `security-events: write`
+    (the SARIF to code scanning) and `id-token: write` (the signature of
+    the result published to api.scorecard.dev, which serves the README's
+    badge), runs no `run:` step and builds nothing of the tree.
+  - The ratchets: `every_workflow_token_is_read_only_unless_it_publishes`
+    lists the two scopes for scorecard.yml's `analysis` by name, and
+    allows the scanner and the artifact upload in that job alone besides
+    the upload-only actions (`token_problems`, now a function).
+    `the_token_check_keeps_the_scorecard_grants_to_its_job` plants the job
+    under another workflow's name, a second job with its permissions, a
+    `run:` step, another action, the scanner in codeql.yml's `upload`, and
+    a top level of `read-all`, `write-all` or `id-token: write`: each is
+    refused. `scorecard_publishes_from_one_job_that_runs_only_its_scanner`
+    holds the workflow to the rules the Scorecard API checks before it
+    accepts a published result (no top-level env or defaults, one job, no
+    env, defaults, container or services, a hosted Ubuntu runner, the four
+    approved actions in order, `publish_results` and
+    `fail_on_publish_error` on, and the example's `cache-mode: none`);
+    `the_scorecard_check_refuses_each_broken_rule` breaks each rule in a
+    copy and sees it reported. `every_action_is_pinned_alike_in_every_workflow`
+    (new) holds every action at one `<sha> # <version>` across the
+    workflows, so scorecard.yml's upload-sarif moves with codeql.yml's.
+  - Mutations of the new checks: 33 of 34 caught by a named test. The
+    survivor, the Scorecard check reading another job when `analysis` is
+    missing, still reports the missing job: equivalent.
+  - Docs: the README's badge; SECURITY.md says what Scorecard checks and
+    where its results are. The CHANGELOG is unchanged: its first section
+    stays `0.1.0-alpha` until the next tag (`verify-release-tag.sh`).
+  - Host: the full gates; `verify-release-tag.sh version v0.1.0-alpha`
+    passes. The workflow first runs on `main`, after the merge (its push
+    trigger). No lab round: nothing of the agent changed.
