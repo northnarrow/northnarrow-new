@@ -15165,3 +15165,47 @@ number in parentheses is a lab PR.
   - Host: the full gates; `verify-release-tag.sh version v0.1.0-alpha`
     passes. The workflow first runs on `main`, after the merge (its push
     trigger). No lab round: nothing of the agent changed.
+- **Lot M5 — a DNS response read before its query answers it
+  (NN-L-NET-028; maintenance, no level change).**
+  - What was wrong: the queries and the responses come on two rings, read
+    by two pumps of the agent in no order between them.
+    `ResolvedTable::on_answer` marked as answered only the receiver's asks
+    already read; a response read ahead of its query left the question
+    "asked, never answered" for `UNSEEN_WINDOW_SECS` (300 s), and every
+    later connect of the process to an address no response named was
+    `Unknown` (no record) instead of `Unresolved` (`Medium`). The 6.8 CI
+    run of PR #630 failed `net_a_name_resolved_on_a_connected_socket_is_seen`
+    that way (the `recvfrom` client); the sensor had seen the response.
+  - The fix: the table keeps, per process, the names of the whole
+    responses it received itself (`ANSWERS_PER_PID`, 64, bounded with the
+    asks by the same pid LRU); an ask read later is answered by one at or
+    after it, the rule `on_answer` applies when the query comes first.
+  - Tests (nn-core, both fail on `main`): `a_response_read_before_its_query_answers_it`
+    (a child of the asker; case and trailing dot; an incomplete
+    response, another process's, another name's answer nothing; a CNAME
+    target asked on its own; the name asked again after the response
+    stays unanswered) and `the_judgements_do_not_depend_on_the_order_the_two_pumps_read`
+    (9 scenarios, every interleaving that keeps each pump's own order: the
+    same, expected judgements); `the_tables_are_bounded` covers the kept
+    responses. Mutations of the new code: 9 of 9 caught by a named test.
+  - Lab: On `ubuntu2404` (6.8.0-151), 20 runs of `nn-lab.sh test-one
+    net_privileged_e2e` each. `main` 0af0e221 with a trace-only probe in
+    the table (never committed): 4 of 20 runs failed — once this test (its
+    `recv` client), three times its sibling
+    `net_connect_without_dns_is_recorded_and_a_resolved_one_is_not` (line
+    1460, the same `.214` connect) —; in 8 of the 100 lookups the response
+    was read 56 to 1,318 µs before its query, and each of the 4 in a test
+    with that assertion was a failure (`Unknown` on `.214`), the other 4
+    in tests without one (the median of the 100: the query read 0.18 ms
+    first). The fix: 20 of 20 runs passed (11 of 11 tests).
+    A guest-only delay of the query pump (30 ms for the tests' names, so
+    the response is read first every time): the fix passed 2 of 2, `main`'s
+    table failed both tests in 2 of 2. The mutant that drops every
+    response before the table fails both at their `.214` assertions (in
+    that run `net_tls_client_hello_fingerprint_on_the_flow_row` failed
+    too, once: no JA3 on the client's flow row — not seen in the 44 other
+    runs, and the mutant does not touch the TLS path). On
+    `ubuntu2204` (5.15.0-204), the fix: 5 of 5 runs passed (11 of 11
+    tests).
+  - Docs: NETWORK_TELEMETRY.md §4. The CHANGELOG is unchanged (its first
+    section stays `0.1.0-alpha` until the next tag).

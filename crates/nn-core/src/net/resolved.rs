@@ -86,6 +86,9 @@ pub const MAX_BINDINGS: usize = 131_072;
 pub const MAX_ASKS: usize = 16_384;
 /// Recent names kept per process for the unseen-response test.
 const ASKS_PER_PID: usize = 64;
+/// Lot M5: names of the whole responses a process received itself, kept
+/// for its asks the query pump reads after them.
+const ANSWERS_PER_PID: usize = 64;
 const MAX_ASKING_PIDS: usize = 4096;
 const MAX_HELD_PIDS: usize = 4096;
 
@@ -349,6 +352,13 @@ struct Inner {
     /// unseen-response test: `answered` when a whole response the process
     /// received itself answered it (a resolver's answers a name host-wide).
     asks: HashMap<u32, VecDeque<(String, u64, bool)>>,
+    /// Lot M5: pid → the whole responses it received itself, `(name, ts)`
+    /// for each name of the question's chain. The queries and the
+    /// responses come on two rings, read by two pumps in no order between
+    /// them: an ask read after the response that answered it is answered
+    /// all the same (`ResolvedTable::ask`).
+    answers: HashMap<u32, VecDeque<(String, u64)>>,
+    /// The pids of `asks` and `answers`, oldest first.
     asking_order: LazyLru<u32>,
     /// pid → the last time the kernel held one of its DNS records back.
     held: HashMap<u32, u64>,
@@ -666,25 +676,58 @@ impl<I: Default> ResolvedTable<I> {
                     }
                 }
             }
+            // lot M5: and those the query pump reads after it
+            Self::answered(&mut g, a.pid, &chain, a.ts_ns);
         } else {
             Self::ask(&mut g, a.pid, &qname, a.ts_ns);
         }
         Self::bound(&mut g, a.ts_ns);
     }
 
-    /// `pid`'s ask of `n` at `ts_ns`, unanswered, in its recent names.
+    /// `pid`'s ask of `n` at `ts_ns`, in its recent names: unanswered,
+    /// unless a whole response the process received at or after it, for a
+    /// name of whose chain `n` is, was read first (lot M5: the query and
+    /// response pumps read their rings in no order between them — the
+    /// ask is answered as when the query is read first, [`Self::on_answer`]).
     fn ask(g: &mut Inner, pid: u32, n: &str, ts_ns: u64) {
+        let answered = g
+            .answers
+            .get(&pid)
+            .is_some_and(|r| r.iter().any(|(m, t)| m == n && *t >= ts_ns));
         {
             let q = g.asks.entry(pid).or_default();
-            q.push_back((n.to_string(), ts_ns, false));
+            q.push_back((n.to_string(), ts_ns, answered));
             while q.len() > ASKS_PER_PID {
                 q.pop_front();
             }
         }
+        Self::touch_asking(g, pid);
+    }
+
+    /// Lot M5: `pid` received a whole response at `ts_ns` answering the
+    /// names of `chain` (its question's, through its CNAMEs): kept for its
+    /// asks read later ([`Self::ask`]).
+    fn answered(g: &mut Inner, pid: u32, chain: &[String], ts_ns: u64) {
+        {
+            let r = g.answers.entry(pid).or_default();
+            for n in chain {
+                r.push_back((n.clone(), ts_ns));
+            }
+            while r.len() > ANSWERS_PER_PID {
+                r.pop_front();
+            }
+        }
+        Self::touch_asking(g, pid);
+    }
+
+    /// `pid`'s asks or answers changed: the pids past [`MAX_ASKING_PIDS`]
+    /// go, the oldest first.
+    fn touch_asking(g: &mut Inner, pid: u32) {
         g.asking_order.touch(pid);
         while g.asking_order.len() > MAX_ASKING_PIDS {
             if let Some(old) = g.asking_order.pop_oldest() {
                 g.asks.remove(&old);
+                g.answers.remove(&old);
                 g.counters.evicted += 1;
             }
         }
@@ -1239,6 +1282,311 @@ mod tests {
         );
     }
 
+    /// Lot M5: the queries and the responses come on two rings, read by two
+    /// pumps in no order between them. A whole response the process
+    /// received itself, read before the query it answered, answers it all
+    /// the same: the process's connect to an address no response named is
+    /// unresolved, as when the query is read first — it was unknown (the
+    /// 6.8 CI run of `net_a_name_resolved_on_a_connected_socket_is_seen`:
+    /// the connect to the unnamed address drew no NN-L-NET-028 record).
+    #[test]
+    fn a_response_read_before_its_query_answers_it() {
+        let own = |t: &Table, pid: u32, ts: u64, name: &str, complete: bool| {
+            answer_as(t, pid, ts, name, &[a(name, 60, WEB)], complete, false)
+        };
+        let t = Table::new();
+        own(&t, 42, T0 + 1, "self.example", true);
+        t.on_query(42, "self.example", T0);
+        assert_eq!(t.check(42, 1, WEB, T0 + SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+        // ... and for a child of it (its lineage)
+        let parent = || vec![(42, 1)];
+        assert_eq!(
+            t.check(77, 1, WEB, T0 + SEC, parent),
+            DnsResolution::Lineage
+        );
+        assert_eq!(
+            t.check(77, 1, C2, T0 + SEC, parent),
+            DnsResolution::Unresolved
+        );
+        // the same name asked again after that response, its own unseen:
+        // unanswered
+        t.on_query(42, "self.example", T0 + 2);
+        assert_eq!(t.check(42, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
+        // the name's case and trailing dot are the same name
+        let t = Table::new();
+        own(&t, 42, T0 + 1, "Self.Example.", true);
+        t.on_query(42, "self.example", T0);
+        assert_eq!(
+            t.check(42, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+        // an incomplete response read first answers nothing (D1)
+        let t = Table::new();
+        own(&t, 43, T0 + 1, "cut.example", false);
+        t.on_query(43, "cut.example", T0);
+        assert_eq!(t.check(43, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
+        // another process's response answers nothing of this one's asks
+        let t = Table::new();
+        own(&t, 44, T0 + 1, "self.example", true);
+        t.on_query(45, "self.example", T0);
+        assert_eq!(t.check(45, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
+        // nor does another name's
+        let t = Table::new();
+        own(&t, 46, T0 + 1, "other.example", true);
+        t.on_query(46, "self.example", T0);
+        assert_eq!(t.check(46, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
+        // a target of the response's CNAME chain, asked on its own
+        let t = Table::new();
+        let recs = [
+            Record::Cname {
+                name: "alias.example".into(),
+                ttl: 60,
+                target: "edge.example".into(),
+            },
+            a("edge.example", 60, WEB),
+        ];
+        answer_as(&t, 47, T0 + 1, "alias.example", &recs, true, false);
+        t.on_query(47, "edge.example", T0);
+        assert_eq!(
+            t.check(47, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+    }
+
+    /// Lot M5, structural: every interleaving of a scenario's queries and
+    /// responses that keeps each pump's own order (the query pump reads
+    /// the queries in their order, the response pump the responses in
+    /// theirs) gives the same judgements, the expected ones.
+    #[test]
+    fn the_judgements_do_not_depend_on_the_order_the_two_pumps_read() {
+        type Ans = (u32, u64, &'static str, Vec<Record>, bool, bool);
+        struct Scenario {
+            what: &'static str,
+            queries: Vec<(u32, &'static str, u64)>,
+            answers: Vec<Ans>,
+            checks: Vec<(u32, IpAddr, DnsResolution)>,
+        }
+        let cname = |from: &str, to: &str| Record::Cname {
+            name: from.into(),
+            ttl: 60,
+            target: to.into(),
+        };
+        let scenarios = [
+            Scenario {
+                what: "a query and the process's own response",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![(
+                    42,
+                    T0 + 1,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    true,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                ],
+            },
+            Scenario {
+                what: "a response timed in the query's nanosecond",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![(
+                    42,
+                    T0,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    true,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                ],
+            },
+            Scenario {
+                what: "A and AAAA asked together, answered in turn",
+                queries: vec![(42, "own.example", T0), (42, "own.example", T0 + 1)],
+                answers: vec![
+                    (
+                        42,
+                        T0 + 2,
+                        "own.example",
+                        vec![a("own.example", 60, WEB)],
+                        true,
+                        false,
+                    ),
+                    (42, T0 + 3, "own.example", vec![], true, false),
+                ],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                ],
+            },
+            Scenario {
+                what: "a response cut, then a whole one",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![
+                    (
+                        42,
+                        T0 + 1,
+                        "own.example",
+                        vec![a("own.example", 60, WEB)],
+                        false,
+                        false,
+                    ),
+                    (
+                        42,
+                        T0 + 2,
+                        "own.example",
+                        vec![a("own.example", 60, WEB)],
+                        true,
+                        false,
+                    ),
+                ],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                ],
+            },
+            Scenario {
+                what: "a response cut only",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![(
+                    42,
+                    T0 + 1,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    false,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unknown),
+                ],
+            },
+            Scenario {
+                what: "a CNAME chain, its target asked too",
+                queries: vec![(42, "alias.example", T0), (42, "edge.example", T0 + 1)],
+                answers: vec![(
+                    42,
+                    T0 + 2,
+                    "alias.example",
+                    vec![
+                        cname("alias.example", "edge.example"),
+                        a("edge.example", 60, WEB),
+                    ],
+                    true,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                ],
+            },
+            Scenario {
+                what: "asked again after the response, its own unseen",
+                queries: vec![(42, "own.example", T0), (42, "own.example", T0 + 2)],
+                answers: vec![(
+                    42,
+                    T0 + 1,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    true,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unknown),
+                ],
+            },
+            Scenario {
+                what: "a resolver's response, an application's ask",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![(
+                    500,
+                    T0 + 1,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    true,
+                    true,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Lineage),
+                    (42, C2, DnsResolution::Unresolved),
+                    (43, WEB, DnsResolution::OtherLineage),
+                ],
+            },
+            Scenario {
+                what: "another process's response",
+                queries: vec![(42, "own.example", T0)],
+                answers: vec![(
+                    43,
+                    T0 + 1,
+                    "own.example",
+                    vec![a("own.example", 60, WEB)],
+                    true,
+                    false,
+                )],
+                checks: vec![
+                    (42, WEB, DnsResolution::Unknown),
+                    (43, WEB, DnsResolution::Lineage),
+                    (43, C2, DnsResolution::Unresolved),
+                ],
+            },
+        ];
+        /// Every merge of `q` queries and `r` responses, each kept in order
+        /// (`true`: the next query).
+        fn merges(q: usize, r: usize) -> Vec<Vec<bool>> {
+            if q == 0 || r == 0 {
+                return vec![
+                    std::iter::repeat_n(true, q)
+                        .chain(std::iter::repeat_n(false, r))
+                        .collect(),
+                ];
+            }
+            let mut out = Vec::new();
+            for (first, rest) in [(true, merges(q - 1, r)), (false, merges(q, r - 1))] {
+                for mut m in rest {
+                    m.insert(0, first);
+                    out.push(m);
+                }
+            }
+            out
+        }
+        for s in &scenarios {
+            let orders = merges(s.queries.len(), s.answers.len());
+            assert!(orders.len() > 1, "{}", s.what);
+            for order in orders {
+                let t = Table::new();
+                let (mut qi, mut ai) = (0, 0);
+                for query_next in &order {
+                    if *query_next {
+                        let (pid, name, ts) = s.queries[qi];
+                        t.on_query(pid, name, ts);
+                        qi += 1;
+                    } else {
+                        let (pid, ts, qname, ref recs, complete, resolver) = s.answers[ai];
+                        answer_as(&t, pid, ts, qname, recs, complete, resolver);
+                        ai += 1;
+                    }
+                }
+                for (pid, addr, want) in &s.checks {
+                    assert_eq!(
+                        t.check(*pid, 1, *addr, T0 + SEC, none),
+                        *want,
+                        "{}: pid {pid} to {addr}, read in the order {order:?} (true: a query)",
+                        s.what
+                    );
+                }
+            }
+        }
+    }
+
     /// A record the pumps could not decode (the parse worker down): what
     /// no binding covers is unknown for a while, for every process.
     #[test]
@@ -1320,11 +1668,25 @@ mod tests {
         assert!(b <= MAX_BINDINGS, "{b}");
         assert!(ad <= MAX_ADDRS, "{ad}");
         assert!(t.counters().evicted > 0);
+        // lot M5: the whole responses kept for the asks read after them,
+        // per process
+        assert!(
+            t.inner
+                .lock()
+                .answers
+                .values()
+                .all(|r| r.len() <= ANSWERS_PER_PID)
+        );
         for i in 0..(MAX_ASKS + 100) {
             t.on_query(i as u32, &format!("q{i}.example"), T0);
         }
         assert!(t.inner.lock().askers.len() <= MAX_ASKS);
         assert!(t.inner.lock().asks.len() <= MAX_ASKING_PIDS);
+        // ... and the processes they are kept for
+        for i in 0..(MAX_ASKING_PIDS as u32 + 100) {
+            answer_as(&t, 100_000 + i, T0, "r.example", &[], true, false);
+        }
+        assert!(t.inner.lock().answers.len() <= MAX_ASKING_PIDS);
     }
 
     #[test]
