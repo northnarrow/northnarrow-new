@@ -1390,3 +1390,114 @@ except Exception:
         mine(resolved_pid)
     );
 }
+
+/// Lot 1.4 (plan S1, F8): the DNS response program's port filter leaves a
+/// socket CONNECTED to port 53 alone — glibc's resolver connects its UDP
+/// socket, then `send`s and `recv`s. Two clients resolve on a socket
+/// connected to the test's server (127.0.0.2:53), one reading the answer
+/// with `recv` (no address: the source is the socket's peer), one with
+/// `recvfrom` (the datagram's address), and each connects to the address it
+/// read: neither connect is NN-L-NET-028's. A literal connect after them is
+/// (the pump has judged theirs by then).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_a_name_resolved_on_a_connected_socket_is_seen() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+    let server = std::net::UdpSocket::bind("127.0.0.2:53").expect("bind 127.0.0.2:53");
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // one response for each of the two clients' queries
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        for _ in 0..2 {
+            if let Ok((n, from)) = server.recv_from(&mut buf) {
+                if n > 12 {
+                    let _ = server.send_to(&dns_response(&buf[..n], [198, 51, 100, 212]), from);
+                }
+            }
+        }
+    });
+    let client = |read: &str| -> u64 {
+        let script = format!(
+            r#"
+import os, socket, struct
+q = struct.pack(">HHHHHH", 0x4e43, 0x0100, 1, 0, 0, 0)
+q += b"\x09connected\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+u.connect(("127.0.0.2", 53))
+u.send(q)
+a = {read}
+ip = ".".join(str(b) for b in a[-4:])
+print(os.getpid(), ip, flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect((ip, 9))
+except Exception:
+    pass
+"#
+        );
+        let out = Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("spawn a connected client");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut parts = text.split_whitespace();
+        let pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
+        assert_eq!(
+            parts.next(),
+            Some("198.51.100.212"),
+            "the answer read: {text}"
+        );
+        pid
+    };
+    let by_recv = client("u.recv(512)");
+    let by_recvfrom = client("u.recvfrom(512)[0]");
+    let _ = server_thread.join();
+    let literal = r#"
+import os, socket
+print(os.getpid(), flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("198.51.100.213", 9))
+except Exception:
+    pass
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(literal)
+        .output()
+        .expect("spawn the literal client");
+    let literal_pid: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("its pid");
+    let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
+    let mine = |pid: u64| -> Vec<serde_json::Value> {
+        common::records_of(&fx.detections_log, NET_028)
+            .into_iter()
+            .filter(|r| r["principal"]["pid"].as_u64() == Some(pid))
+            .collect()
+    };
+    while mine(literal_pid).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert_eq!(
+        mine(literal_pid).len(),
+        1,
+        "the literal connect's NN-L-NET-028 record"
+    );
+    for (how, pid) in [("recv", by_recv), ("recvfrom", by_recvfrom)] {
+        assert!(
+            mine(pid).is_empty(),
+            "the connect after an answer read with {how} on a connected socket drew \
+             NN-L-NET-028 (the answer unseen): {:?}",
+            mine(pid)
+        );
+    }
+}

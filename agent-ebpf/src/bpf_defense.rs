@@ -1743,8 +1743,17 @@ pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64, kfuncs_only: u6
     SCAN_CLEAN
 }
 
+/// Lot 1.4b (stack): the body inline in the program the macro makes. The
+/// macro's inner function, called through a 32-byte frame of its own, put
+/// the deepest chain (into [`nn_held_slot`] → [`nn_held_use`] →
+/// [`nn_in_role_unit`]) at 480 of the verifier's 512 bytes; inline, 448.
 #[lsm(hook = "bpf")]
+#[inline(always)]
 pub fn bpf_syscall_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `try_bpf_syscall_observe` reads the hook's arguments from its
+    // context and `bpf_attr` through `bpf_probe_read_kernel` (a failed read
+    // is counted as a fail-open where it decides), and writes nothing
+    // through them.
     unsafe { try_bpf_syscall_observe(&ctx) }
 }
 
@@ -1782,7 +1791,12 @@ pub extern "C" fn nn_loader_opted_out(prog_type: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the hook's arguments are its context's slots; `attr` (the
+    // kernel's copy of the `bpf_attr`) is tested for null and read only
+    // through `bpf_probe_read_kernel`, at offsets within the union (an
+    // unreadable value is counted as a fail-open where it decides); the
+    // handles and descriptors go to the global functions as plain values;
+    // nothing is written through either.
     unsafe {
         let cmd = ctx.arg::<c_int>(0) as u32;
         let attr: *const c_void = ctx.arg(1);

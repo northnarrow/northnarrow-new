@@ -52,15 +52,8 @@ pub const STACK_BUDGET: u32 = 448;
 /// brought under the budget leaves the list (the xtask ratchet fails on an
 /// entry that is no longer over it).
 pub const STACK_DEBT: &[(&str, u32)] = &[
-    // owner: S1 lot 1.4b (mini-lot) — `bpf_defense.rs`'s `bpf()` observer,
-    // in no S1 lot's files
-    ("bpf_syscall_observe", 480),
-    // owner: S1 lot 1.4 — its whole chain is `open_sensor.rs`'s
-    // (`on_open` → `nn_open_class` → `nn_open_walk`), inlined into the FIM
-    // watch's program
-    ("fim_file_open_sensor", 480),
-    // owner: S1 lot 1.4b (mini-lot) — `tcp_close.rs`, in no S1 lot's files
-    ("tcp_close", 480),
+    // empty: lot 1.4 brought the last three (`bpf_syscall_observe`,
+    // `fim_file_open_sensor`, `tcp_close`, at 480) under the budget
 ];
 
 /// The deepest call chain `prog` may have: its debt's, else the budget.
@@ -562,20 +555,33 @@ mod tests {
         assert_eq!(v.stack_unmeasured, vec!["dark".to_string()]);
         assert!(verdict_line("k", &v).contains("stack chain not read back"));
 
-        // the debt: within it, held and reported; above it, a failure
-        let (name, debt) = STACK_DEBT[0];
-        let v = judge(&[st(name, Some(debt))], HEADROOM_BUDGET);
-        assert!(v.passes(), "{v:?}");
-        assert_eq!(v.stack_debt, vec![(name.to_string(), debt, debt)]);
-        assert!(verdict_line("k", &v).contains("(1 held to their debt)"));
-        assert!(stack_line(&v).contains(&format!("held to their debt: {name} {debt} of {debt}")));
-        let v = judge(&[st(name, Some(debt + 32))], HEADROOM_BUDGET);
-        assert!(!v.passes());
-        assert!(v.stack_debt.is_empty());
-        // under the budget, a debt's program is no debt any more
-        let v = judge(&[st(name, Some(STACK_BUDGET))], HEADROOM_BUDGET);
-        assert!(v.passes() && v.stack_debt.is_empty());
-        assert!(stack_line(&v).contains("no debt over it"));
+        // the debt: within it, held and reported; above it, a failure (while
+        // a program is on it: lot 1.4 left it empty)
+        if let Some(&(name, debt)) = STACK_DEBT.first() {
+            let v = judge(&[st(name, Some(debt))], HEADROOM_BUDGET);
+            assert!(v.passes(), "{v:?}");
+            assert_eq!(v.stack_debt, vec![(name.to_string(), debt, debt)]);
+            assert!(verdict_line("k", &v).contains("(1 held to their debt)"));
+            assert!(
+                stack_line(&v).contains(&format!("held to their debt: {name} {debt} of {debt}"))
+            );
+            let v = judge(&[st(name, Some(debt + 32))], HEADROOM_BUDGET);
+            assert!(!v.passes());
+            assert!(v.stack_debt.is_empty());
+        }
+        // Lot 1.4: the three programs the debt held at 480 are held to the
+        // budget — their old chain fails the gate; under the budget, a
+        // program is no debt
+        for name in ["bpf_syscall_observe", "fim_file_open_sensor", "tcp_close"] {
+            assert_eq!(stack_allowed(name), STACK_BUDGET, "{name}");
+            let v = judge(&[st(name, Some(480))], HEADROOM_BUDGET);
+            assert!(!v.passes(), "{v:?}");
+            assert_eq!(v.stack_over, vec![(name.to_string(), 480)]);
+            assert!(v.stack_debt.is_empty());
+            let v = judge(&[st(name, Some(STACK_BUDGET))], HEADROOM_BUDGET);
+            assert!(v.passes() && v.stack_debt.is_empty());
+            assert!(stack_line(&v).contains("no debt over it"));
+        }
     }
 
     /// The debt only holds programs over the budget, each below the
