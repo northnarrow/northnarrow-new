@@ -154,7 +154,7 @@ impl Rig {
             Arc::clone(&self.held),
             capture,
             enforce,
-            Some(self.journal.clone()),
+            self.journal.clone(),
             Some(SharedRecorder::new(Box::new(self.audits.clone()))),
         )
     }

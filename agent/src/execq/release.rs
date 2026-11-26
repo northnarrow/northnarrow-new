@@ -196,7 +196,9 @@ pub struct Sweeper<M> {
     /// Lot 341: an observing run kills nothing — a kill the map owes is
     /// resumed.
     enforce: bool,
-    journal: Option<ActionJournal>,
+    /// The review of #635 (P3-1): a kill is never without its signed
+    /// intent — the journal is not optional.
+    journal: ActionJournal,
     recorder: Option<SharedRecorder>,
 }
 
@@ -228,7 +230,7 @@ impl<M: HeldMaps> Sweeper<M> {
         held: Arc<Held<M>>,
         capture: SweepCapture,
         enforce: bool,
-        journal: Option<ActionJournal>,
+        journal: ActionJournal,
         recorder: Option<SharedRecorder>,
     ) -> Self {
         Self {
@@ -295,7 +297,7 @@ impl<M: HeldMaps> Sweeper<M> {
                 return;
             }
             Liveness::Live if owed => {
-                if kill_with_intent(self.journal.as_ref(), &pr, pid, OWED_KILL_PATH, true).0 {
+                if kill_with_intent(&self.journal, &pr, pid, OWED_KILL_PATH, true).0 {
                     out.killed.push(pid);
                 } else {
                     out.left.push(pid);
@@ -393,17 +395,18 @@ pub fn stop_then_sweep<M: HeldMaps>(
 pub const OWED_KILL_PATH: &str = "(a process held without a report of this run)";
 
 /// The kill of a captured process (`held`: the kernel holds it), with its
-/// signed intent (R12c, lab PR 270) when a journal is there, and its
-/// outcome: whether the signal was delivered, and the response. One path
-/// for the controller and the stop's sweep.
+/// signed intent (R12c, lab PR 270) and its outcome: whether the signal was
+/// delivered, and the response. One path for the controller and the stop's
+/// sweep. The review of #635 (P3-1): the journal is not optional — no kill
+/// without its intent (`xtask/tests/action_records.rs` holds it).
 pub fn kill_with_intent(
-    journal: Option<&ActionJournal>,
+    journal: &ActionJournal,
     pr: &ProcRef,
     pid: u32,
     path: &str,
     held: bool,
 ) -> (bool, String) {
-    let intent = journal.map(|j| j.intent(intent_named("KillProcess", pid, path)));
+    let intent = journal.intent(intent_named("KillProcess", pid, path));
     match pr.signal(libc::SIGKILL) {
         Ok(()) => {
             super::COUNTERS
@@ -414,19 +417,15 @@ pub fn kill_with_intent(
             } else {
                 "killed".to_string()
             };
-            if let Some(i) = intent {
-                i.finish(ActionResult::Success, text.clone(), None);
-            }
+            intent.finish(ActionResult::Success, text.clone(), None);
             (true, text)
         }
         Err(e) => {
-            if let Some(i) = intent {
-                i.finish(
-                    ActionResult::Failure,
-                    "kill failed".to_string(),
-                    Some(e.to_string()),
-                );
-            }
+            intent.finish(
+                ActionResult::Failure,
+                "kill failed".to_string(),
+                Some(e.to_string()),
+            );
             (false, format!("kill failed: {e}"))
         }
     }

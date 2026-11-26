@@ -531,7 +531,7 @@ pub fn start(
         Arc::clone(&k.held),
         Box::new(crate::response::proc_ref::ProcRef::open_started_at),
         enforce,
-        Some(deps.journal.clone()),
+        deps.journal.clone(),
         Some(recorder.clone()),
     ));
     let _ = EXIT_SWEEPER.set(Arc::clone(&sweeper));

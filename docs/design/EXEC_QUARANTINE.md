@@ -311,7 +311,16 @@ Now:
 - the stop's deadline sweeps the map too before it ends the process,
   whichever stage blocks: there it resumes and kills nothing (a kill owed
   stays in the pinned map for the next start), and signs nothing (the
-  audit log may be held by the stage that blocks).
+  audit log may be held by the stage that blocks);
+- a kill verdict known is owed in the map from the moment it is known (the
+  review of #635): in enforce mode a scan whose verdict the policy kills (a
+  block-list hit, a suspicious verdict under
+  `--exec-quarantine-on-suspicious kill`) marks the held process's kill
+  owed at once, while the rules' verdict on its exec is still awaited. The
+  sweep then kills it (signed), the deadline's exit leaves it stopped, and
+  the next start after a crash kills it: a stop the controller misses never
+  resumes a binary whose kill it knew. What has no kill verdict is resumed,
+  undecided, as before (fail-open).
 
 **A process that cannot be captured is not one that ended** (lot 317,
 BUG-124). The agent captures a held process by a pidfd (`ProcRef`); that

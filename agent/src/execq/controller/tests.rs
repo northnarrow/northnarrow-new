@@ -660,6 +660,14 @@ fn a_late_blocklist_verdict_kills_after_the_default_policy() {
     assert_eq!(late.evidence.verdict, "malicious");
     assert!(late.response.starts_with("killed"), "{}", late.response);
     assert!(late.evidence.reasons.iter().any(|r| r.starts_with("late:")));
+    // the review of #635 (P2-1): a late verdict acts on a running process —
+    // no kill owed in the map for it (a mark there would name a process the
+    // kernel no longer holds)
+    assert!(
+        w.k.0.lock().left.is_empty(),
+        "a late verdict marked a kill owed: {:?}",
+        w.k.0.lock().left
+    );
 }
 
 /// A rule kill (R001 on a held /tmp binary) lands while held: the record
@@ -2102,7 +2110,7 @@ fn a_stop_while_the_controller_is_in_a_pass_releases_every_held_process() {
         held,
         Box::new(ProcRef::open_started_at),
         true,
-        None,
+        crate::response::journal::ActionJournal::memory(),
         Some(super::super::release::SharedRecorder::new(Box::new(
             rec.clone(),
         ))),
@@ -2296,5 +2304,262 @@ fn a_running_controller_handles_no_report_once_the_agent_stops() {
         2,
         "a report was handled after the stop: {}",
         own[0]
+    );
+}
+
+// ── the review of #635 (P2-1): a kill verdict known is owed in the map ──
+
+/// The stop's sweep alone, as when the controller is stuck in a pass past
+/// the stop's wait (it never reaches `stop_all`): it reads the map only.
+fn sweeper_of(w: &World) -> super::super::release::Sweeper<FakeKernel> {
+    super::super::release::Sweeper::new(
+        Arc::new(super::super::release::Held::new(w.k.clone())),
+        Box::new(ProcRef::open_started_at),
+        true,
+        w.journal.clone(),
+        Some(super::super::release::SharedRecorder::new(Box::new(
+            w.rec.clone(),
+        ))),
+    )
+}
+
+/// The journal's rows, one line each.
+fn journal_lines(w: &World) -> Vec<String> {
+    use crate::response::journal::ActionRow;
+    w.journal
+        .rows()
+        .iter()
+        .map(|r| match r.row {
+            ActionRow::Intent => {
+                let i = r.intent.as_ref().unwrap();
+                format!("intent {} {} {}", i.source, i.response, i.pid)
+            }
+            _ => format!("{:?} {:?}", r.row, r.outcome.as_ref().unwrap().result),
+        })
+        .collect()
+}
+
+/// The review of #635 (P2-1, the reviewer's probe): the controller is
+/// stuck past the stop's wait while it holds a process whose scan already
+/// asks for its kill (block list), the rules' verdict on its exec still
+/// awaited. Its own stop would kill it (N1), but the stop's sweep sees
+/// only the map. The scan's answer now marks the kill owed there at once:
+/// the sweep kills the process, its signed intent before and its outcome
+/// after. The probe found it resumed.
+#[test]
+fn the_sweep_kills_a_held_process_whose_verdict_asks_for_it() {
+    let (w, h) = held_with_a_kill_verdict("nn-bad");
+    assert_eq!(
+        w.k.0.lock().left,
+        [(
+            h.pid,
+            ExecqStopped {
+                start_ns: h.start_ns,
+                stop_ns: kernel::KILL_OWED,
+            }
+        )],
+        "the scan's kill verdict is not owed in the map"
+    );
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "the sweep resumed a held process whose block-list verdict the controller had: {:?} \
+         {swept:?}",
+        state(h.pid)
+    );
+    assert_eq!(swept.killed, [h.pid], "{swept:?}");
+    assert!(swept.resumed.is_empty(), "{swept:?}");
+    assert!(w.k.0.lock().left.is_empty(), "its entry stayed in the map");
+    use crate::response::journal::ActionResult;
+    assert_eq!(
+        journal_lines(&w),
+        [
+            format!("intent exec_quarantine KillProcess {}", h.pid),
+            format!("Outcome {:?}", ActionResult::Success),
+        ]
+    );
+    let a = w.rec.audits.lock();
+    let s: Vec<_> = a.iter().filter(|e| e["kind"] == "stopping").collect();
+    assert_eq!(s.len(), 1, "{a:?}");
+    assert_eq!(s[0]["killed"], serde_json::json!([h.pid]), "{}", s[0]);
+    assert_eq!(s[0]["resumed"], serde_json::json!([]), "{}", s[0]);
+}
+
+/// P2-1: the deadline's exit, which kills nothing, leaves that process
+/// stopped, its kill owed in the map — never resumed.
+#[test]
+fn the_deadline_exit_leaves_a_kill_verdict_stopped() {
+    let (w, h) = held_with_a_kill_verdict("nn-bad");
+    let swept = sweeper_of(&w).sweep_at_exit().expect("the maps' lock");
+    assert_eq!(swept.kills_left, [h.pid], "{swept:?}");
+    assert!(swept.resumed.is_empty(), "{swept:?}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(state(h.pid), Some('T'), "resumed by the deadline's exit");
+    assert_eq!(w.k.0.lock().left[0].1.stop_ns, kernel::KILL_OWED);
+}
+
+/// P2-1: the agent killed (SIGKILL: no stop, no sweep) while it holds that
+/// process — the next start kills it (`recovered_at_boot`), signed, where
+/// it resumed it.
+#[test]
+fn the_next_start_kills_a_held_process_whose_verdict_asked_for_it() {
+    let (w, h) = held_with_a_kill_verdict("nn-bad");
+    // the next agent: the pinned map outlives the one killed
+    let mut next = world(ScanConfig::default(), enforce(), 5000, false);
+    next.k.0.lock().left = w.k.0.lock().left.clone();
+    next.ctl.recover();
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "the next start resumed a held process whose block-list verdict the killed agent had: \
+         {:?}",
+        state(h.pid)
+    );
+    let a = next.rec.audits.lock();
+    assert_eq!(a[0]["kind"], "recovered_at_boot", "{}", a[0]);
+    assert_eq!(a[0]["killed"], serde_json::json!([h.pid]), "{}", a[0]);
+    assert_eq!(a[0]["resumed"], serde_json::json!([]), "{}", a[0]);
+    drop(w);
+}
+
+/// P2-1, the fail-open kept: a held process whose scan asks for no kill
+/// (clean), the rules' verdict still awaited, owes nothing — the sweep
+/// resumes it, as the design says (undecided: resumed, signed).
+#[test]
+fn the_sweep_resumes_a_held_process_whose_scan_asks_no_kill() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-ok");
+    let mut w = world(ScanConfig::default(), enforce(), 5000, false);
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.run_until(|w| w.ctl.entries.values().any(|p| p.scan.is_some()));
+    assert!(w.records().is_empty(), "decided before the rules");
+    assert_eq!(
+        w.k.0.lock().left[0].1.stop_ns,
+        1,
+        "a kill owed for a clean scan"
+    );
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    assert_eq!(swept.resumed, [h.pid], "{swept:?}");
+    assert!(swept.killed.is_empty(), "{swept:?}");
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "{:?}",
+        state(h.pid)
+    );
+    assert!(journal_lines(&w).is_empty(), "an action without a kill");
+}
+
+/// A held script whose scan is suspicious (a `#!` under /tmp), the rules'
+/// verdict on its exec still awaited, under `policy`.
+fn held_with_a_suspicious_scan(policy: Policy) -> (World, Held) {
+    let mut w = world(ScanConfig::default(), policy, 5000, false);
+    let h = held_copy(w.dir.path(), "nn-x");
+    let script = w.dir.path().join("s.sh");
+    std::fs::write(&script, "#!/tmp/.hidden/interp\n").unwrap();
+    let mut raw = raw_of(h.pid, h.start_ns, &script, class::TMP);
+    raw.flags |= stop_flags::SCRIPT;
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw);
+    w.run_until(|w| w.ctl.entries.values().any(|p| p.scan.is_some()));
+    let verdict = w
+        .ctl
+        .entries
+        .values()
+        .find_map(|p| p.scan.as_ref())
+        .unwrap()
+        .verdict;
+    assert_eq!(verdict, ScanVerdict::Suspicious);
+    assert!(w.records().is_empty(), "decided before the rules");
+    (w, h)
+}
+
+/// P2-1: a suspicious scan under `--exec-quarantine-on-suspicious kill` is
+/// a kill verdict too — owed in the map, carried out by the sweep.
+#[test]
+fn the_sweep_kills_a_suspicious_scan_the_policy_kills() {
+    let (w, h) = held_with_a_suspicious_scan(Policy {
+        on_suspicious: Action::Kill,
+        ..Policy::default()
+    });
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    assert_eq!(swept.killed, [h.pid], "{swept:?}");
+    assert!(
+        wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
+        "{:?}",
+        state(h.pid)
+    );
+}
+
+/// P2-1, the fail-open kept: the same scan under the default policy
+/// (suspicious: resume) owes nothing — the sweep resumes it.
+#[test]
+fn the_sweep_resumes_a_suspicious_scan_the_policy_resumes() {
+    let (w, h) = held_with_a_suspicious_scan(Policy::default());
+    assert_eq!(w.k.0.lock().left[0].1.stop_ns, 1);
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    assert_eq!(swept.resumed, [h.pid], "{swept:?}");
+    assert!(
+        wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+        "{:?}",
+        state(h.pid)
+    );
+}
+
+/// P2-1: an observing run owes no kill for a block-list scan (lot 341: it
+/// kills nothing), even on a report of a process the map names (an
+/// enforcing run's leftover) — the map is left as the kernel wrote it.
+#[test]
+fn an_observing_run_owes_no_kill_for_a_block_list_scan() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-bad");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "nn-lab-owed".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(
+        cfg,
+        Policy {
+            enforce: false,
+            ..Policy::default()
+        },
+        5000,
+        false,
+    );
+    hold_in_map(&w, h.pid, h.start_ns);
+    w.push(raw_for(&h, class::TMP));
+    w.run_until(|w| w.ctl.entries.values().any(|p| p.scan.is_some()));
+    assert_eq!(
+        w.k.0.lock().left[0].1.stop_ns,
+        1,
+        "an observing run marked a kill owed"
+    );
+}
+
+/// P2-1: an exec the kernel let run unheld (its stop signal refused: the
+/// map's entry removed) owes no kill in the map for a block-list scan — a
+/// mark there would name a running process the kernel does not hold.
+#[test]
+fn an_unheld_exec_owes_no_kill_in_the_map_for_a_block_list_scan() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-bad");
+    let cfg = ScanConfig {
+        block: vec![HashEntry {
+            sha256: sha_of(&h.exe),
+            label: "nn-lab-owed".into(),
+        }],
+        ..ScanConfig::default()
+    };
+    let mut w = world(cfg, enforce(), 5000, false);
+    let mut raw = raw_for(&h, class::TMP);
+    raw.flags |= stop_flags::SIGNAL_FAILED;
+    w.push(raw);
+    w.run_until(|w| !w.records().is_empty());
+    assert!(
+        w.k.0.lock().left.is_empty(),
+        "a kill owed in the map for a process the kernel does not hold: {:?}",
+        w.k.0.lock().left
     );
 }

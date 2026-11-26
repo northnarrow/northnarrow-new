@@ -753,8 +753,25 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     .entries
                     .get(&id)
                     .is_some_and(|p| p.late_until.is_some());
+                // the review of #635 (P2-1): a scan that asks for the kill of
+                // a held process — the rules' verdict on its exec still
+                // awaited — marks the kill owed in the map at once, so that
+                // the stop's sweep kills it (signed), the deadline's exit
+                // leaves it stopped and the next start after a crash kills
+                // it: never a resume of a kill verdict known. A late verdict
+                // is carried out below (its owed kill marked there).
+                let kills = !late
+                    && self.s.policy.enforce
+                    && decide(&self.s.policy, &Basis::Scanned(r.verdict)).action == Action::Kill;
+                let mut owe = None;
                 if let Some(p) = self.entries.get_mut(&id) {
+                    if kills && p.held() {
+                        owe = Some((p.raw.pid, p.raw.start_ns));
+                    }
                     p.scan = Some(r);
+                }
+                if let Some((pid, start_ns)) = owe {
+                    self.k.owe_kill(pid, start_ns);
                 }
                 if late {
                     self.late_verdict(id, now);
@@ -1164,7 +1181,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// 270) and outcome: whether the signal was delivered, and the response.
     fn kill(&self, pr: &ProcRef, pid: u32, path: &str, held: bool) -> (bool, String) {
         // lot M4: one kill path with the stop's sweep
-        super::release::kill_with_intent(Some(&self.s.journal), pr, pid, path, held)
+        super::release::kill_with_intent(&self.s.journal, pr, pid, path, held)
     }
 
     /// Lot 317 (BUG-124): the decisions owed to held processes that could

@@ -240,7 +240,8 @@ fn a_stop_with_reports_left_unread_resumes_them() {
         "unread",
         &[("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE)],
         StopBy::Signed,
-    );
+    )
+    .count;
     assert!(
         unreported > 0,
         "no process held without an entry: the window was not held open"
@@ -261,7 +262,8 @@ fn the_map_alone_names_what_the_stop_resumes() {
             ("NN_DEBUG_EXECQ_STOP_NO_LAST_READ", "1"),
         ],
         StopBy::Signed,
-    );
+    )
+    .count;
     assert!(
         unreported > 0,
         "no process held without an entry: the window was not held open"
@@ -281,10 +283,25 @@ fn the_map_alone_names_what_the_stop_resumes() {
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn a_stop_while_the_controller_is_stuck_releases_every_held_process() {
-    let unreported = burst_and_stop("stuck", &[("NN_DEBUG_EXECQ_STALL", STALL)], StopBy::Signed);
+    let ended = burst_and_stop("stuck", &[("NN_DEBUG_EXECQ_STALL", STALL)], StopBy::Signed);
     assert!(
-        unreported > 0,
+        ended.count > 0,
         "the stop's sweep resumed nothing: the controller was not stuck at the stop"
+    );
+    // the review of #635 (P3-2): the controller's own stop also names
+    // processes without an entry — the case tests the sweep only when the
+    // stall held the controller past the stop's wait, and the sweep signed
+    assert!(
+        ended.overran,
+        "the controller's stop did not overrun its wait: the stall did not take effect"
+    );
+    assert!(
+        ended
+            .by
+            .iter()
+            .any(|b| b.starts_with("sweep: the controller did not stop")),
+        "no `stopping` entry signed by the sweep of a controller that did not stop: {:?}",
+        ended.by
     );
 }
 
@@ -296,7 +313,7 @@ fn a_stop_while_the_controller_is_stuck_releases_every_held_process() {
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn the_next_start_releases_what_a_killed_agent_held() {
-    let recovered = burst_and_stop("killed", &[], StopBy::KillThenRestart);
+    let recovered = burst_and_stop("killed", &[], StopBy::KillThenRestart).count;
     assert!(
         recovered > 0,
         "the next start's signed `recovered_at_boot` resumed nothing: the killed agent left \
@@ -370,11 +387,21 @@ const PAUSE: &str = "@pause@";
 /// stall file, created 300 ms before the stop is asked.
 const STALL: &str = "@stall@";
 
+/// What a case's stop did.
+struct Ended {
+    /// How many processes the stop resumed without an entry
+    /// (`unreported`) — after a kill, how many the next start resumed
+    /// (`recovered_at_boot`).
+    count: usize,
+    /// The controller's stop overran the wait the agent's stop gives it.
+    overran: bool,
+    /// Who signed each `stopping` entry (its `by`).
+    by: Vec<String>,
+}
+
 /// A burst, a stop in its middle (`by`), the checks; `env`: the agent's
-/// extra variables (`PAUSE`: the pause file). Returns how many processes
-/// the stop resumed without an entry (`unreported`) — after a kill, how
-/// many the next start resumed (`recovered_at_boot`).
-fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> usize {
+/// extra variables (`PAUSE`: the pause file).
+fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> Ended {
     common::require_root("run the exec quarantine's stop e2e");
     common::require_disposable_host("run the exec quarantine's stop e2e");
     common::refuse_if_northnarrow_running("run the exec quarantine's stop e2e");
@@ -732,8 +759,16 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> usize {
     drop(nn_admin);
     drop(installed_agent);
     drop(burst_dir);
-    match by {
-        StopBy::Signed => unreported,
-        StopBy::KillThenRestart => recovered,
+    let signers = stopping
+        .iter()
+        .filter_map(|s| s.get("by").and_then(|b| b.as_str()).map(str::to_string))
+        .collect();
+    Ended {
+        count: match by {
+            StopBy::Signed => unreported,
+            StopBy::KillThenRestart => recovered,
+        },
+        overran,
+        by: signers,
     }
 }
