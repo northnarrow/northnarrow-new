@@ -144,6 +144,14 @@ fail-safe.
   any other record of a response is ignored. It lasts for the name's TTL (at least 300 s, at most a day),
   then 2 hours past each use: a daemon that resolved its peers once keeps
   them while it uses them. A process's ancestors count; a sibling does not.
+- **A question and its response, in either order** (lot M5): the queries
+  and the responses come on two rings, read by two pumps of the agent in
+  no order between them. A whole response a process received answers the
+  questions of its chain that process asked at or before it, whichever the
+  agent read first. Before, a response read ahead of its query left the
+  question "asked, never answered" for 5 minutes: the process's later
+  connects to an address no response named were `unknown` (no record)
+  instead of `Medium`.
 - **Not judged (no record):**
   - a destination that is not public: loopback, RFC 1918, unique-local,
     link-local, CGNAT, multicast, broadcast, `0/8`, `240/4`, `198.18/15`
