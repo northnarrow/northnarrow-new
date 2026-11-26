@@ -65,12 +65,19 @@ pub const UNKNOWN: &str = "{?}";
 
 /// `text` (the file `rel`) parsed, its macros' bodies read as Rust.
 pub fn parse(rel: &str, text: &str) -> File {
-    let mut file = syn::parse_file(text).unwrap_or_else(|e| {
-        panic!(
+    try_parse(rel, text).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Lot 1.7b: [`parse`], its refusal returned (`Err`: why the file does not
+/// parse, or the macros this reader does not read) — for a scan that reads
+/// such a file some other way, by name.
+pub fn try_parse(rel: &str, text: &str) -> Result<File, String> {
+    let mut file = syn::parse_file(text).map_err(|e| {
+        format!(
             "{rel}:{}: does not parse as Rust: {e}",
             e.span().start().line
         )
-    });
+    })?;
     let mut expand = Expand::default();
     expand.visit_file_mut(&mut file);
     let mut left = Unread::default();
@@ -80,24 +87,32 @@ pub fn parse(rel: &str, text: &str) -> File {
     unread.extend(left.0.into_iter().filter(|(l, _, _)| !reported.contains(l)));
     unread.sort();
     unread.dedup();
-    assert!(
-        unread.is_empty(),
-        "{rel}: a macro this reader does not read as Rust — read it in support::ast, or list \
-         its name with the reason in GRAMMARS (a body read part by part) or OPAQUE (no code): \
-         {:#?}",
-        unread
-            .iter()
-            .map(|(l, name, why)| format!("{rel}:{l} `{name}`: {why}"))
-            .collect::<Vec<_>>()
-    );
-    file
+    if !unread.is_empty() {
+        return Err(format!(
+            "{rel}: a macro this reader does not read as Rust — read it in support::ast, or list \
+             its name with the reason in GRAMMARS (a body read part by part) or OPAQUE (no code): \
+             {:#?}",
+            unread
+                .iter()
+                .map(|(l, name, why)| format!("{rel}:{l} `{name}`: {why}"))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(file)
 }
 
 /// [`parse`], with what only a test build compiles dropped.
 pub fn production(rel: &str, text: &str) -> File {
     let mut file = parse(rel, text);
-    StripTests.visit_file_mut(&mut file);
+    strip_tests(&mut file);
     file
+}
+
+/// Lot 1.7b: what only a test build compiles dropped from a parsed file
+/// (the second half of [`production`], for a scan that reads a file both
+/// whole and as a release builds it).
+pub fn strip_tests(file: &mut File) {
+    StripTests.visit_file_mut(file);
 }
 
 /// A span's line (1-based).
@@ -2379,4 +2394,368 @@ pub fn spine<'a>(
         cur = p;
     }
     (cur, methods, None)
+}
+
+// ── who names whom (lot 1.7b) ───────────────────────────────────────────
+
+/// A node of [`Graph`]: a function (`file`, its id), or a `const`/`static`
+/// (`file`, its name, which of that name) — what its initialiser names.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Node {
+    Fn(String, FnId),
+    Value(String, String, usize),
+}
+
+impl Node {
+    pub fn file(&self) -> &str {
+        match self {
+            Node::Fn(f, _) | Node::Value(f, _, _) => f,
+        }
+    }
+}
+
+/// Lot 1.7b: who names whom in a [`Corpus`] — every function and every
+/// `const`/`static`, and what each one's code may run or read. A name is
+/// followed as the compiler would find it, and wider where this reader
+/// cannot tell (an over-approximation: a scan that follows too much fails
+/// closed):
+///
+/// - a path through the file's `use` items (an alias, a group, a glob), its
+///   module segment naming the file (`crate::execq::f` is `execq.rs`'s
+///   `f`), and that file's own re-exports (`pub use self::X as Y`);
+/// - a bare name: the file's own function, `const` or `static` of that
+///   name, else every file's;
+/// - a method: the file's functions of that name, else every file's;
+/// - a macro's invocation: its `macro_rules!` (its rules, read as Rust by
+///   [`parse`]), the file's own else every file's;
+/// - a word of the code that names one of them, wherever it stands (a
+///   function passed as a value, an array of them, a parenthesised
+///   initialiser, a macro's tokens this reader left as they are) — not a
+///   field's or a method's name, nor a path's inner segment.
+pub struct Graph<'c, 'a> {
+    pub corpus: &'c Corpus<'a>,
+    fns: BTreeMap<String, Vec<(String, FnId)>>,
+    values: BTreeMap<String, Vec<(String, String, usize)>>,
+    rules: BTreeMap<String, Vec<(String, FnId)>>,
+}
+
+/// A macro's rule function's macro: `__macro__rules_<name>::__rule<n>`.
+pub fn rule_macro(item: &str) -> Option<&str> {
+    let rest = item.rsplit_once("::").map(|(m, _)| m)?;
+    let m = rest.rsplit("::").next()?;
+    m.strip_prefix(&format!("{MACRO}rules_"))
+}
+
+/// A word of some tokens: its line, and where it stands.
+struct Word {
+    word: String,
+    line: usize,
+    /// after `.` (a field or a method) or `::` (a path's later segment)
+    after: bool,
+    /// before `::`, `!` or `(` (a path's module, a macro, a call)
+    before: bool,
+}
+
+fn punct(t: Option<&TokenTree>, c: char) -> bool {
+    matches!(t, Some(TokenTree::Punct(p)) if p.as_char() == c)
+}
+
+/// The words of `tokens` (macros' bodies too), with their line.
+fn words_of(tokens: TokenStream, out: &mut Vec<Word>) {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, t) in trees.iter().enumerate() {
+        match t {
+            TokenTree::Ident(id) => {
+                let prev = |n: usize| i.checked_sub(n).and_then(|k| trees.get(k));
+                let after = (punct(prev(1), '.') && !punct(prev(2), '.'))
+                    || (punct(prev(1), ':') && punct(prev(2), ':'));
+                let before = punct(trees.get(i + 1), '!')
+                    || (punct(trees.get(i + 1), ':') && punct(trees.get(i + 2), ':'))
+                    || matches!(trees.get(i + 1), Some(TokenTree::Group(g))
+                        if g.delimiter() == proc_macro2::Delimiter::Parenthesis);
+                out.push(Word {
+                    word: id.to_string(),
+                    line: line(id.span()),
+                    after,
+                    before,
+                });
+            }
+            TokenTree::Group(g) => words_of(g.stream(), out),
+            _ => {}
+        }
+    }
+}
+
+/// Every word of `tokens` (an identifier anywhere, a macro's body too),
+/// with its line.
+pub fn idents(tokens: TokenStream) -> Vec<(String, usize)> {
+    let mut w = Vec::new();
+    words_of(tokens, &mut w);
+    w.into_iter().map(|w| (w.word, w.line)).collect()
+}
+
+/// The paths (as written) and the methods a piece of code names, nested
+/// functions left out (each is a node of its own).
+#[derive(Default)]
+struct Names {
+    paths: Vec<Vec<String>>,
+    methods: Vec<String>,
+}
+
+impl<'a> Visit<'a> for Names {
+    fn visit_expr_path(&mut self, p: &'a syn::ExprPath) {
+        self.paths.push(segments(&p.path));
+        visit::visit_expr_path(self, p);
+    }
+    fn visit_expr_method_call(&mut self, m: &'a syn::ExprMethodCall) {
+        self.methods.push(m.method.to_string());
+        visit::visit_expr_method_call(self, m);
+    }
+    fn visit_item_fn(&mut self, _: &'a syn::ItemFn) {}
+    fn visit_impl_item_fn(&mut self, _: &'a syn::ImplItemFn) {}
+}
+
+impl<'c, 'a> Graph<'c, 'a> {
+    pub fn new(corpus: &'c Corpus<'a>) -> Self {
+        let mut fns: BTreeMap<String, Vec<(String, FnId)>> = BTreeMap::new();
+        let mut values: BTreeMap<String, Vec<(String, String, usize)>> = BTreeMap::new();
+        let mut rules: BTreeMap<String, Vec<(String, FnId)>> = BTreeMap::new();
+        for (rel, ix) in &corpus.files {
+            for (id, f) in ix.fns.iter().enumerate() {
+                if f.body.is_none() {
+                    continue;
+                }
+                match rule_macro(&f.item) {
+                    Some(m) => rules
+                        .entry(m.to_string())
+                        .or_default()
+                        .push((rel.clone(), id)),
+                    None => fns
+                        .entry(f.name.clone())
+                        .or_default()
+                        .push((rel.clone(), id)),
+                }
+            }
+            for (name, exprs) in &ix.consts {
+                for i in 0..exprs.len() {
+                    values
+                        .entry(name.clone())
+                        .or_default()
+                        .push((rel.clone(), name.clone(), i));
+                }
+            }
+        }
+        Graph {
+            corpus,
+            fns,
+            values,
+            rules,
+        }
+    }
+
+    /// The node's name: a function's, `name!` for a macro's rule, a
+    /// value's.
+    pub fn name(&self, n: &Node) -> String {
+        match n {
+            Node::Fn(rel, id) => {
+                let f = &self.corpus.files[rel].fns[*id];
+                match rule_macro(&f.item) {
+                    Some(m) => format!("{m}!"),
+                    None => f.name.clone(),
+                }
+            }
+            Node::Value(_, name, _) => name.clone(),
+        }
+    }
+
+    /// The functions of `rel` named `name` (macros' rules left out).
+    pub fn fns_named(&self, rel: &str, name: &str) -> Vec<Node> {
+        self.fns
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(f, _)| f == rel)
+            .map(|(f, id)| Node::Fn(f.clone(), *id))
+            .collect()
+    }
+
+    /// The tokens of a node's code: a function's body, a value's
+    /// initialiser.
+    pub fn tokens(&self, n: &Node) -> TokenStream {
+        match n {
+            Node::Fn(rel, id) => self.corpus.files[rel].fns[*id]
+                .body
+                .map(ToTokens::to_token_stream)
+                .unwrap_or_default(),
+            Node::Value(rel, name, i) => self.corpus.files[rel].consts[name][*i].to_token_stream(),
+        }
+    }
+
+    /// The items named `name`, those of `files` when there are some, else
+    /// every file's.
+    fn named(&self, name: &str, files: &[&str]) -> Vec<Node> {
+        let all: Vec<Node> = self
+            .fns
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|(f, id)| Node::Fn(f.clone(), *id))
+            .chain(
+                self.values
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|(f, n, i)| Node::Value(f.clone(), n.clone(), *i)),
+            )
+            .collect();
+        let own: Vec<Node> = all
+            .iter()
+            .filter(|n| files.contains(&n.file()))
+            .cloned()
+            .collect();
+        if own.is_empty() { all } else { own }
+    }
+
+    /// The files a module segment names (`execq`: `…/execq.rs`,
+    /// `…/execq/mod.rs`).
+    fn module_files(&self, m: &str) -> Vec<&str> {
+        self.corpus
+            .files
+            .keys()
+            .filter(|rel| {
+                rel.ends_with(&format!("/{m}.rs"))
+                    || *rel == &format!("{m}.rs")
+                    || rel.ends_with(&format!("/{m}/mod.rs"))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// What the path `segs`, written in `rel`, may name.
+    pub fn resolve(&self, rel: &str, segs: &[String]) -> Vec<Node> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        self.resolve_in(rel, segs, 0, &mut seen, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn resolve_in(
+        &self,
+        rel: &str,
+        segs: &[String],
+        depth: u8,
+        seen: &mut BTreeSet<(String, Vec<String>)>,
+        out: &mut Vec<Node>,
+    ) {
+        if depth > 8 || segs.is_empty() || !seen.insert((rel.to_string(), segs.to_vec())) {
+            return;
+        }
+        let Some(ix) = self.corpus.files.get(rel) else {
+            return;
+        };
+        if let Some(m) = segs[segs.len() - 1].strip_prefix(MACRO) {
+            let all: Vec<&(String, FnId)> = self.rules.get(m).into_iter().flatten().collect();
+            let own: Vec<&&(String, FnId)> = all.iter().filter(|(f, _)| f == rel).collect();
+            let pick: Vec<&(String, FnId)> = if own.is_empty() {
+                all
+            } else {
+                own.into_iter().copied().collect()
+            };
+            out.extend(pick.into_iter().map(|(f, id)| Node::Fn(f.clone(), *id)));
+            return;
+        }
+        for p in ix.full_paths(segs) {
+            let name = &p[p.len() - 1];
+            let module = (p.len() >= 2).then(|| p[p.len() - 2].as_str()).filter(|m| {
+                !matches!(*m, "crate" | "self" | "super")
+                    && m.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            });
+            let files: Vec<&str> = match module {
+                Some(m) => {
+                    let f = self.module_files(m);
+                    if f.is_empty() { vec![rel] } else { f }
+                }
+                None => vec![rel],
+            };
+            out.extend(self.named(name, &files));
+            // a re-export of the file the path names
+            for f in files {
+                if let Some(fulls) = self.corpus.files.get(f).and_then(|x| x.imports.get(name)) {
+                    for full in fulls.clone() {
+                        if full != p {
+                            self.resolve_in(f, &full, depth + 1, seen, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the method `name`, called in `rel`, may run.
+    pub fn method(&self, rel: &str, name: &str) -> Vec<Node> {
+        let all: Vec<Node> = self
+            .fns
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|(f, id)| Node::Fn(f.clone(), *id))
+            .collect();
+        let own: Vec<Node> = all.iter().filter(|n| n.file() == rel).cloned().collect();
+        if own.is_empty() { all } else { own }
+    }
+
+    /// The nodes `n`'s code names.
+    pub fn edges(&self, n: &Node) -> Vec<Node> {
+        let rel = n.file();
+        let mut names = Names::default();
+        match n {
+            Node::Fn(rel, id) => {
+                if let Some(b) = self.corpus.files[rel].fns[*id].body {
+                    names.visit_block(b);
+                }
+            }
+            Node::Value(rel, name, i) => names.visit_expr(self.corpus.files[rel].consts[name][*i]),
+        }
+        let mut out = Vec::new();
+        for p in &names.paths {
+            out.extend(self.resolve(rel, p));
+        }
+        for m in &names.methods {
+            out.extend(self.method(rel, m));
+        }
+        let mut words = Vec::new();
+        words_of(self.tokens(n), &mut words);
+        for w in words {
+            if !w.after
+                && !w.before
+                && (self.fns.contains_key(&w.word) || self.values.contains_key(&w.word))
+            {
+                out.extend(self.resolve(rel, &[w.word]));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Every node reachable from `from` (themselves included), each with
+    /// the node it was reached from (`None` for a start).
+    pub fn reach(&self, from: &[Node]) -> BTreeMap<Node, Option<Node>> {
+        let mut out: BTreeMap<Node, Option<Node>> = BTreeMap::new();
+        let mut todo: Vec<(Node, Option<Node>)> = from.iter().map(|n| (n.clone(), None)).collect();
+        while let Some((n, via)) = todo.pop() {
+            if out.contains_key(&n) {
+                continue;
+            }
+            for next in self.edges(&n) {
+                if !out.contains_key(&next) {
+                    todo.push((next, Some(n.clone())));
+                }
+            }
+            out.insert(n, via);
+        }
+        out
+    }
 }
