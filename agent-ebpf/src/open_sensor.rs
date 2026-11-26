@@ -72,8 +72,6 @@ const FMODE_WRITE: u32 = 0x2;
 /// created the file. Set before `security_file_open` runs.
 const FMODE_CREATED: u32 = 0x10_0000;
 
-/// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
-const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const S_IFMT: u16 = 0o170_000;
 const S_IFREG: u16 = 0o100_000;
 const S_IFDIR: u16 = 0o040_000;
@@ -162,7 +160,7 @@ static OPEN_HAD_DATA: LruHashMap<InodeKey, u64> = LruHashMap::with_max_entries(4
 /// Review 75: the last read-only report per (task, inode)
 /// ([`crate::read_repeat`]).
 #[map]
-static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
+pub(crate) static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
 /// Bulk windows, each read in one call: `struct file` at [0, FILE_WIN) and
 /// the opened inode at [FILE_WIN, FILE_WIN + INODE_WIN). A kernel read
 /// costs about 70 ns on the lab; one window replaces four field reads
@@ -264,7 +262,10 @@ fn open_task_bump(slot: u32) {
 /// ([`OPEN_TASK_RUN`]). `None`: neither has room (counted).
 #[inline(always)]
 unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the running task's own entries of this module's maps, looked up
+    // or made by `nn_open_task_make` / `task_scratch::make`; the pointers
+    // returned are those maps' values, valid for this run (nothing removes
+    // the running task's entry while it runs).
     unsafe {
         if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
             return Some((p, true));
@@ -289,6 +290,7 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
         }
     }
 }
+
 /// The re-check of #547 (G5): the running task's [`OPEN_TASK`] entry made
 /// (zeroed), within its share ([`OPEN_TASK_PER_SHARE`]; the row it is
 /// counted in kept in the entry). 1: made; 0: the share taken or the map
@@ -356,7 +358,8 @@ pub fn armed() -> bool {
 
 #[inline(always)]
 pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `p` is only passed to `bpf_probe_read_kernel`, which returns an
+    // error for an unreadable address (read here as null) instead of faulting.
     unsafe {
         match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
             Ok(v) => v,
@@ -372,7 +375,8 @@ pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
 /// rule has device 0, no name is empty).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the helper writes all 8 bytes of `v` in every case (the value, or
+    // zeros on a fault) before `assume_init`; `src` is only passed to it.
     unsafe {
         let mut v = core::mem::MaybeUninit::<u64>::uninit();
         let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
@@ -382,7 +386,7 @@ unsafe fn peek_u64(src: *const u8) -> u64 {
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: as [`peek_u64`]'s, for 4 bytes.
     unsafe {
         let mut v = core::mem::MaybeUninit::<u32>::uninit();
         let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
@@ -394,7 +398,9 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
 /// (an unreadable name stays all zeros).
 #[inline(always)]
 unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dst` is 32 writable bytes of the caller's buffer (map memory),
+    // zeroed before the helper writes at most `OPEN_NAME_LEN` of them; the
+    // name's address is read through the probe helper ([`peek_u64`]).
     unsafe {
         zero32(dst);
         let name = peek_u64(dentry.add(name_off)) as *const c_void;
@@ -405,32 +411,47 @@ unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
 /// `(dev, ino)` of `inode` as `stat()` reports it (review 55); dev 0 /
 /// ino 0 when unreadable — a plain value, never an `Option` across the
 /// inlined calls (5.15 rule 3).
+///
+/// Lot 1.4: the two words start from [`crate::opaque::opaque`]'s zero, a
+/// value LLVM knows nothing about, and the key is built whole at the end.
+/// From a literal 0, the paths that read nothing stored two constant zeros,
+/// which LLVM 22 merged into a call of the `memset` subprogram — one the
+/// 5.15 and 6.1 verifiers cross without their precision marks
+/// (KERNEL_COMPATIBILITY "Older verifiers", rule 9):
+/// `module_read_file_observe` processed 11 % more instructions. The values
+/// are the same: 0 where nothing was read. [`InodeKey`] is two `u64`s, no
+/// padding: every byte of the key the maps and userland see is one of the
+/// two written.
 #[inline(always)]
 pub(crate) unsafe fn key_of(inode: *const u8) -> InodeKey {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `inode` and its superblock are read only through
+    // `bpf_probe_read_kernel` (a fault is an `Err`, never a load through the
+    // pointer); a null pointer is tested before any read past it.
     unsafe {
-        let mut key = InodeKey { dev: 0, ino: 0 };
-        if inode.is_null() {
-            return key;
+        let zero = crate::opaque::opaque(0u64);
+        let mut dev = zero;
+        let mut ino = zero;
+        if !inode.is_null() {
+            let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
+            if !sb.is_null() {
+                if let Ok(d) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
+                    dev = crate::inode_dev::stat_dev(inode, sb, d) as u64;
+                }
+                if let Ok(i) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+                    ino = i;
+                }
+            }
         }
-        let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
-        if sb.is_null() {
-            return key;
-        }
-        if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-            key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
-        }
-        if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-            key.ino = ino;
-        }
-        key
+        InodeKey { dev, ino }
     }
 }
 
 /// `dentry->d_name.name` into `dst[..32]`, NUL-padded.
 #[inline(always)]
 unsafe fn read_name(dentry: *const u8, dst: *mut u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dst` points to `OPEN_NAME_LEN` (32) writable bytes of the task's
+    // buffer (map memory), each word zeroed before the helper writes the
+    // name; `dentry` is read only through `bpf_probe_read_kernel`.
     unsafe {
         let w = dst as *mut u64;
         core::ptr::write_volatile(w, 0);
@@ -450,7 +471,8 @@ unsafe fn read_name(dentry: *const u8, dst: *mut u8) {
 
 #[inline(always)]
 unsafe fn zero32(dst: *mut u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dst` points to 32 writable, 8-byte aligned bytes of the task's
+    // buffer (the names area of [`OpenTask`], at a multiple of 32).
     unsafe {
         let w = dst as *mut u64;
         core::ptr::write_volatile(w, 0);
@@ -462,7 +484,8 @@ unsafe fn zero32(dst: *mut u8) {
 
 #[inline(always)]
 unsafe fn copy32(dst: *mut u8, src: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dst` and `src` each point to 32 aligned bytes of the task's buffer
+    // (the names area of [`OpenTask`]), which do not overlap.
     unsafe {
         let d = dst as *mut u64;
         let s = src as *const u64;
@@ -499,7 +522,9 @@ fn carveout_magic(magic: u64) -> bool {
 /// walking its ancestors ([`nn_open_walk`]).
 #[inline(always)]
 unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> DirClass {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: map lookups and an insert with keys and values on this frame;
+    // `dir` and `dir_inode` only go, as values, to the walk, which reads
+    // them through the probe helper.
     unsafe {
         let generation = match DIR_CLASS_GEN.get(0) {
             Some(g) => *g,
@@ -535,7 +560,8 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
 /// 283c: the unlink counter reads its owner bits too ([`own_of`]).
 #[inline(always)]
 unsafe fn parent_class(key: &InodeKey, parent: *const u8) -> Option<DirClass> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `parent` is read only through the probe helper (`read_ptr`,
+    // `bpf_probe_read_kernel`); a null inode is tested before its use.
     unsafe {
         let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
         if parent_inode.is_null() {
@@ -556,7 +582,8 @@ unsafe fn parent_class(key: &InodeKey, parent: *const u8) -> Option<DirClass> {
 /// cannot be read.
 #[inline(always)]
 unsafe fn inode_uid(inode: *const u8) -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `inode` is tested for null and read only through
+    // `bpf_probe_read_kernel` (a fault is `u32::MAX`).
     unsafe {
         if inode.is_null() {
             return u32::MAX;
@@ -575,7 +602,9 @@ unsafe fn inode_uid(inode: *const u8) -> u32 {
 /// read outside a class [`own_code`] reads.
 #[inline(always)]
 unsafe fn own_of(bits: u32, owner: u32, dentry: *const u8) -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dentry` and the inodes it reaches are read only through the probe
+    // helper (`read_ptr`, `bpf_probe_read_kernel`, [`inode_uid`]); each
+    // pointer is tested for null before a field past it is read.
     unsafe {
         if bits & OWN_DATA_BITS == 0 || dentry.is_null() {
             return 0;
@@ -614,7 +643,12 @@ pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> 
 
 #[inline(always)]
 unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the kernel's dentries, inodes and superblock are read only
+    // through the branch-free probe reads ([`peek_u64`], [`peek_u32`],
+    // [`peek_name`]); `scratch` is the running task's own buffer
+    // ([`task_buffer`]: `names`, 128 bytes), written within it — two names
+    // at 0 and 32, a `ChildRuleKey` (48 bytes) at 64 — and read as map
+    // keys only after those writes.
     unsafe {
         // The running task's buffers: [`on_open`]'s, or made here for an
         // unlink or a rename (`forget_task` removes them).
@@ -642,8 +676,16 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         if carveout_magic(magic) {
             bits |= TREE_CARVEOUT;
         }
-        let btrfs = magic == BTRFS_SUPER_MAGIC;
         let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+        // Lot 1.4b (stack): the superblock's btrfs facts read once
+        // (`inode_dev::SbDev`, lot 318's walk form of `stat_dev`, the same
+        // device): `stat_dev` in each level looked its three offsets up again
+        // and kept them across the level's helper calls — the walk's frame
+        // was 192 bytes, on `fim_file_open_sensor`'s deepest chain (480 of the
+        // verifier's 512); 160 now. No call is added to the loop: a
+        // subprogram call there would cost the 5.15 verifier its precision
+        // marks (KERNEL_COMPATIBILITY "Older verifiers", rule 9).
+        let devs = crate::inode_dev::SbDev::of(sb, s_dev);
         let mut d = dir;
         let mut key = start;
         let mut capped = DEPTH_CAPPED;
@@ -669,11 +711,7 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
             peek_name(d, o_name, scratch);
             let up_inode = peek_u64(up.add(o_inode)) as *const u8;
             let up_key = InodeKey {
-                dev: if btrfs {
-                    crate::inode_dev::stat_dev(up_inode, sb, s_dev) as u64
-                } else {
-                    s_dev as u64
-                },
+                dev: devs.dev(up_inode) as u64,
                 ino: peek_u64(up_inode.add(o_ino)),
             };
             let ck = scratch.add(64);
@@ -713,7 +751,8 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
 /// when the kernel has none.
 #[inline(always)]
 unsafe fn loginuid() -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the running task's `task_struct` is tested for null and read only
+    // through `bpf_probe_read_kernel` (a fault is `u32::MAX`).
     unsafe {
         let task = bpf_get_current_task() as *const u8;
         match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
@@ -800,7 +839,10 @@ unsafe fn count_write(
     key: &InodeKey,
     dentry: *const u8,
 ) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: map lookups and inserts with keys on this frame; the window
+    // pointers are values of the per-tgid map, written only through
+    // `write_step` for this run; `dentry` only goes to [`own_of`] (probe
+    // reads).
     unsafe {
         if carved_class(cls_bits, cls_uid, || loginuid()) {
             return 0;
@@ -875,7 +917,9 @@ unsafe fn count_write(
 /// a few files under the threshold in a window of their own.
 #[inline(always)]
 unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: a lookup and an insert in the per-cgroup window map, the key and
+    // the new window on this frame; the pointer found is that map's value,
+    // updated in place by `cgroup_step`.
     unsafe {
         let cgroup = bpf_get_current_cgroup_id();
         let key = if cgroup > 1 {
@@ -919,7 +963,9 @@ unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
 /// `off + 8 <= len` into a comparison of `off` itself.
 #[inline(always)]
 unsafe fn win_u64(win: *const u8, len: usize, src: *const u8, off: usize) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the window read is within `win[..len]` (`off + 8 <= len`, `len`
+    // a constant the verifier bounds `off` by), unaligned-safe
+    // (`read_unaligned`); past it, `src` is read through the probe helper.
     unsafe {
         if off + 8 <= len {
             core::ptr::read_unaligned(win.add(off) as *const u64)
@@ -934,7 +980,7 @@ unsafe fn win_u64(win: *const u8, len: usize, src: *const u8, off: usize) -> u64
 
 #[inline(always)]
 unsafe fn win_u32(win: *const u8, len: usize, src: *const u8, off: usize) -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: as [`win_u64`]'s, for 4 bytes.
     unsafe {
         if off + 4 <= len {
             core::ptr::read_unaligned(win.add(off) as *const u32)
@@ -953,7 +999,10 @@ unsafe fn win_u32(win: *const u8, len: usize, src: *const u8, off: usize) -> u32
 /// after a small `struct file`).
 #[inline(always)]
 unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `w` is the task's buffer, `FILE_WIN + INODE_WIN` writable bytes
+    // ([`OpenTask::win`]); each window is filled by the probe helper, which
+    // zeroes what it fails to read; `file` and the inode are only passed to
+    // it.
     unsafe {
         if bpf_probe_read_kernel_buf(file, core::slice::from_raw_parts_mut(w, FILE_WIN)).is_err() {
             return core::ptr::null();
@@ -975,7 +1024,9 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 /// own buffers ([`task_buffer`]: kept for the task's life, or this run's).
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `file` is the hook's argument, only read through the probe helper
+    // (here and in `on_open_in`); `t` is the running task's own buffer from
+    // [`task_buffer`], removed at the end of the run when it is the run's.
     unsafe {
         let task = bpf_get_current_task();
         let (t, live) = match task_buffer(task) {
@@ -1000,7 +1051,10 @@ pub unsafe fn on_open(file: *const u8) {
 
 #[inline(always)]
 unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `t` is the running task's own buffer ([`task_buffer`]); the
+    // windows are read into it before any field is used, the stash written
+    // into its first three words after the last read of them; the kernel's
+    // objects past the windows are read through the probe helper only.
     unsafe {
         let w = (*t).win.as_mut_ptr();
         let inode = read_windows(file, w);
@@ -1032,7 +1086,9 @@ unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
                 return;
             }
             // Review 75: a read-only repeat by the same task is dropped.
-            if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
+            if mode & FMODE_WRITE != 0
+                || crate::read_repeat::nn_read_repeat(crate::read_repeat::SEEN_FIM, key.dev, key.ino) == 0
+            {
                 crate::fim_watch::emit_drift_opened(key);
             }
         }
@@ -1195,7 +1251,9 @@ unsafe fn observe(
     pino: u64,
     scratch: *mut u8,
 ) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `scratch` is the task's own names area (128 bytes), written before
+    // it is read as map keys; the kernel's objects are read through the
+    // probe helper only.
     unsafe {
         let write = mode & FMODE_WRITE != 0;
         let pkey = InodeKey { dev: key.dev, ino: pino };
@@ -1271,7 +1329,10 @@ unsafe fn observe(
         }
         // Review 75: a read-only repeat by the same task is dropped (the
         // telemetry probe excepted: each of its opens is a check).
-        if !write && reason & open_reason::PROBE == 0 && crate::read_repeat::repeat(&OPEN_READ_SEEN, key) {
+        if !write
+            && reason & open_reason::PROBE == 0
+            && crate::read_repeat::nn_read_repeat(crate::read_repeat::SEEN_OPEN, key.dev, key.ino) != 0
+        {
             return;
         }
         emit(reason, key, dentry, flags, mode, 0);
@@ -1317,7 +1378,10 @@ pub extern "C" fn nn_open_emit(reason_count: u64, dev: u64, ino: u64, dentry: u6
 
 #[inline(always)]
 unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32, mode: u32, count: u32) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `raw` is this run's reserved ring entry, zeroed before any
+    // field is written, and submitted once; the path's components are read
+    // into its slots by the probe helper, each within its own slot; the
+    // dentries are read only through the probe helper.
     unsafe {
         let mut entry = match OPEN_SENSOR_EVENTS.reserve::<OpenRecordRaw>(0) {
             Some(e) => e,
@@ -1409,7 +1473,7 @@ pub fn bump_generation() {
 /// the class of everything below it.
 #[inline(always)]
 pub unsafe fn on_rename(moved_inode: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `moved_inode` is read only through `bpf_probe_read_kernel`.
     unsafe {
         if !armed() || moved_inode.is_null() {
             return;
@@ -1435,7 +1499,8 @@ pub fn open_sensor_rmdir(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the hook's dentry is read only through the probe helper
+    // (`read_ptr`, [`key_of`]); the cache entry is removed by its key.
     unsafe {
         // Kernel signature: (dir, dentry).
         if !armed() {
@@ -1459,7 +1524,12 @@ unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
 /// shape counts.
 #[inline(always)]
 unsafe fn read_parts(dentry: *const u8, p: *mut NameParts) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `p` is a `NameParts` of the task's rename entry (map memory):
+    // its head is zeroed byte by byte before the string helper writes at
+    // most `NAME_HEAD_LEN` bytes into it, its tail is the buffer helper's
+    // read of the name's last `NAME_TAIL_LEN` bytes (zeros on a fault) or a
+    // copy of the head; the dentry and its name are read only through the
+    // probe helpers.
     unsafe {
         let head = core::ptr::addr_of_mut!((*p).head) as *mut u8;
         let tail = core::ptr::addr_of_mut!((*p).tail) as *mut u8;
@@ -1502,7 +1572,8 @@ unsafe fn read_parts(dentry: *const u8, p: *mut NameParts) {
 /// `(mode, size)` of `inode`, zeros when unreadable.
 #[inline(always)]
 unsafe fn mode_size(inode: *const u8) -> (u16, u64) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `inode` is read only through `bpf_probe_read_kernel` (a fault is
+    // 0).
     unsafe {
         let mode = bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16).unwrap_or(0);
         let size = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_SIZE_OFFSET)) as *const u64).unwrap_or(0);
@@ -1535,7 +1606,9 @@ pub extern "C" fn nn_rename_burst(old_dentry: u64, new_dentry: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn rename_burst(old: *const u8, new: *const u8, task: u64) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `rt` is the running task's own rename entry, made in this run
+    // (`task_scratch::make`) and removed by its caller; the dentries are read
+    // only through the probe helpers.
     unsafe {
         if !armed() || old.is_null() || new.is_null() {
             return;
@@ -1673,7 +1746,9 @@ pub extern "C" fn nn_unlink_burst(dentry: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn unlink_burst(dentry: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dentry` and its inodes are read only through the probe helpers
+    // (`read_ptr`, [`mode_size`], [`key_of`]); map lookups and inserts with
+    // keys on this frame.
     unsafe {
         if !armed() || dentry.is_null() {
             return;
@@ -1797,7 +1872,8 @@ pub extern "C" fn nn_setattr_mark(dentry: u64, iattr: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn setattr_mark(dentry: *const u8, iattr: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `dentry` and `iattr` are tested for null and read only through
+    // `bpf_probe_read_kernel`.
     unsafe {
         if !armed() || dentry.is_null() || iattr.is_null() {
             return;
@@ -1846,7 +1922,8 @@ const XATTR_NAME_CAPS: [u8; 20] = *b"security.capability\0";
 /// 9's 5.14), and `value` is one.
 #[inline(always)]
 pub(crate) unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx` is the hook's context, an array of the hook's arguments;
+    // slot `i` is read through `bpf_probe_read_kernel` (a fault is 0).
     unsafe {
         let args = ctx.as_ptr() as *const u64;
         bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
@@ -1855,7 +1932,9 @@ pub(crate) unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
 
 #[inline(always)]
 unsafe fn try_file_cap(ctx: &LsmContext) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the hook's arguments are read untyped ([`raw_arg`]) and tested for
+    // null; the attribute's name and value are read through the probe
+    // helpers into arrays on this frame, of their own sizes.
     unsafe {
         let dentry: *const u8 = ctx.arg(0);
         let name = raw_arg(ctx, 1) as *const u8;

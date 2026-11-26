@@ -697,6 +697,129 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     );
 }
 
+// ── Test 3b: a credential file re-read after an exec ─────────────────
+
+/// Lot 1.4 (plan S1, F7; the review of #587, P2): a credential file read by
+/// a process, then read again within the second by the program that
+/// process executed in its place, gives the second read its own record.
+/// The read-repeat filter (review 75) keyed a read by the task alone (pid,
+/// start time), which an exec keeps: the program that read second — the
+/// one a reader-class rule judges — had no record. It is keyed by the
+/// task's image too now (its `mm` and its executable's inode).
+///
+/// One process, `sh`, reads `<tmp>/.aws/credentials` (a redirection: the
+/// shell's own read-only open), then `exec`s `cat` on it: two reads, one
+/// pid, a few milliseconds apart. Both are NN-L-FIM-011 verdicts (neither
+/// is an AWS client); `--detect-only` keeps the first verdict's kill off
+/// the second reader. Without the image in the key, the record of `cat`
+/// is missing.
+#[test]
+fn fim_cred_read_after_an_exec_gets_its_own_record() {
+    wipe_pin_tree();
+    // Declared before the agent's guard: dropped after the agent stops.
+    let installed_agent = InstalledAgent::install();
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let dir = tempdir.path();
+    let state = AgentState::new(dir);
+    let aws_dir = dir.join(".aws");
+    std::fs::create_dir(&aws_dir).expect("mkdir .aws");
+    let watched_file = aws_dir.join("credentials");
+    std::fs::write(&watched_file, b"[default]\naws_access_key_id = AKIA_TEST\n")
+        .expect("seed creds file");
+    let admin_priv = dir.join("admin.priv");
+    let init = Command::new(nn_admin_bin())
+        .arg("init")
+        .arg("--priv-out")
+        .arg(&admin_priv)
+        .arg("--pub-append")
+        .arg(state.admin_pub())
+        .status()
+        .expect("nn-admin init");
+    assert!(init.success(), "nn-admin init failed");
+    let combat = dir.join("combat-rules.v4");
+    std::fs::copy(combat_rules_path(), &combat).expect("copy combat rules");
+    let fim_paths_v1 = dir.join("fim-paths.v1");
+    std::fs::write(
+        &fim_paths_v1,
+        format!("{}\n", watched_file.to_string_lossy()),
+    )
+    .expect("write fim-paths.v1");
+    let fim_paths_local = dir.join("fim-paths.local");
+    std::fs::write(&fim_paths_local, "").unwrap();
+    let baseline_log = state.fim_baseline();
+    let detections_log = state.detections();
+
+    common::require_bpftool();
+    let child = installed_agent
+        .command(&state, Launch::Direct, &[common::OWN_DEFAULT_LISTS_ENV])
+        .arg("--combat-rules")
+        .arg(&combat)
+        .arg("--fim-paths-v1")
+        .arg(&fim_paths_v1)
+        .arg("--fim-paths-local")
+        .arg(&fim_paths_local)
+        .arg("--detect-only")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn northnarrow-agent for the read-after-exec e2e");
+    let _guard = AgentGuard(Some(child));
+    wait_for_socket(&state.admin_socket());
+    let deadline = Instant::now() + BASELINE_POLL_TIMEOUT;
+    while Instant::now() < deadline && common::read_jsonl_strict(&baseline_log).is_empty() {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert!(
+        !common::read_jsonl_strict(&baseline_log).is_empty(),
+        "TOFU baseline never populated {}",
+        baseline_log.display()
+    );
+
+    // One task, two images: the shell's read, then `cat`'s after the exec.
+    let mut reader = Command::new("sh")
+        .arg("-c")
+        .arg("read -r line < \"$1\"; exec cat \"$1\"")
+        .arg("sh")
+        .arg(&watched_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn sh");
+    let pid = u64::from(reader.id());
+    assert!(
+        reader.wait().expect("wait sh").success(),
+        "the reader failed"
+    );
+
+    let comms = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| {
+                r["rule_id"] == serde_json::json!("NN-L-FIM-011_AwsCredsRead")
+                    && r["principal"]["pid"].as_u64() == Some(pid)
+            })
+            .filter_map(|r| r["principal"]["comm"].as_str().map(str::to_string))
+            .collect()
+    };
+    let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        seen = comms(&common::read_jsonl_strict(&detections_log));
+        if seen.iter().any(|c| c == "sh") && seen.iter().any(|c| c == "cat") {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert!(
+        seen.iter().any(|c| c == "sh"),
+        "no NN-L-FIM-011 record of the shell's read (pid {pid}): {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|c| c == "cat"),
+        "the read after the exec (pid {pid}, cat) has no record of its own — \
+         dropped as a repeat of the shell's: {seen:?}"
+    );
+}
+
 // ── Polish #2: BaselineCache no-op-touch suppression ────────────────
 
 /// Tappa 9 polish #2 e2e — cache suppression for `Modified`

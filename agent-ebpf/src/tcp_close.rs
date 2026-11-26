@@ -24,17 +24,13 @@
 //!     flows`.
 
 use aya_ebpf::{
-    helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel,
-    },
+    cty::c_void,
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, generated},
     macros::{fexit, map},
     maps::RingBuf,
     programs::FExitContext,
 };
-use northnarrow_common::wire::{
-    NetFlowCloseRaw, ADDR_LEN, NET_FLOW_CLOSE_EVENTS_BYTES, TASK_COMM_LEN,
-};
+use northnarrow_common::wire::{NetFlowCloseRaw, ADDR_LEN, NET_FLOW_CLOSE_EVENTS_BYTES};
 
 use crate::btf_offsets::{
     INET_SOCK_INET_SPORT_OFFSET, SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET, SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_NUM_OFFSET,
@@ -61,7 +57,12 @@ pub fn tcp_close(ctx: FExitContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the socket is the hook's argument, read only through the probe
+    // helper (a fault is 0, as each field's default); the flow id is two
+    // aligned words of the map's value, copied before the entry is removed;
+    // the record is this run's reserved ring entry, zeroed before any field is
+    // written, the addresses and the `comm` written into it by the helpers
+    // (which zero what they fail to read).
     unsafe {
         // arg(0) of tcp_close(struct sock *sk, long timeout) is the
         // sock pointer. The fexit context's arg() is unsafe — caller
@@ -93,8 +94,15 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         // outbound flows, the ones the flow rules judge. Lot 275: an accepted
         // socket the inbound sensor recorded has its close on its own ring
         // (`crate::inbound`), never this one.
-        let corr: [u8; 16] = match FLOW_SOCK_MAP.get(&sk_key) {
-            Some(c) => *c,
+        // Lot 1.4b (stack): the flow id copied as two words — a byte-wise copy
+        // of the `[u8; 16]` kept each byte in a stack slot of its own (the
+        // program's frame was 448 of the verifier's 512 bytes). A map value is
+        // 8-byte aligned (the kernel rounds the key up to 8 before it).
+        let (corr_lo, corr_hi) = match FLOW_SOCK_MAP.get_ptr(&sk_key) {
+            Some(c) => {
+                let w = c as *const u64;
+                (core::ptr::read_volatile(w), core::ptr::read_volatile(w.add(1)))
+            }
             None => {
                 crate::inbound::close(sk_ptr, family);
                 return Ok(());
@@ -165,12 +173,13 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
 
         let pid_tgid = bpf_get_current_pid_tgid();
         let uid_gid = bpf_get_current_uid_gid();
-        let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
 
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         (*raw_ptr).bytes_sent = bytes_sent;
         (*raw_ptr).bytes_recv = bytes_recv;
-        (*raw_ptr).flow_id = corr;
+        let flow = (*raw_ptr).flow_id.as_mut_ptr() as *mut u64;
+        core::ptr::write_volatile(flow, corr_lo);
+        core::ptr::write_volatile(flow.add(1), corr_hi);
         (*raw_ptr).pid = (pid_tgid >> 32) as u32;
         (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;
         (*raw_ptr).family = family as u8;
@@ -179,62 +188,34 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         (*raw_ptr).src_port = sport_host;
         (*raw_ptr).dst_port = u16::from_be(dport_be);
 
-        // Addresses — v4 OR v6 per family.
-        let src_dst = (*raw_ptr).src_addr.as_mut_ptr();
-        let dst_dst = (*raw_ptr).dst_addr.as_mut_ptr();
+        // Addresses — v4 OR v6 per family, read by the helper straight into
+        // the record (lot 1.4b: no stack copy, no byte loop). The record was
+        // zeroed above, and the helper zeroes what it fails to read: a v4
+        // address fills the first 4 bytes, the other 12 stay 0, as before.
+        let src_dst = (*raw_ptr).src_addr.as_mut_ptr() as *mut c_void;
+        let dst_dst = (*raw_ptr).dst_addr.as_mut_ptr() as *mut c_void;
         if family == AF_INET {
-            let saddr: u32 =
-                match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32) {
-                    Ok(v) => v,
-                    Err(_) => 0,
-                };
-            let daddr: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const u32)
-            {
-                Ok(v) => v,
-                Err(_) => 0,
-            };
-            let sb = saddr.to_ne_bytes();
-            let db = daddr.to_ne_bytes();
-            let mut i = 0usize;
-            while i < 4 {
-                *src_dst.add(i) = sb[i];
-                *dst_dst.add(i) = db[i];
-                i += 1;
-            }
-            while i < ADDR_LEN {
-                *src_dst.add(i) = 0;
-                *dst_dst.add(i) = 0;
-                i += 1;
-            }
+            let _ = generated::bpf_probe_read_kernel(
+                src_dst,
+                4,
+                sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const c_void,
+            );
+            let _ = generated::bpf_probe_read_kernel(dst_dst, 4, sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const c_void);
         } else {
-            let s6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-                sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
-            ) {
-                Ok(v) => v,
-                Err(_) => [0u8; ADDR_LEN],
-            };
-            let d6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-                sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN]
-            ) {
-                Ok(v) => v,
-                Err(_) => [0u8; ADDR_LEN],
-            };
-            let mut i = 0usize;
-            while i < ADDR_LEN {
-                *src_dst.add(i) = s6[i];
-                *dst_dst.add(i) = d6[i];
-                i += 1;
-            }
+            let _ = generated::bpf_probe_read_kernel(
+                src_dst,
+                ADDR_LEN as u32,
+                sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const c_void,
+            );
+            let _ = generated::bpf_probe_read_kernel(
+                dst_dst,
+                ADDR_LEN as u32,
+                sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const c_void,
+            );
         }
 
-        // comm
-        let src = comm.as_ptr();
-        let cdst = (*raw_ptr).comm.as_mut_ptr();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            *cdst.add(i) = *src.add(i);
-            i += 1;
-        }
+        // comm, straight into the zeroed record (`crate::comm`: no `memset`)
+        crate::comm::comm_into(&mut (*raw_ptr).comm);
 
         entry.submit(0);
         Ok(())
