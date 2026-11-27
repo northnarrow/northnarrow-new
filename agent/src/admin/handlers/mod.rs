@@ -264,7 +264,9 @@ pub(super) fn dispatch(
         // and verified like the plain grant (the challenge's nonce, the
         // quorum, the role); lot 2.3 arms it. Until then no window opens:
         // the reply is `UnknownOperation`, as for a verified grant with no
-        // override wired, and `nn-admin` falls back to the plain grant.
+        // override wired. No client sends it yet; from 2.3 `nn-admin` will
+        // never fall back to the plain grant on a refusal (the design's
+        // "Trusted-installer window per process tree", section 5).
         AdminMessage::TrustedInstallerTreeGrantRequest(req) => {
             AdminMessage::TrustedInstallerGrantResult(super::verify::signed(
                 &req,
