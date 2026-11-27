@@ -95,7 +95,8 @@ pub static EXEC_MARK_ARMED: Array<u32> = Array::pinned(1, 0);
 #[map]
 pub static ROLE_UNMARKED: HashMap<u32, u64> = HashMap::pinned(ROLE_UNMARKED_MAX, 0);
 
-/// `tgid` lost its role (an unmarked executable mapping).
+/// `tgid` lost its role (a main image without the mark, or an executable
+/// mapping that was not trusted code).
 #[inline(always)]
 pub fn role_lost(tgid: u32) -> bool {
     // SAFETY: a lookup in this program's own map; nothing is kept.

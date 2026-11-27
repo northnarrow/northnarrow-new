@@ -6,12 +6,14 @@
 //! the scaffold fixes its name, its bounds and the meaning of its bits
 //! before the lots that use it.
 //!
-//! - [`MARK_ROLE`] (lot 2.2): an image the release starts a role
-//!   process from — the agent's or the watchdog's binary, its dynamic
-//!   loader, a library it links — registered by the agent from the files
-//!   it verified. A process that claims a role while an executable mapping
-//!   of an inode WITHOUT this mark is in it is refused the role and
-//!   signed (`started_for_the_role` asks for "no unmarked mapping").
+//! - [`MARK_ROLE`] (lot 2.2): the MAIN image of a role process — the
+//!   agent's or the watchdog's binary, as the install or the upgrade put
+//!   it in place inside a window — registered by the agent from the files
+//!   it verified (decision D10 of the review of #644). Every other
+//!   executable mapping of a role process needs no mark: it is judged when
+//!   it is made, on its file ([`code_verdict`]). A main image without the
+//!   mark, or a mapping that is not trusted code, takes the role away,
+//!   signed (`started_for_the_role` and the exemption ask for it).
 //! - [`MARKS_RESERVED_S12`]: the code-origin marks of stage S12 (an image
 //!   written by an exposed lineage, owned by a signed package, on the
 //!   signed exec list, a JIT library). Reserved: nothing sets them, and a
