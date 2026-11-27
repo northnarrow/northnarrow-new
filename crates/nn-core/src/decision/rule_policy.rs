@@ -194,6 +194,15 @@ pub struct RulePolicy {
     /// those types outside a window, each load recorded. The agent honours
     /// it only from a policy whose signature it verified.
     bpf_loader_allow: BTreeMap<String, u32>,
+    /// Lot 2.1 (S2 scaffold, the kernel-read option): `kernel-read-refuse
+    /// <class>[,<class>…]` (or `all`) — the signed opt-in that refuses a
+    /// foreign process, outside a window, the reads of kernel and physical
+    /// memory and of the agent's blocks by another way than its files
+    /// (`common::wire::KERNEL_READ_CLASSES`: physical-memory, block-device,
+    /// tracefs, kprobes, perf). Off by default: a firmware tool, udev's
+    /// probe or a profiler needs them. The mask of the classes; read by no
+    /// one yet (lots 2.2 and 2.3 refuse them).
+    kernel_read_refuse: u32,
     /// Where it came from (`built-in defaults`, `<path> (signed, sha256 …)`).
     pub source: String,
 }
@@ -248,6 +257,22 @@ impl RulePolicy {
         self.bpf_loader_allow.iter().map(|(p, m)| (p.as_str(), *m))
     }
 
+    /// Lot 2.1 (S2 scaffold): the kernel-read option's classes in force
+    /// (`common::wire::KERNEL_READ_*`), 0 when off.
+    pub fn kernel_read_refusals(&self) -> u32 {
+        self.kernel_read_refuse
+    }
+
+    /// Lot 2.1: [`Self::kernel_read_refusals`] by name, in the table's
+    /// order.
+    pub fn kernel_read_refusal_names(&self) -> Vec<&'static str> {
+        common::wire::KERNEL_READ_CLASSES
+            .iter()
+            .filter(|(_, bit)| self.kernel_read_refuse & bit != 0)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
     /// No directive at all.
     pub fn is_builtin(&self) -> bool {
         self.modes.is_empty()
@@ -256,6 +281,7 @@ impl RulePolicy {
             && self.sysctl_allow.is_empty()
             && self.module_allow.is_empty()
             && self.bpf_loader_allow.is_empty()
+            && self.kernel_read_refuse == 0
     }
 
     /// One line for the logs and the audit row (lot 280a: the sysctl
@@ -281,6 +307,13 @@ impl RulePolicy {
                 ", {n} BPF loader opt-out{}",
                 if n == 1 { "" } else { "s" }
             )),
+        }
+        // Lot 2.1 (S2 scaffold)
+        if self.kernel_read_refuse != 0 {
+            opt_outs.push_str(&format!(
+                ", kernel reads refused: {}",
+                self.kernel_read_refusal_names().join(",")
+            ));
         }
         format!(
             "{} enforce, {} alert, {} audit, {} off, {} exemptions on {} rules, \
@@ -325,8 +358,41 @@ impl RulePolicy {
                 common::bpf_prog_class::mask_names(*mask)
             ));
         }
+        if self.kernel_read_refuse != 0 {
+            out.push_str(&format!(
+                "kernel-read-refuse {}\n",
+                self.kernel_read_refusal_names().join(",")
+            ));
+        }
         out
     }
+}
+
+/// Lot 2.1 (S2 scaffold): a `kernel-read-refuse` line's classes — `all`,
+/// or names of `common::wire::KERNEL_READ_CLASSES` separated by commas,
+/// each once.
+fn kernel_read_classes(list: &str) -> Result<u32, String> {
+    if list == "all" {
+        return Ok(common::wire::KERNEL_READ_ALL);
+    }
+    let mut mask = 0u32;
+    for name in list.split(',') {
+        let bit = common::wire::kernel_read_class(name).ok_or_else(|| {
+            format!(
+                "unknown class `{name}` (classes: all, {})",
+                common::wire::KERNEL_READ_CLASSES
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        if mask & bit != 0 {
+            return Err(format!("`{name}` twice"));
+        }
+        mask |= bit;
+    }
+    Ok(mask)
 }
 
 /// Lot 290: the most `bpf-loader-allow` lines a policy holds (the kernel's
@@ -818,6 +884,20 @@ fn parse_as(
                     common::bpf_prog_class::mask_names(common::bpf_prog_class::DENIED_MASK)
                 )));
             }
+            // Lot 2.1 (S2 scaffold, the kernel-read option): the kernel-read option, one
+            // line
+            ["kernel-read-refuse", list] => {
+                if p.kernel_read_refuse != 0 {
+                    return Err(err("kernel-read-refuse twice".to_string()));
+                }
+                p.kernel_read_refuse = kernel_read_classes(list)
+                    .map_err(|why| err(format!("kernel-read-refuse {list}: {why}")))?;
+            }
+            ["kernel-read-refuse", ..] => {
+                return Err(err(
+                    "`kernel-read-refuse all|<class>[,<class>…]`".to_string()
+                ));
+            }
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
                 if id != RANSOMWARE_RULE {
@@ -833,7 +913,8 @@ fn parse_as(
             [kw, ..] => {
                 return Err(err(format!(
                     "unknown directive `{kw}`: enforce, alert, audit, off, exempt, \
-                     combat-without-corroboration, sysctl-allow, module-allow, bpf-loader-allow"
+                     combat-without-corroboration, sysctl-allow, module-allow, bpf-loader-allow, \
+                     kernel-read-refuse"
                 )));
             }
             [] => unreachable!("empty content skipped"),
@@ -1267,6 +1348,47 @@ mod tests {
         assert_eq!(p.mode(resolve_rule("R008").unwrap()), Some(Mode::Off));
         // The rendering reads back to the same policy.
         assert_eq!(parse(&p.render()).unwrap(), p);
+    }
+
+    /// Lot 2.1 (S2 scaffold, the kernel-read option): the kernel-read option — one line
+    /// of known classes (or `all`), each once, off by default, read back as
+    /// written, counted in the summary; a class unknown, twice, empty, or a
+    /// second line refused.
+    #[test]
+    fn the_kernel_read_option_is_one_line_of_known_classes() {
+        let p = parse("kernel-read-refuse physical-memory,tracefs\n").unwrap();
+        assert_eq!(
+            p.kernel_read_refusals(),
+            common::wire::KERNEL_READ_PHYSICAL_MEMORY | common::wire::KERNEL_READ_TRACEFS
+        );
+        assert_eq!(
+            p.kernel_read_refusal_names(),
+            ["physical-memory", "tracefs"]
+        );
+        assert!(!p.is_builtin());
+        assert!(
+            p.summary()
+                .ends_with(", kernel reads refused: physical-memory,tracefs")
+        );
+        // the rendered policy reads back the same
+        assert_eq!(p.render(), "kernel-read-refuse physical-memory,tracefs\n");
+        assert_eq!(parse(&p.render()).unwrap(), p);
+        let all = parse("kernel-read-refuse all\n").unwrap();
+        assert_eq!(all.kernel_read_refusals(), common::wire::KERNEL_READ_ALL);
+        assert_eq!(parse(&all.render()).unwrap(), all);
+        // off by default
+        assert_eq!(RulePolicy::builtin().kernel_read_refusals(), 0);
+        assert!(!RulePolicy::builtin().summary().contains("kernel reads"));
+        for bad in [
+            "kernel-read-refuse kcore\n",
+            "kernel-read-refuse tracefs,tracefs\n",
+            "kernel-read-refuse tracefs,\n",
+            "kernel-read-refuse\n",
+            "kernel-read-refuse perf kprobes\n",
+            "kernel-read-refuse perf\nkernel-read-refuse kprobes\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     /// Lot 290 (named): the signed per-loader opt-out — an absolute

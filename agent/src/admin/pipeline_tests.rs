@@ -40,8 +40,8 @@ use nn_proto::admin_protocol::{
     ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
     ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest, RotateKeysRevokeRequest,
     ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse, StatusRequest,
-    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockRequest,
-    UnlockResult,
+    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
+    TrustedInstallerTreeGrantRequest, UnlockRequest, UnlockResult,
 };
 use nn_proto::admin_quorum::role_keyword;
 use nn_proto::admin_signed_payload::{
@@ -51,7 +51,8 @@ use nn_proto::admin_signed_payload::{
     NetFingerprintExtra, NetFlowsExtra, NetListenersExtra, NetResolveExtra, OperationExtra,
     OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra, ResponseRestoreExtra,
     ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra, ShutdownExtra,
-    SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra, sign,
+    SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra,
+    TrustedInstallerTreeGrantExtra, UnlockExtra, sign,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 
@@ -660,6 +661,33 @@ fn verbs() -> Vec<Verb> {
             },
             refused: |r, _| AdminMessage::TrustedInstallerGrantResult(r),
             row: |_, _, own| json!({ "window_secs": if own { 300 } else { 0 } }),
+        },
+        // lot 2.1 (S2 scaffold): the grant for one tree, its root in the row
+        Verb {
+            request: "TrustedInstallerTreeGrantRequest",
+            op: "trusted_installer_tree_grant",
+            quorum: 1,
+            extra: |_| {
+                OperationExtra::TrustedInstallerTreeGrant(TrustedInstallerTreeGrantExtra {
+                    window_secs: 300,
+                    root_pid: 4242,
+                    root_start_ticks: 77,
+                })
+            },
+            wrap: |payload, signatures| {
+                AdminMessage::TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest {
+                    payload,
+                    signatures,
+                })
+            },
+            refused: |r, _| AdminMessage::TrustedInstallerGrantResult(r),
+            row: |_, _, own| {
+                if own {
+                    json!({ "window_secs": 300, "root_pid": 4242, "root_start_ticks": 77 })
+                } else {
+                    json!({ "window_secs": 0 })
+                }
+            },
         },
         Verb {
             request: "DetectionsRequest",
@@ -1872,7 +1900,7 @@ fn designed_roles(op: &str) -> &'static [Role] {
         "canary_deploy" | "canary_burn" | "canary_refresh" => &[Role::CanaryManage],
         "canary_list" => &[Role::CanaryRead],
         "net_flows" | "net_listeners" | "net_resolve" | "net_fingerprint" => &[Role::NetRead],
-        "trusted_installer_grant" => &[Role::TrustedInstaller],
+        "trusted_installer_grant" | "trusted_installer_tree_grant" => &[Role::TrustedInstaller],
         "detections" => &[Role::TelemetryRead],
         "detection_set_status" => &[Role::Triage],
         "config_overlay_set" => &[Role::ConfigManage],

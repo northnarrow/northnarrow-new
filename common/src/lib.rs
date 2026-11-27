@@ -48,6 +48,10 @@ pub mod cgroup_limits;
 /// Exploit post-condition guard (lab PR 219): the decision model the eBPF
 /// programs run and the agent tests. `no_std`, like [`btf_offsets`].
 pub mod epg;
+/// Lot 2.1 (S2 scaffold): the per-inode marks of executable images — the
+/// role mark (lot 2.2) and the bits reserved for S12's code origin. NOT
+/// `std`-gated.
+pub mod exec_marks;
 /// Per-hook fail-open counter slots of the deny hooks, shared by the eBPF
 /// programs and the agent (lab PR 215). NOT `std`-gated.
 pub mod fail_open;

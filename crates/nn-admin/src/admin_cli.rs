@@ -4175,6 +4175,9 @@ mod tests {
                         ..Default::default()
                     }),
                     advisories: Some(vec!["integrity: admin_key_on_host".to_string()]),
+                    installer_window_tree: None,
+                    role_marks: None,
+                    kernel_read_refused: None,
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
