@@ -98,6 +98,18 @@ The CI runs the same checks on Linux x86_64. A red PR is not merged.
   (`verify-release-tag.sh version`): a tag of another version, an
   `[Unreleased]` above the version, or a section with no date stops there.
   Before the push: `.github/scripts/verify-release-tag.sh version vX.Y.Z`.
+  Between two tags the changes merged since the last one sit in
+  `CHANGELOG.md`'s *Unreleased* block, a `###` heading above the tagged
+  section (an `[Unreleased]` `##` heading would stop the check); the last
+  commit before the tag makes it the new version's dated section, with the
+  workspace version raised to match.
+- The eBPF object (lot 1.2): `release.yml`'s `package` job rebuilds it and
+  prints the sha256 of the object it embeds. Before a tag, compare the one
+  a release dry run of the commit prints with
+  `northnarrow-agent-ebpf.sha256` of `ci.yml`'s `ebpf-object` artefact for
+  the same commit (`gh run download <run> -n ebpf-object`): a mismatch
+  means the release does not embed the object CI tested. No job compares
+  them yet.
 - Adding, rotating or revoking a key is a PR on
   `.github/allowed_signers`; the list committed in the tagged commit is
   the one that counts. When rotating, the old key stays with

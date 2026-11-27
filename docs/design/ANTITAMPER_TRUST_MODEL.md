@@ -2938,7 +2938,7 @@ path.
 
 ## Lot 357 — a mount on, over or below the paths the agent depends on is refused
 
-Four review rounds of lot 353 (#563) kept finding one more by-path read
+Lot 353 (#563) kept finding by-path reads, one after another,
 that a FUSE or a tmpfs mounted by root over `/proc`, `/sys`, the cgroup
 root, `/etc/northnarrow` or `/run/northnarrow` could stall or blind. Each
 site was bounded in turn; the class stayed open, because the mount itself
@@ -3112,14 +3112,13 @@ where it starts.
   target (`PTRACE_READ_SEEN`, an exact key). The refusal is the hook's,
   after the record, whatever it did. Root running journald's binary in
   journald's cgroup loses the record of its reads, not their refusal. The
-  keys are written before the hook attaches (fix round 3: written after
-  it, one read made in between was recorded).
+  keys are written before the hook attaches (written after it, a read
+  made in between was recorded).
 - **If the bpffs loses its last mount.** No path reaches the pins; the
   super block keeps them while a descriptor in it is open (the agent's
   anchor of `/sys/fs/bpf`, `kernel_roots`' bpf view), and frees them
   (`kill_litter_super` evicting each pinned inode, dropping its object's
-  reference) once the agent's descriptors close. Fix round 3 (the
-  coordinator's decision): the agent holds a
+  reference) once the agent's descriptors close. The agent holds a
   descriptor of every link and program it pins (`antitamper_bpf::held`:
   `pin_link` opens its own from the pin and checks the link's id, aya's
   kept when it cannot; `pin_prog`/`pin_fd` a copy), so the links keep a

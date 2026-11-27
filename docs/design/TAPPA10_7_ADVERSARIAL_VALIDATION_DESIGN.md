@@ -59,8 +59,7 @@ evidence — which of the 61 rules trigger correctly on real tool
 execution. The output is a publishable **NorthNarrow Adversarial
 Validation Report**: the Beta marketing + technical-credibility
 artifact that converts "61 rules, all unit-tested" into "61 rules,
-validated against the same tools Wazuh/CrowdStrike are benchmarked
-with."
+validated against public adversary-emulation tools."
 
 ### 1.1 Goals
 

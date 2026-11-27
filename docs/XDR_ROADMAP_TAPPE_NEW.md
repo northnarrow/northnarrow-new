@@ -1,4 +1,11 @@
-> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+> **Historical.** This delta is kept as it was written (May 2026) and is no
+> plan: the on-host LLM advisor was removed in Wave 4 (lab PR 214), and the
+> principle is "no model on the host", so neither Tappa below is planned
+> (battle-time rule synthesis needs a model or a trained advisor on the
+> host; the continuous red team was a local model). The current plan is the
+> [roadmap after the alpha in ROADMAP.md](../ROADMAP.md#roadmap-after-v010-alpha),
+> and the state of each capability is
+> [`docs/roadmap/CAPABILITY_PROGRAM.md`](roadmap/CAPABILITY_PROGRAM.md).
 
 # XDR Roadmap — New Tappe (Delta for Merge into XDR_ROADMAP.md)
 

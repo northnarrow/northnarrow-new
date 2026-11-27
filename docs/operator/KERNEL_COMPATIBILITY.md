@@ -27,12 +27,24 @@ today's counts on a host.
 
 | Distribution | Kernel | BPF LSM | BTF | Status | Verified |
 |---|---|---|---|---|---|
-| Ubuntu 24.04 LTS | 6.8.0-142-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41 at the date shown, 0 drift) | 2026-10-09 |
-| Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets (at the date shown) resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
-| Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
-| AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-741.22.1 el9_9 (AlmaLinux 9.9) | yes (default list includes `bpf`; the lab template also sets `lsm=…,selinux,bpf` with `grubby`) | yes | **supported**, SELinux **enforcing**, re-verified by lot 1.10 (in the nightly since): `verifier-check` 128 of 130 OK, 2 not counted (no `bpf_override_return` on el9: optional), 0 failing, the highest `execmap_check` at 33.9% of the 900k gate, stack within 448; 28 of 28 deny hooks (el9 backports the ACL hooks), trust level L3, no degradation; privileged suites 179 passed and 5 failed in 165 suites: a canary test's daemon that SELinux kept from its fifo (the test fixed), R018 rating a staged-tree module load High where kmod loads the `.ko.xz` through `init_module` (an expected failure on this guest), and exec quarantine's stop leaving about a thousand processes of a burst stopped (a follow-up); these suites ran with the guest's earlier `lsm=` list, which lacked `landlock` (the template is fixed); with it, `nn-lab.sh rpm-release-check` passed: the release `.rpm` installed signed, upgraded in place, back after a cold boot, removed and purged with nothing left, 0 AVC denials. Earlier (2026-10-10, lab PR 20, 5.14.0-687): e2e agent 6/6, FIM 4/4, watchdog 4/4, `--btf-check` SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-11-26 (lot 1.10) |
-| Ubuntu 26.04 LTS | 7.0.0-38-generic | needs `lsm=…,bpf` (the lab template sets it) | yes | the hosted CI runners' release, with uutils coreutils (lab PR 229): `verifier-check` 77 of 77 OK, privileged suites 80 of 80 (the gate's `test-ignored`); `install.sh --upgrade` needed the immutable state directory unlocked before `install -d` (fixed); `malsim/exec-check.sh` passes except its two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su), which drew no record — a follow-up | 2026-10-22 (lab PR 229) |
-| Debian 13 (trixie) | 6.12 | `lsm=…,bpf` set by the lab template | yes | the first guest from 6.9: `inode_setattr`'s dentry is argument 1, read from the prototype (see "Kernels from 6.9" below); verified there: chmod, chown and touch of a protected file refused (allowed on `main`), the FIM setattr observer records; privileged suites 81 of 82 — DNS attribution fails on `main` too, the guest resolves through `nss-resolve` | 2026-10-16 (lab PR 164) |
+| Ubuntu 24.04 LTS | 6.8.0-151-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — stage S1 round: `verifier-check` 127 of 130 OK, 3 not counted (optional), 0 failing, the highest `execmap_check` at 29.1% of the 900k gate, every stack chain within 448; the installed agent at trust level L3 with no degradation, 55 LSM links, `--btf-check` SUPPORTED (164 slots, 22 differing from the build kernel); prog-cost within 5% of lot 1.4's or within the run's own spread. Earlier (2026-10-09, `6.8.0-142`): full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41 then, 0 drift) | 2026-11-26 (stage S1, lot 1.5) |
+| Debian 12 (bookworm) | 6.1.0-56-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — stage S1 round: `verifier-check` 124 of 130 OK, 6 not counted (optional), 0 failing, the highest `module_read_file_observe` at 53.3% of the 900k gate, every stack chain within 448; L3, no degradation, 53 LSM links, `--btf-check` SUPPORTED (164 slots, 58 differing from the build kernel). Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts. Earlier (2026-10-09, `6.1.0-53`): full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning), `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` | 2026-11-26 (stage S1, lot 1.5) |
+| Ubuntu 22.04 LTS | 5.15.0-204-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`, the 2 optional `ubuf` slots absent). Stage S1 round: `verifier-check` 123 of 130 OK, 7 not counted (optional), 0 failing, the highest `module_read_file_observe` at 53.3% of the 900k gate (the count read by the kprobe, see "Verifier headroom"), every stack chain within 448; privileged suites 186 passed, 0 failed (5 of 5 runs); L3, no degradation, 53 LSM links; prog-cost within 5% of lot 1.4's, or faster. The older verifier's rules are below ("Older verifiers") | 2026-11-26 (stage S1, lot 1.5) |
+| AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-741.22.1 el9_9 (AlmaLinux 9.9) | yes (default list includes `bpf`; the lab template also sets `lsm=` with `grubby`, naming every module of `CONFIG_LSM`) | yes | **supported**, SELinux **enforcing**, in the nightly since lot 1.10. Stage S1 round: `verifier-check` 128 of 130 OK, 2 not counted (no `bpf_override_return` on el9: optional), 0 failing, the highest `execmap_check` at 33.9% of the 900k gate (el9's verifier gives 6.12's counts), every stack chain within 448; `nn-lab.sh pkg-check` 30 of 30, then a cold boot with both units active (107 pins, 55 LSM links); 28 of 28 deny hooks (el9 backports the ACL hooks), L3, no degradation. Lot 1.10: privileged suites 179 passed and 5 failed in 165 suites — a canary test's daemon that SELinux kept from its fifo (the test fixed), R018 rating a module load from a staged tree High where kmod loads the `.ko.xz` through `init_module` (an expected failure on this guest), and the exec quarantine's stop leaving about a thousand processes of a burst stopped (fixed by lot M4: 25 of 25 cases); `nn-lab.sh rpm-release-check`: the alpha's signed `.rpm` installed, a build of `main` over it in place, a cold boot, removed and purged with nothing left, 0 AVC denials. Earlier (2026-10-10, lab PR 20, 5.14.0-687): e2e agent 6/6, FIM 4/4, watchdog 4/4, `--btf-check` SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-11-26 (stage S1, lots 1.10 and 1.5) |
+| Ubuntu 26.04 LTS | 7.0.0-43-generic | needs `lsm=…,bpf` (the lab template sets it) | yes | **verified in the lab**, the hosted CI runners' release, with uutils coreutils and sudo-rs. Stage S1 round: `verifier-check` 125 of 130 OK, 5 not counted (optional), 0 failing, the highest `execmap_check` at 30.8% of the 900k gate, every stack chain within 448; privileged suites 186 passed, 0 failed (5 of 5 runs; a second run, since sudo-rs ignores `sudo -E`); the exec fallback recorded 10 of 10 execs on each of the 4 CPUs (see "Syscall tracepoints on Ubuntu 26.04's 7.0"); `sensor-feasibility` 18 of 18 with the runner's fix for `/usr/bin/true` as a symlink; L3, no degradation, 55 LSM links. Earlier (2026-10-22, lab PR 229, `7.0.0-38`): `install.sh --upgrade` needed the immutable state directory unlocked before `install -d` (fixed); `malsim/exec-check.sh` passed except its two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su), which drew no record — a follow-up | 2026-11-26 (stage S1, lot 1.5) |
+| Debian 13 (trixie) | 6.12.118+deb13-cloud-amd64 | `lsm=…,bpf` set by the lab template | yes | **verified in the lab** — stage S1 round: `verifier-check` 126 of 130 OK, 4 not counted (optional), 0 failing, the highest `execmap_check` at 33.9% of the 900k gate, every stack chain within 448; L3, no degradation, 55 LSM links. The first guest from 6.9: `inode_setattr`'s dentry is argument 1, read from the prototype (see "Kernels from 6.9" below). Earlier (2026-10-16, lab PR 164): chmod, chown and touch of a protected file refused (allowed on `main` then), the FIM setattr observer records; privileged suites 81 of 82 — DNS attribution failed under `nss-resolve` (fixed by lab PR 229) | 2026-11-26 (stage S1, lot 1.5) |
+
+The stage S1 round (2026-11-26, `main` at `7f4834ce`, the eBPF object of
+that commit's CI run, sha256 `4a410ff354ab4c32…`, on every guest) is
+written up in
+<https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>;
+its margins are below in "Verifier headroom", its kernel census in "The
+kernel census (stage S1)". "Not counted" are the documented optional
+programs: the variants built for another kernel's signature of the same
+function (`dns_answer_*_ret4/5/6`, `inbound_accept_ret2/4`), the hooks a
+kernel lacks (`inode_set_acl` and `inode_remove_acl` before 6.2,
+`bpf_prog_load` before 6.9 except el9, the `bpf_link` iterator on 5.15),
+and `nn_calib_override` where the kernel has no `bpf_override_return`.
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
@@ -693,9 +705,11 @@ kernel alone, using `bpftrace` and no agent:
 - `sched:sched_process_exec` (not a syscall's tracepoint) and the
   `security_bprm_check` hook fired on every CPU.
 
-Upstream reworked that path in 2026: 57918341dd19 runs the program
-before the perf list check, and 2c2b322acdcc is the stale-head fix. Which
-patch Ubuntu's kernel carries was not identified.
+Upstream reworked that path in 2026: 57918341dd19 (first in 7.2) runs the
+program before the perf list check, and 2c2b322acdcc (7.2, marked for the
+stable trees) is the stale-head fix. Which patch Ubuntu's kernel carries
+was not identified, and a kernel's version does not say, so the agent asks
+the kernel at boot (below).
 
 What it meant here:
 
@@ -704,10 +718,20 @@ What it meant here:
   `bprm_check_security`.
 - **Exec sensor, tracepoint mode** (`sys_enter_execve`, when the LSM program
   cannot run) and **file-open sensor fallback** (`sys_enter_openat`). On
-  such a kernel they see only the calls made on CPU 0. Both are fallbacks
-  of a degraded start. The telemetry probe's exec and open steps miss on
-  the rounds whose child runs elsewhere, which ends in its alert. They are
-  not fixed by lot 322.
+  such a kernel they saw only the calls made on CPU 0. Both are fallbacks
+  of a degraded start. Lot 322 did not change them; lot 1.3 (lot 324) did:
+  when a sensor starts on its syscall tracepoint, a boot self-test makes
+  one harmless call on every online CPU, and where the tracepoint misses
+  one the sensor moves to the raw `sys_enter` tracepoint, which runs on
+  every CPU, signed as a degradation that names the CPUs
+  ([`SENSOR_CONTRACT.md`](SENSOR_CONTRACT.md) §5c). Measured on
+  `7.0.0-43-generic` (4 vCPU) in the stage S1 round, 10 calls per CPU with
+  `taskset`: the `sys_enter_execve` and `sys_enter_openat` tracepoints
+  10 / 0 / 0 / 0, the raw `sys_enter` 10 / 10 / 10 / 10; the installed
+  agent, its sensors set to their tracepoints, signed the gap ("seen on
+  CPUs 0, missed on CPUs 1-3"), took the fallback and recorded 10 of 10
+  execs on each CPU. The test runs once, at the boot: a CPU brought online
+  later is not tested.
 
 A program on a non-syscall tracepoint, a raw tracepoint (the exploit
 guard's `sys_enter` / `sys_exit`), a BTF tracepoint, a kprobe or an LSM hook
@@ -724,6 +748,46 @@ low-latency flavour.
 
 The environment check reads the 32-bit (`int $0x80`) and x32 execs as
 well; x32 calls exist only where the kernel has `CONFIG_X86_X32_ABI`.
+
+## Where a deny decides: kernel objects and kernel copies
+
+A deny program decides what it lets through on the kernel's own objects —
+an inode by its device and number, a mount and its peer group, a task's
+credentials and cgroup, a BPF object, a program's type and instructions —
+or on the kernel's own copy of what the caller passed, never on the
+caller's memory or on a name the caller chose. Memory the caller still
+shares can change between a read of it and the kernel's copy (a second
+thread rewrites it), so a check of it can judge something other than what
+the kernel acts on. Where a hook can only read the caller's memory, that
+read may refuse early, as a first layer; what it lets through is judged
+again on the kernel's copy, or the operation is observed and recorded,
+not decided. A new deny program keeps to this rule. The precedents:
+
+- **sysctl writes** (lot 280a). The write deny on `file_permission` reads
+  the writer's bytes and stays the first layer; the `cgroup/sysctl` judge
+  decides on the kernel's copy (`bpf_sysctl_get_new_value`), after the
+  kernel duplicated the buffer and before the handler parses it. Where the
+  judge cannot be linked, the write deny judges alone and the start signs
+  that degradation.
+- **The exec environment** (lots 322 and 325). Its check no longer reads
+  `envp` on the syscall tracepoints. The first pass at
+  `bprm_check_security` reads the caller's memory and can refuse a staging
+  preload; `execpol_env_commit` judges the kernel's copy in the new image
+  after the point of no return, which no other task shares, and kills
+  before the image's first instruction what the first pass missed
+  ([the exec policy's design](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md)).
+- **BPF loads** (lot 345). The `bpf` hook reads `expected_attach_type`
+  from the kernel's copy of the attr, and from 6.9 `bpf_prog_load_guard`
+  reads the kernel's copy of the instructions (see "The BPF content
+  judge").
+- **`mount_setattr(2)`** (lot 1.1). It has no LSM hook; an `fmod_ret`
+  program on the syscall would read the caller's memory. The guard counts
+  the change at `change_mnt_propagation`, a kernel function that receives
+  the mount the kernel resolved, and the integrity round signs it.
+
+What the fallback modes read from the caller's memory (the exec sensor's
+`sys_enter_execve` filename, the file-open fallback's, the io_uring
+tracepoints) is recorded, never the ground of a refusal.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
@@ -880,6 +944,18 @@ same rules or the 22.04 guest will refuse to load it:
     branch on each read's result, took its global function past the
     million on 5.15 by itself.
 
+13. **A bound the verifier needs is tested on the register the value is
+    used from** (lot 1.2, LLVM 22). LLVM 22 moved three such tests — onto
+    the whole source word, onto a copy, or out as redundant — and folded an
+    LSM verdict into arithmetic: 5.15 and 6.12 refused
+    `sched_process_exec`, 5.15 `exec_check_lsm` and `execmap_check`, and
+    6.12 `exec_check_lsm` again, for its return value. The value now goes through `opaque::opaque` (a
+    volatile read of a local, which the compiler cannot see through) before
+    its clamp or mask, and `exec_check_lsm`'s verdict through
+    `opaque::lsm_ret`, which brings it into `[-4095, 0]` on the register
+    returned and fails closed (a positive value is `-EACCES`).
+    `xtask/tests/ebpf_barriers.rs` keeps each barrier before its test.
+
 Lab notes for 22.04-era userland:
 
 - sudo 1.9.9 does not relay a signal sent by a process in its own process
@@ -960,6 +1036,106 @@ lot is `module_read_file_observe`, 551,900 on 5.15 (55.2%; 68,066 to 84,080 else
 own field where both exist: on 7.0 the two agreed for 100 of 100 programs
 (`kprobe cross-check`); on 6.8 and 6.12 `check_max_stack_depth` is not a
 kprobe target (the program info counts there, so nothing is unmeasured).
+
+### At the end of stage S1 (2026-11-26)
+
+The gates are those above, plus two from lot 1.3: `verifier-check` fails a
+kernel where a program's deepest call chain is over 448 of the verifier's
+512 bytes of stack, or could not be read back, and its report gives each
+program's share of the 900,000-instruction gate. The stage's own exit
+criterion was every program at most 80% of the gate on 5.15 and 6.1, the
+two kernels whose verifiers count the most. The stage S1 round measured it
+on six kernels: no program is refused but the documented optional ones
+(see "Verified matrix"), the highest is `module_read_file_observe` at
+479,498 on 5.15 and 6.1 (53.3%), at most 33.9% on the other four, and
+every chain is at most 448 bytes (`bpf_syscall_observe`,
+`fim_file_open_sensor`), with no debt left
+(`no_program_s_stack_chain_is_over_448_bytes`). The el9 kernel's verifier gives the
+same count as 6.12's for every program.
+
+The programs above 100,000 on one kernel at least (processed
+instructions; the share of the gate on 5.15 and 6.1; the deepest chain
+over the six kernels, in bytes):
+
+| program | 5.14 el9 | 5.15 | 6.1 | 6.8 | 6.12 | 7.0 | of the gate 5.15 / 6.1 | chain |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `module_read_file_observe` | 75,761 | 479,498 | 479,498 | 76,440 | 75,761 | 66,161 | 53.3% / 53.3% | 96 |
+| `mount_guard_move_mount_point` | 99,243 | 441,309 | 372,416 | 111,027 | 99,243 | 100,993 | 49.0% / 41.4% | 416 |
+| `mount_guard_sb_mount_point` | 65,976 | 380,618 | 334,375 | 63,222 | 65,976 | 64,015 | 42.3% / 37.2% | 384 |
+| `mount_guard_sb_umount` | 244,167 | 329,045 | 328,988 | 246,756 | 244,167 | 242,681 | 36.6% / 36.6% | 352 |
+| `execmap_check` | 304,741 | 327,746 | 293,718 | 261,797 | 304,741 | 277,196 | 36.4% / 32.6% | 416 |
+| `execpol_env_commit` | 233,115 | 316,015 | 311,741 | 225,174 | 233,115 | 227,378 | 35.1% / 34.6% | 320 |
+| `fim_file_open_sensor` | 61,592 | 233,493 | 137,097 | 70,997 | 61,592 | 61,054 | 25.9% / 15.2% | 448 |
+| `exec_env_lsm` | 221,130 | 227,623 | 223,337 | 221,182 | 221,130 | 215,515 | 25.3% / 24.8% | 352 |
+| `mount_guard_sb_mount_propagate` | 110,202 | 206,308 | 112,061 | 111,130 | 110,202 | 169,553 | 22.9% / 12.5% | 288 |
+| `fim_rename_observe` | 159,060 | 106,641 | 101,200 | 157,441 | 159,060 | 157,273 | 11.8% / 11.2% | 416 |
+| `exec_check_lsm` | 106,388 | 153,358 | 115,199 | 99,583 | 106,388 | 100,453 | 17.0% / 12.8% | 384 |
+| `probe_file_open` (the lab's probe) | 12,890 | 120,951 | 77,362 | 12,889 | 12,890 | 14,324 | 13.4% / 8.6% | 160 |
+
+Every other program is below 100,000 on every kernel. The full table, one
+row per program, is in the stage's results file (above, "Verified
+matrix").
+
+The DNS response program (lot 1.4) reads the socket's peer port and the
+message's address with plain loads from the hook's BTF-typed arguments
+(`struct sock *`, `struct msghdr *`), at the compiled offsets, which the
+verifier checks against the running kernel's BTF; where the offset
+resolved at load differs from the compiled one, the probe helper reads it.
+
+## The kernel census (stage S1)
+
+The stage S1 round also took a census of the kernel facts the agent
+relies on, on each guest before the agent was installed (the BTF,
+tracefs, kallsyms, `bpftool feature probe`, the sysctls and the kernel's
+configuration), then the installed agent's own view. On all six kernels
+the installed agent ran at trust level L3 with no degradation and no event
+lost, its sensor self-tests seen for its 16 sources.
+
+| | 5.14 el9 | 5.15 | 6.1 | 6.8 | 6.12 | 7.0 |
+|---|---:|---:|---:|---:|---:|---:|
+| the object's LSM hooks present in the BTF | 46 / 46 | 43 / 46 | 43 / 46 | 45 / 46 | 46 / 46 | 46 / 46 |
+| LSM links of the installed agent | 55 | 53 | 53 | 55 | 55 | 55 |
+| all links of the installed agent | 101 | 96 | 97 | 99 | 101 | 99 |
+| `--btf-check` | SUPPORTED | SUPPORTED (degraded) | SUPPORTED | SUPPORTED | SUPPORTED | SUPPORTED |
+| BTF slots resolved / differing from the build kernel / absent | 164 / 66 / 0 | 164 / 64 / 2 | 164 / 58 / 0 | 164 / 22 / 0 | 164 / 45 / 0 | 164 / 65 / 0 |
+| hook arguments checked | 40 | 38 | 38 | 40 | 40 | 40 |
+
+The hooks absent on 5.15 and 6.1 are the optional `bpf_prog_load`,
+`inode_set_acl` and `inode_remove_acl`; 6.8 lacks only `bpf_prog_load`.
+The two slots absent on 5.15 are the optional `iov_iter` `ubuf` fields.
+The mount guard's three stage programs are loaded with no link of their
+own: they run through their hook's program array.
+
+The `fentry` of lot 1.1 on `change_mnt_propagation` is in the BTF,
+traceable and in kallsyms on all six kernels, and the installed agent
+attached it everywhere; `do_mount_setattr` is not traceable under its name
+on any of them (inlined, or only an `.isra` copy). `--btf-check` does not
+check that target yet: on a kernel without the function the agent starts
+with a signed degradation (a propagation change then followed at the
+guard's next refresh, not at once). The raw `sys_enter` fallbacks of lot
+1.3 loaded on all six and were taken only on 7.0.
+
+Kernel facts the agent's code paths depend on:
+
+| fact | 5.14 el9 | 5.15 | 6.1 | 6.8 | 6.12 | 7.0 |
+|---|---|---|---|---|---|---|
+| `fexit` with more than 6 arguments (`ip_make_skb`) | yes | no | no | yes | yes | yes |
+| `bpf_override_return` (`CONFIG_BPF_KPROBE_OVERRIDE`) | no | yes | no | yes | no | yes |
+| `cgroup/sysctl` programs: `bpf_get_current_pid_tgid`, `bpf_get_current_comm` | yes | **no** | yes | yes | yes | yes |
+| `bpf_find_vma` | yes | no | yes | yes | yes | yes |
+| the `bpf_link` iterator | yes | no | yes | yes | yes | yes |
+| verifier count in `bpf_prog_info` (else the kprobe above) | yes | no | yes | yes | yes | yes |
+| io_uring submit tracepoint | `io_uring_submit_req` | `io_uring_submit_sqe` | `io_uring_submit_sqe` | `io_uring_submit_req` | `io_uring_submit_req` | `io_uring_submit_req` |
+| `kernel.io_uring_disabled` | **2** (io_uring off for everyone) | 0 | absent | 0 | 0 | 0 |
+| tracepoint common header | + `common_preempt_lazy_count` | standard | standard | standard | standard | standard |
+| `memfd_create(MFD_EXEC / MFD_NOEXEC_SEAL)` | yes | no (`EINVAL`) | no (`EINVAL`) | yes | yes | yes |
+| Landlock ABI | 6 | 1 | 2 | 4 | 6 | 8 |
+
+The el9 tracepoint header and the two io_uring tracepoint names are
+handled already (the offsets read from tracefs at boot; both names
+tried); 5.15's missing `cgroup/sysctl` helpers are the limit of the
+sysctl judge there. On AlmaLinux 9 io_uring is disabled by default, so the
+io_uring sensor has nothing to see there unless an operator enables it.
 
 ## Kernel fix level (lot 277)
 

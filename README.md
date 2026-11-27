@@ -7,7 +7,7 @@
 **Sovereign endpoint defence for Linux.**<br/>
 Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic on the host · verified in a lab you can rerun.
 
-🆕 **Since the alpha:** Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors. [What's new →](#whats-new-since-the-alpha)
+🆕 **Since the alpha:** stage S1 done — Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors, AlmaLinux 9 and the `.rpm` tested. [What's new →](#whats-new-since-the-alpha)
 
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
@@ -41,7 +41,8 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 >   program: each verdict is recorded as what it *would have* done. Its self-protection and the
 >   host-integrity refusals (untrusted kernel modules, kexec, foreign BPF programs) stay enforced.
 > - **Linux x86_64 only**, verified in our lab on five kernels, which the nightly CI also runs:
->   5.15, 6.1, 6.8, 6.12 and 7.0 (Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13).
+>   5.15, 6.1, 6.8, 6.12 and 7.0 (Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13). Since the
+>   alpha, `main` is verified on AlmaLinux 9 (5.14) too.
 > - **Built with AI assistance, under the founder's direction.** A single-founder project from
 >   the EU. The founder sets the direction, decides and reviews. The code, and much of the
 >   design, were written with Claude Code (Anthropic's AI coding assistant). Reviews and
@@ -63,9 +64,12 @@ Merged after `v0.1.0-alpha` (23 November 2026):
 - The exec and open sensors see every CPU on 7.0, where the syscall tracepoints fired only on CPU 0 ([#625](https://github.com/northnarrow/northnarrow-new/pull/625)).
 - The DNS sensor is 27 to 54% cheaper per event ([#629](https://github.com/northnarrow/northnarrow-new/pull/629)).
 - The code ratchets read the syntax tree, not the text, so a renamed or reformatted variant no longer slips past them ([#628](https://github.com/northnarrow/northnarrow-new/pull/628)).
-- OpenSSF Scorecard 8.2, now run on every change ([#627](https://github.com/northnarrow/northnarrow-new/pull/627)); supply-chain checks tightened ([#616](https://github.com/northnarrow/northnarrow-new/pull/616)).
+- OpenSSF Scorecard 8.2, now run on every change ([#627](https://github.com/northnarrow/northnarrow-new/pull/627)); supply-chain checks tightened ([#616](https://github.com/northnarrow/northnarrow-new/pull/616), [#630](https://github.com/northnarrow/northnarrow-new/pull/630)).
+- AlmaLinux 9 is in the nightly lab run, and the `.rpm` is tested in the lab: the alpha's signed package upgraded in place, cold-booted, removed and purged ([#632](https://github.com/northnarrow/northnarrow-new/pull/632)).
+- With the experimental exec quarantine on, a stop of the agent no longer leaves the processes it held stopped ([#635](https://github.com/northnarrow/northnarrow-new/pull/635)); a DNS response read before its query now answers it ([#636](https://github.com/northnarrow/northnarrow-new/pull/636)).
+- Stage S1 is done: on six kernels (5.14 el9 to 7.0) every program loads, the highest uses 53.3% of the verifier budget and every stack chain is within 448 of 512 bytes ([#637](https://github.com/northnarrow/northnarrow-new/pull/637), [the round](docs/validation/results/stage-s1-2026-11-26.md)).
 
-What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+Upgrading from `v0.1.0-alpha`: [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md). What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
 
 ---
 
@@ -74,9 +78,8 @@ What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#
 
 Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
 
-- [S1 Foundations](ROADMAP.md#s1): AlmaLinux 9 and the `.rpm` package tested in the lab, the lab using the exact eBPF object the CI built, then a stage-wide lab round and the docs.
-- Maintenance: the OpenSSF Scorecard findings (known-vulnerable dependencies, binary fuzz seeds).
-- Next, [S2 Self-protection after the alpha](ROADMAP.md#s2): the installer window limited to the process tree that asked, and upgrades with no protection gap.
+- Done: [S1 Foundations](ROADMAP.md#s1), with its lab round on six kernels ([results](docs/validation/results/stage-s1-2026-11-26.md)) and its [upgrade notes](docs/operator/UPGRADE_NOTES_0.2.md).
+- Next, [S2 Self-protection after the alpha](ROADMAP.md#s2): the installer window limited to the process tree that opened it, upgrades with no protection gap, and the residual items accepted for the alpha closed.
 <!-- working-on:end -->
 
 ---
@@ -176,7 +179,7 @@ flowchart LR
 | | |
 |---|---|
 | **Sense** | Sixteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
-| **Prioritise** | Every event class has its own queue. Tamper (P0) is taken first, so a flood of file opens no longer pushes denials out. A full queue follows its class's policy, and every drop is counted and signed, never silent ([event bus](docs/architecture/EVENT_BUS.md)). |
+| **Prioritise** | Every event class has its own queue. Tamper (P0) is taken first, so a flood of file opens no longer pushes denials out. A full queue follows its class's policy, and every drop from a ring or a queue is counted and signed ([event bus](docs/architecture/EVENT_BUS.md); what is not counted yet is in [the limits](#limits-said-plainly)). |
 | **Decide** | One OS thread with no `await` judges every event against the engine's 87 rules, chain correlation and the posture; most of the blocking I/O it used to do now runs elsewhere. There is no AI model on the host: the on-host LLM advisor was removed in Wave 4 ([upgrade notes](docs/operator/UPGRADE_NOTES_WAVE4.md)). |
 | **Act** | Responses go to a dispatcher: eight workers by default, Critical first, one process's responses in order. Each action is a signed intent before it runs and a signed outcome after it. The posture rises from OBSERVING through ALERTED and ENGAGED to COMBAT only on corroborated evidence. COMBAT climbs from INVESTIGATE to NEUTRALIZE to ISOLATE, and only an Ed25519-signed command releases it. Under the `alpha` profile every step is recorded as what it would have done, and none is carried out. |
 | **Isolate** | Hostile bytes (DNS names today) are parsed by an unprivileged worker: the `northnarrow-worker` account, no capabilities, a seccomp allowlist and Landlock. A source test checks that the root core calls no parser. Each core thread keeps only the capabilities its role needs. The keys live in one `KeyStore`, locked in memory and kept out of core dumps, and the signing key is decided once at boot ([process model](docs/architecture/PROCESS_MODEL.md)). |
@@ -270,9 +273,9 @@ against it on every `cargo test` by
 |---|---|---|
 | Rules | **95** rules the agent can record: 87 in the engine, 8 issued outside it (anti-tamper, exploit guard, exec policy and its environment checks, exec quarantine). Strongest test per rule: an end-to-end test or a lab script for 35, unit tests only for 55, no proof yet for 5 (the experimental exec-policy and quarantine records) | [`RULE_CATALOGUE.md`](docs/detection/RULE_CATALOGUE.md) |
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
-| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2), 28 on AlmaLinux 9's 5.14 el9, which backports them. The eBPF object holds **130** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 124 of the latest pre-alpha release candidate (November 2026), the mount guard's six included, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
+| Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2), 28 on AlmaLinux 9's 5.14 el9, which backports them. The eBPF object holds **130** programs; in the stage S1 round on six lab kernels (5.14 el9, 5.15, 6.1, 6.8, 6.12, 7.0; 26 Nov 2026) the verifier rejected none but the documented optional ones, the highest used 53.3% of the 900,000-instruction gate and every stack chain stayed within 448 of 512 bytes; the nightly fails a kernel where a program goes above that gate or a chain above 448 bytes | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), stage S1 |
 | Host tests | more than **6,500** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
-| Privileged suites | run as root in 5 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 22 Nov 2026: 7 of 16 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
+| Privileged suites | run as root in 6 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 22 Nov 2026: 7 of 16 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
 | Event bus | in the lab's file-open flood (EXP-13), anti-tamper denials lost: 3,699 before the priority bus, **0** after | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) |
 | Response | 400 kill trees at once: the longest queue wait went from 19 s to **1.6 s** | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) §2e |
@@ -293,12 +296,12 @@ kernel, and a weekly CI job recomputes the matrix over BTFHub.
 
 | Distribution | Kernel | systemd | Status | Nightly gate | Deny hooks |
 |---|---|---|---|---|---|
-| Ubuntu 22.04 LTS | 5.15 | 249 | supported, degraded (DNS names through the `ITER_IOVEC` path only) | every night and on PRs | 26 |
-| Debian 12 | 6.1 | 252 | supported | every night | 26 |
-| Ubuntu 24.04 LTS | 6.8 | 255 | supported | every night and on PRs | 28 |
-| Debian 13 | 6.12 | 257 | verified in the lab | every night | 28 |
-| Ubuntu 26.04 LTS | 7.0 | 259 | verified in the lab | every night | 28 |
-| AlmaLinux 9 | 5.14 (el9) | 252 | supported with SELinux enforcing; re-verified 2026-11-26 (lot 1.10), the `.rpm` too | every night | 28 |
+| Ubuntu 22.04 LTS | 5.15 | 249 | supported, degraded (DNS names through the `ITER_IOVEC` path only); re-verified 2026-11-26 | every night and on PRs | 26 |
+| Debian 12 | 6.1 | 252 | supported; re-verified 2026-11-26 | every night | 26 |
+| Ubuntu 24.04 LTS | 6.8 | 255 | supported; re-verified 2026-11-26 | every night and on PRs | 28 |
+| Debian 13 | 6.12 | 257 | verified in the lab, again 2026-11-26 | every night | 28 |
+| Ubuntu 26.04 LTS | 7.0 | 259 | verified in the lab, again 2026-11-26 | every night | 28 |
+| AlmaLinux 9 | 5.14 (el9) | 252 | supported with SELinux enforcing; re-verified 2026-11-26, the `.rpm` too | every night | 28 |
 
 The full matrix, with its prerequisites, is in
 [`KERNEL_COMPATIBILITY.md`](docs/operator/KERNEL_COMPATIBILITY.md). Without the `bpf` LSM in the
@@ -311,8 +314,8 @@ Thirty capabilities, each with a level that changes only together with its evide
 **0** absent, **1** partial, **2** present and tested in the lab, **3** mature and verified on every
 supported kernel. The table in
 [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md) was re-assessed on 2026-11-03
-against `main`, separately from the lab PRs, and C14 and C23 again on 2026-11-11. It is a
-self-assessment, not a third party's.
+against `main`, separately from the lab PRs, and C14 and C23 again on 2026-11-11; the stage S1
+note (2026-11-27) changed no level. It is a self-assessment, not a third party's.
 **No capability is at level 3.** Eleven are at 2, ten at 1 and nine at 0.
 
 <details>
@@ -371,6 +374,9 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   well as new rows; only what already left the host (the beats an off-host verifier fetched, an
   export) is beyond its reach. Hardware attestation (a TPM quote of the measured boot) is future work
   ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md#what-it-does-not-prove)).
+- **Not every loss is counted yet.** Drops in the kernel's rings, the decoder's refusals and the
+  event bus's queues are counted and signed. A run of one of the agent's eBPF programs that the
+  kernel itself skipped (a probe that missed, a recursion the kernel refused) is not counted.
 - **The capability manifest is the agent's own word.** Every round, the sensor self-test sees
   a harmless live event of 13 of the 16 sources and checks that the other 3 are still attached
   (no harmless operation makes them report); the boot's deny self-test exercises `task_kill` and
@@ -402,6 +408,10 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   `enforcing` is a signed profile switch ([`ALPHA_PROFILE.md`](docs/operator/ALPHA_PROFILE.md)).
 - **Prevention is experimental and off by default:** the exec policy, exec quarantine and copy on
   first write ([`EXEC_POLICY.md`](docs/design/EXEC_POLICY.md)).
+- **A rule's kill is containment, not prevention.** A kill decided in user space (by a rule or the
+  COMBAT ladder) acts after the event it judged: it stops a program that already ran. What
+  prevents is a refusal in the kernel before the operation: the deny hooks of the
+  self-protection and the host-integrity judges, and the experimental exec policy.
 
 ---
 
@@ -476,6 +486,8 @@ health check, and any failure restores and restarts the previous version
 (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §2). At every boot the agent compares its
 binaries and its eBPF object with the manifest, and refuses to start on a mismatch.
 
+- Upgrading from `v0.1.0-alpha`: read
+  [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md).
 - Upgrading from `v0.0.1-tappa9.0`: read
   [`UPGRADE_NOTES_AUDIT_16f7563.md`](docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md), then
   [`UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md).
@@ -509,12 +521,13 @@ binaries and its eBPF object with the manifest, and refuses to start on a mismat
 ## Roadmap
 
 The tracker is [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md): one note per
-lab PR, with what moved, what the lab measured and what is still open. The history of the
+lab PR up to the alpha's maintenance, one per stage from S1 on, with what moved, what the lab
+measured and what is still open. The history of the
 earlier stages is in [`ROADMAP.md`](ROADMAP.md), the goals are in [`VISION.md`](VISION.md), and
 the long-term technical vision is in [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are
 published: milestones ship in order.
 
-**After the alpha: 22 stages, S1 to S22**, in [`ROADMAP.md`](ROADMAP.md#roadmap-after-v010-alpha), each with a goal, what you will see and its status. S1 (foundations: verifier margin on every kernel, a modern toolchain, sensors on every CPU) is in progress, 8 of its 11 changes on `main`. S2 to S9 follow: self-protection after the alpha, seeing failed attempts, kernel helpers, keyed decoys, fewer false positives, bounded responses, evidence off the host, quarantine scanning. S10 to S14 (a cold kernel surface, envelopes for exposed services, code origin, native switches, shared indicators) are built in "would have denied" mode and need a maintainer decision on enforcement for their last step. S15 to S22 are the Phase 4 work below.
+**After the alpha: 22 stages, S1 to S22**, in [`ROADMAP.md`](ROADMAP.md#roadmap-after-v010-alpha), each with a goal, what you will see and its status. S1 (foundations: verifier margin on every kernel, a modern toolchain, sensors on every CPU) is done, with its lab round on six kernels on 26 November 2026. S2 to S9 follow, S2 next: self-protection after the alpha, seeing failed attempts, kernel helpers, keyed decoys, fewer false positives, bounded responses, evidence off the host, quarantine scanning. S10 to S14 (a cold kernel surface, envelopes for exposed services, code origin, native switches, shared indicators) are built in "would have denied" mode and need a maintainer decision on enforcement for their last step. S15 to S22 are the Phase 4 work below.
 
 **Done: the foundations.** eBPF sensors, the rule engine, the response engine, the adaptive
 posture, anti-tamper, the signed COMBAT release, FIM, deception, network observability and

@@ -1,5 +1,10 @@
 # Upgrade notes: Wave 4
 
+> Frozen at `v0.1.0-alpha`. What changes after the alpha is in
+> `UPGRADE_NOTES_0.2.md`. Here only facts found wrong later are corrected,
+> each marked "Corrected after the alpha", and comparisons with no source
+> are removed.
+
 What changes for an operator who upgrades to a build of Wave 4 (the
 capability program, tracker in the source repository:
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md>).
@@ -111,7 +116,7 @@ and every model and tokenizer dependency. Why:
   left every model measurement open);
 - it cost gigabytes of RAM on a server (about 7 GB of peak RSS with the
   model loaded);
-- mature EDRs keep on-host detection deterministic; an AI assistant, if
+- on-host detection is to stay deterministic; an AI assistant, if
   any, belongs off the enforcement path (for instance a future analyst
   assistant on the backend).
 
@@ -1188,7 +1193,7 @@ configure; use the `nn-admin` of this release where the export is checked.
 - **`--since` and `--until`**: a value past any row's time (beyond year
   9999, or 2^63 seconds and more) keeps no row for `fim report` and `net
   flows`, and is the farthest time for `detections`; `nn-admin heartbeat
-  verify --max-skew-secs` holds at any value. They all kept every row, or
+  watch --max-skew-secs` holds at any value. They all kept every row, or
   reported a skew, before.
 - Nothing to configure; the files' formats are unchanged.
 
@@ -3971,7 +3976,11 @@ round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
   mounts included), `unshare -m` (with `--propagation shared` too),
   `systemd-nspawn` and systemd's own unit namespaces work. A tool
   that removes `/sys/fs/bpf/northnarrow` by hand must unmount it first, in
-  a window. `findmnt /sys/fs/bpf/northnarrow` shows the lock
+  a window. Corrected after the alpha: these refusals hold for a
+  `mount(2)` caller. A `mount` built on the new mount API (util-linux 2.39
+  and later, Debian 13's 2.41) makes the same changes through
+  `mount_setattr(2)`, which has no LSM hook: they succeed and the
+  integrity round signs them (`UPGRADE_NOTES_0.2.md` §3). `findmnt /sys/fs/bpf/northnarrow` shows the lock
   (`unbindable`).
 
 - **The root's own point (a fix found by the lab).** The host's `/` was
@@ -4099,7 +4108,9 @@ in `Init`; `unshare -m --propagation shared` the same.
   /sys/fs/bpf:/sys/fs/bpf:rshared`, `unshare -m --propagation shared`.
 - **Unchanged in the host's namespace.** `mount --make-rshared` and
   `--make-rprivate` of `/`, `/sys` or `/sys/fs/bpf` stay refused and
-  signed High (`NN-L-AT-001`, operation `mount`). Every change of
+  signed High (`NN-L-AT-001`, operation `mount`) for a `mount(2)` caller
+  (corrected after the alpha: through `mount_setattr(2)` they are not
+  refused, §52.1). Every change of
   propagation of the lock itself, or of a raw namespace's copy of it whose
   changes reach the host's, stays refused in every namespace.
 - **What it costs.** It is inside the raw-namespace residual of 52.1: a

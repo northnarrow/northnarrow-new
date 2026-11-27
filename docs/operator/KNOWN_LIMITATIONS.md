@@ -1,6 +1,7 @@
 # Known limitations of the alpha
 
-> Checked again for the v0.1.0-alpha tag.
+> Checked again for the v0.1.0-alpha tag, and for `main` after stage S1
+> (2026-11-27): an item S1 changed names its lot.
 
 This page is for people who test the NorthNarrow alpha. It lists what we
 know does not work yet, or works only in part, so that you can tell a
@@ -135,12 +136,20 @@ how.
 
 ## Packages and supply chain
 
-- **The `.rpm` has not been tested in our lab.** It is built and signed in
-  CI and passes the CI self-test, but our lab has no Fedora, RHEL or
-  AlmaLinux guest. The `.deb` (Ubuntu 24.04, Debian 13) and the tarball
-  were tested. *For you:* if you test the `.rpm`, please report what you
-  see, even when it works. *Evidence:* internal check Phase 1 §7; internal
-  check Phase 2b §4.5 (the Debian package).
+- **The `.rpm` is tested on AlmaLinux 9 only.** Since lot 1.10 the lab
+  checks it on AlmaLinux 9.9 (SELinux enforcing): the alpha's signed
+  package installed with dnf's signature check, a build of `main` put over
+  it in place, a cold boot, the removal and the purge, with nothing left
+  and no SELinux denial; the stage round's package check passed 30 of 30
+  steps. Fedora, Rocky and RHEL itself, an upgrade between two released
+  versions and `gh attestation verify` on that host were not tried. The
+  `.deb` (Ubuntu 24.04, Debian 13) and the tarball were tested before the
+  alpha. *For you:* on another RPM distribution, please report what you
+  see, even when it works. *Evidence:* lot 1.10;
+  `deploy/lab/pkg/release-rpm-check.sh`; `deploy/lab/pkg/pkg-check.sh`;
+  the stage round,
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>; internal check Phase
+  2b §4.5 (the Debian package).
 - **The SBOMs do not cover the eBPF object.** The release has three
   CycloneDX SBOMs: the agent (which covers `nn-admin` too), the watchdog
   and the scanner. The eBPF object built into the agent is a separate crate
@@ -459,15 +468,22 @@ not cause as an incident.
   loss that comes back soon after one already signed is reported again
   later, as every drift finding is:
   - a change of the lock's own settings through `mount_setattr(2)`, which
-    has no kernel hook, is not refused. A change of its propagation: the
-    next round signs it (`pin_lock_changed`, `mount_attrs_changed`) and
-    makes the lock again. A read-only bind remount: signed
+    has no kernel hook, is not refused. A change of its propagation: since
+    lot 1.1 the kernel's change is counted as it is made and the guard
+    follows it within a second; the next round signs it
+    (`pin_lock_changed`, `mount_attrs_changed`) and makes the lock again.
+    A kernel without the function the count sits on starts with a signed
+    degradation; the six lab kernels have it. A read-only bind remount: signed
     (`mount_attrs_changed`), not undone — the lock stays read-only, and
     the agent's writes of pins there fail (each a signed degradation),
     until you act (below);
   - another mount namespace's own copy of the lock is not judged as the
     host's lock: the host's bpffs view and the pins can be lost through
-    it. Signed `protected_mount_gone` and `pin_lock_missing`;
+    it. Signed `protected_mount_gone` and `pin_lock_missing`. Since lot
+    1.1 a `move_mount(2)` of an attached peer copy of a held mount (the
+    lock, `/sys`, the bpffs) is refused in any namespace; a move of one
+    through `mount(2)` outside the guarded namespaces is judged by where
+    it lands, and what follows by the unmount guard and the round;
   - the systemd units' own mount namespaces, the agent's and the
     watchdog's among them, never have the lock. That namespace's view of
     the bpffs can be lost, not the host's nor the pins; what reads the pins
@@ -476,7 +492,7 @@ not cause as an incident.
     was made does not hold the lock: the host's bpffs view can be lost
     through it. Signed `protected_mount_gone`.
 
-  A hardening lot after the alpha narrows the first two. A start that finds
+  Lot 1.1 narrowed the first two, as above. A start that finds
   no lock (a kernel without `open_tree(2)`, an error) signs a degradation
   and the round makes it. *For you:* if a `protected_mount_gone`,
   `pin_lock_missing`, `pin_lock_changed` or `bpf_pin_vanished` appears that
@@ -488,8 +504,11 @@ not cause as an incident.
   `a_lost_or_changed_lock_is_a_finding_and_made_again`;
   `a_start_without_the_lock_is_a_degradation`;
   `a_removed_held_pin_is_a_high_pinned_again`;
-  `a_mount_gone_from_under_the_agents_paths_is_reported`; lot 359;
-  internal check Phase 2c §7; internal check Phase 8b §4.2.
+  `a_mount_gone_from_under_the_agents_paths_is_reported`;
+  `a_propagation_change_counts_on_a_guarded_or_held_mount_or_the_lock`;
+  `a_move_of_a_peer_copy_of_a_held_mount_is_refused_in_any_namespace`;
+  lot 359; lot 1.1; internal check Phase 2c §7; internal check Phase 8b
+  §4.2.
 - **On Debian 13 the system's `mount` changes mount flags without a
   refusal.** Its `mount` (util-linux 2.41, built with the new mount API:
   `mount --version` lists `fd-based-mount`) changes a mount's propagation
@@ -508,14 +527,17 @@ not cause as an incident.
   `pin_lock` degradation only while the lock is not in place). The
   lock's propagation is made again within that round; a read-only remount
   of the lock is signed and stays until you act, as in the item above; the
-  other mounts' changes are signed, not undone. Another distribution
-  whose `mount` is built the same way behaves like Debian 13. *For you:*
+  other mounts' changes are signed, not undone. Since lot 1.1 a change of
+  propagation there is counted as the kernel makes it, and the guard
+  follows it within a second; the record is still the round's. Another
+  distribution whose `mount` is built the same way (util-linux 2.39 and
+  later) behaves like Debian 13. *For you:*
   on such a host, treat a `mount_attrs_changed` or `pin_lock_changed` you
   did not cause as an incident, read the mount it names, and put it back
   inside a trusted-installer window. *Evidence:*
   `a_lost_or_changed_lock_is_a_finding_and_made_again`;
-  `a_protected_mounts_attributes_changed_are_reported`; lot 384; internal
-  check Phase 3c §4.3.
+  `a_protected_mounts_attributes_changed_are_reported`; lot 384; lot 1.1;
+  internal check Phase 3c §4.3.
 - **The unmount guard reads a bounded part of the mount tree.** An
   unmount is judged on the part of the mount tree the guard reads. Outside
   the host's namespace some unmounts that take a host mount the agent
@@ -912,6 +934,15 @@ not cause as an incident.
   `alpha` they would only observe anyway. *Evidence:*
   `every_enforcing_switch_takes_the_resolved_gate`; internal check Phase 4
   §7.
+- **The exec quarantine after a crash of the agent.** With the quarantine
+  on, a stop of the agent releases every process it held, also when its
+  controller is busy (since the fix of #633). After the agent was killed
+  (SIGKILL, the OOM killer) the processes it held stay stopped until the
+  next start, which releases them only when the quarantine runs again; a
+  start with it off or degraded, and `uninstall.sh` after such a crash,
+  leave them stopped. *For you:* after a crash of an agent with the
+  quarantine on, start it again before you uninstall it. *Evidence:*
+  `the_next_start_releases_what_a_killed_agent_held`.
 
 ## False positives you may see
 
@@ -1193,10 +1224,13 @@ lists the known false positives of each rule.
   loader, uutils' links, `getent shadow` raise ALERTED.
 
   Residuals:
-  - **A file re-read after an exec.** A read-only open that a process
-    repeats after it executes another program may be recorded once, under
-    the program that ran first; a write is always recorded. An eBPF
-    change, planned for the first eBPF lot after the alpha.
+  - **A file re-read after an exec.** Since lot 1.4 a read-only open
+    that a process repeats after it executes another program is recorded
+    again, under the new program. One narrower case is left: the same
+    executable run again within the second, whose new memory map lands at
+    the old one's address, is still taken for a repeat (that read is
+    already recorded, under the same program). A write is always
+    recorded.
   - **A forker that gave up its privilege** between the fork and the
     pump's read is taken for one that never held it (only root's own
     process can; R018 judges any module its fork loads). A `modprobe` a
@@ -1247,19 +1281,27 @@ lists the known false positives of each rule.
 ## Kernels and distributions
 
 - **Tested.** Ubuntu 22.04 (5.15), Debian 12 (6.1), Ubuntu 24.04 (6.8),
-  Debian 13 (6.12) and Ubuntu 26.04 (7.0)
+  Debian 13 (6.12) and Ubuntu 26.04 (7.0) for the alpha; since lot 1.10
+  AlmaLinux 9 (5.14 el9) too. The six were verified again by the stage S1
+  round on 2026-11-26
   ([KERNEL_COMPATIBILITY.md](KERNEL_COMPATIBILITY.md), "Verified matrix").
   Ubuntu 22.04 is supported degraded: DNS names are read through one kernel
-  path only. *Evidence:* internal check Phase 8 §4.1; internal check Phase
-  8b §4.1.
-- **The verifier margin on 5.15 and 6.1.** The kernel's verifier accepts
-  every program on the five kernels, but two programs of the mount guard
-  use about 92 % of the instruction budget the project allows itself on
-  5.15 (91 % on 6.1): `mount_guard_sb_mount` processed 830,908
-  instructions on 5.15 at rc10 (internal check Phase 8g), 83.1 % of the
-  kernel's limit of one million and 92.3 % of the project's gate of
-  900,000. A kernel whose verifier counts differently could refuse one.
-  Then the agent does not stop: it starts without that hook, the other
+  path only. *Evidence:* lot 1.5;
+  the stage round,
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>; internal check Phase
+  8 §4.1; internal check Phase 8b §4.1.
+- **The verifier margin.** At the alpha two programs of the mount guard
+  used about 92 % of the instruction budget the project allows itself on
+  5.15 (`mount_guard_sb_mount`, 830,908 of the 900,000-instruction gate).
+  Since lot 1.1 the guard's hooks are each an entry and the stages it
+  tail-calls, and since lot 1.4 every program's deepest call chain is
+  within 448 of the verifier's 512 bytes. Measured at the end of stage S1
+  on six kernels (5.14 el9 to 7.0): no program refused but the documented
+  optional ones; the highest, `module_read_file_observe`, at 53.3 % of the
+  gate on 5.15 and 6.1, 33.9 % at most elsewhere; the mount guard's at
+  49.0 % at most; every stack chain at most 448 bytes. A kernel the lab has
+  not seen, whose verifier counts differently, could still refuse a
+  program. Then the agent does not stop: it starts without that hook, the other
   hooks of the guard attached, and signs a degradation (`anti_tamper:
   mount guard: 4 of 5 hooks attached (sb_mount: verifier rejected LSM
   program …)`), listed by `nn-admin status` (`sensors: DEGRADED`) and in
@@ -1270,7 +1312,10 @@ lists the known false positives of each rule.
   the privileged suite checks the signed row, the manifest and the status
   on a real agent; release builds cannot carry that fault injection. *For
   you:* on any kernel, a mount-guard degradation in `nn-admin status` is
-  worth a report with `uname -r`. *Evidence:* internal check Phase 8b
+  worth a report with `uname -r`. *Evidence:* lot 1.1; lot 1.5;
+  the stage round,
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>;
+  `no_program_s_stack_chain_is_over_448_bytes`; internal check Phase 8b
   §4.3 and §5 (F8b-1); `a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`
   (a privileged suite of the CI's KVM guests);
   `a_build_without_the_test_feature_injects_nothing`;
@@ -1300,9 +1345,15 @@ lists the known false positives of each rule.
   `a_proven_networkd_monitor_reattach_is_low_and_any_other_high`;
   `a_proven_monitor_reattach_raises_nothing_and_any_other_impairs`;
   lot 386.
-- **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
-  build and not since many recent changes; the `.rpm` is untested (above).
-  *Evidence:* internal check Phase 8 §7 (residual R066).
+- **RHEL family: AlmaLinux 9 only.** AlmaLinux 9.9 (5.14.0-741 el9_9,
+  SELinux enforcing) was verified again by lot 1.10 and is in the nightly
+  lab run since. RHEL itself, Rocky and Fedora are not re-verified. On
+  AlmaLinux 9, R018 rates a module load from a tree outside the running
+  kernel's High, not Critical: el9's kmod decompresses a `.ko.xz` itself
+  and loads it with `init_module`, so the kernel sees no file (R011 still
+  acts on the `modprobe`). *Evidence:* lot 1.10;
+  `deploy/lab/expected-failures.tsv`; internal check Phase 8 §7 (residual
+  R066).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
   active LSM list, bpffs at `/sys/fs/bpf`, systemd, `nft`. Without the BPF
   LSM the agent refuses to start. Only the override
@@ -1317,12 +1368,26 @@ lists the known false positives of each rule.
   `northnarrow-agent --btf-check <btf file>` gives a verdict for a
   kernel's BTF without starting anything. *Evidence:* internal check Phase
   8 §4.4 (a field removed: a signed degradation, not a wrong read).
-- **Ubuntu 26.04 (7.0): degraded fallbacks see one CPU.** On that kernel a
-  BPF program on a syscall tracepoint runs only for calls made on CPU 0.
-  The agent's normal start does not use those tracepoints. Only the
-  fallbacks do (a sensor's tracepoint mode, a start without the BPF LSM
-  under the lab override above), and they then miss what runs on other
-  CPUs. *Evidence:* internal check Phase 8 §7 (residual R060).
+- **Ubuntu 26.04 (7.0): syscall tracepoints run on CPU 0 only.** On that
+  kernel a BPF program on a syscall tracepoint runs only for the calls
+  made on CPU 0. The agent's normal start does not use those tracepoints.
+  Only the fallbacks do (the exec and file-open sensors' tracepoint modes,
+  and a start without the BPF LSM under the lab override above), and until
+  lot 1.3 they missed what ran on the other CPUs. Now a boot
+  self-test makes one harmless call on every online CPU, and where the
+  tracepoint misses one the sensor moves to the raw `sys_enter`
+  tracepoint, which runs on every CPU; the choice is a signed degradation
+  that names the CPUs. Measured on 7.0: 10 of 10 execs recorded on each of
+  4 CPUs. Its cost is a filter on every system call while it runs. What
+  is left: the test runs at the boot only, so a CPU brought online later is
+  not tested (where the tracepoint was kept, that CPU's calls are not
+  observed until the agent restarts); and another tool's perf event on the
+  same syscall event during the boot's test can make a CPU look covered
+  (read from the kernel's code, not seen on a guest). *Evidence:* lot 1.3;
+  `live_every_cpu_self_test`;
+  the stage round,
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>; internal check Phase
+  8 §7 (residual R060).
 - **overlayfs, FUSE and NFS.** On these filesystems the kernel's identity of
   a file may not match what `stat()` reports, so a protected or watched
   file there may be neither protected nor watched. The agent signs a
