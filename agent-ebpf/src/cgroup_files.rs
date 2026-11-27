@@ -26,6 +26,12 @@
 //!   programs loaded after it) — every write refused, found by the
 //!   filesystem and the names ([`refuse_switch`]).
 //!
+//! * (lot 2.0) `/proc/sysrq-trigger` (procfs): each request letter acts on
+//!   the whole host, outside every other hook — every write refused to
+//!   every caller outside the agent's family, root included, found by the
+//!   filesystem and the name ([`refuse_switch`]); inside a window let
+//!   through and recorded at its open.
+//!
 //! Outside a signed trusted-installer window only, like every deny.
 
 use aya_ebpf::{
@@ -42,7 +48,7 @@ use northnarrow_common::cgroup_limits::{
 use northnarrow_common::sysctl_judge::{record_dev, sysctl_write_verdict, SysctlVerdict};
 use northnarrow_common::wire::{
     InodeKey, CGROUP_POLICY_V1_REFUSE, FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_V1, FS_OP_OOM_ADJ,
-    FS_OP_SYSCTL, FS_OP_SYSCTL_OPT_OUT, FS_PROTECT_LIMIT_DIR,
+    FS_OP_SYSCTL, FS_OP_SYSCTL_OPT_OUT, FS_OP_SYSRQ, FS_OP_SYSRQ_WINDOW, FS_PROTECT_LIMIT_DIR,
 };
 
 use crate::btf_offsets::{
@@ -114,12 +120,15 @@ pub(crate) unsafe fn refuse_write(
                 return false;
             }
         };
-        // the classification is the shared module's (the host's tests judge it)
+        // the classification is the shared module's (the host's tests judge
+        // it); lot 2.0: procfs's SysRq trigger after its other files
         match special_fs(magic) {
             Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),
             Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),
             Some(SpecialFs::Proc) => {
-                refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)
+                refuse_sysctl(file, inode, hook, phase)
+                    || refuse_oom_adj(file, inode, phase)
+                    || refuse_switch(file, inode, SpecialFs::Proc, phase)
             }
             Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),
             None => false,
@@ -228,6 +237,11 @@ const MODE_READ_FSCREDS: u64 = 0x01 | 0x08;
 /// beyond the names: an inode that cannot be read is signed as `0:0`, and
 /// refused all the same (fail closed); a name that cannot be read is no
 /// switch's.
+///
+/// Lot 2.0: and `sysrq-trigger` on procfs (by its name alone: the
+/// directory is not read for it), refused to every caller outside the
+/// agent's family and a window, root included. Inside a window its write
+/// goes through and its open is recorded (`FS_OP_SYSRQ_WINDOW`, minor).
 #[inline(always)]
 unsafe fn refuse_switch(file: *const c_void, inode: *const c_void, fs: SpecialFs, phase: Phase) -> bool {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
@@ -238,17 +252,30 @@ unsafe fn refuse_switch(file: *const c_void, inode: *const c_void, fs: SpecialFs
         let Some(name) = dentry_name_words(dentry) else {
             return false;
         };
-        let parent = match bpf_probe_read_kernel::<*const c_void>(
-            (dentry as *const u8).add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const c_void,
-        ) {
-            Ok(p) if !p.is_null() => dentry_name_words(p).unwrap_or((0, [0; 3])),
-            _ => (0, [0; 3]),
+        // only `kprobes/enabled` is judged by its directory's name
+        let parent = if matches!(fs, SpecialFs::Debugfs) {
+            match bpf_probe_read_kernel::<*const c_void>(
+                (dentry as *const u8).add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const c_void,
+            ) {
+                Ok(p) if !p.is_null() => dentry_name_words(p).unwrap_or((0, [0; 3])),
+                _ => (0, [0; 3]),
+            }
+        } else {
+            (0, [0; 3])
         };
         let op = switch_file_op(fs, name, parent);
         if op == 0 {
             return false;
         }
-        if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if caller_may(caller) {
+            // lot 2.0: a window's write of the SysRq trigger (not the
+            // family's), recorded at its open; a write on that descriptor
+            // after the window is refused
+            if op == FS_OP_SYSRQ && phase == Phase::Open && !crate::task_kill::is_exempt_pid(caller) {
+                let key = crate::inode_protect::read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });
+                sign(phase, FS_OP_SYSRQ_WINDOW, key);
+            }
             return false;
         }
         let key = crate::inode_protect::read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });

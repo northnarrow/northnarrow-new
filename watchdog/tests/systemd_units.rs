@@ -633,6 +633,14 @@ fn the_watchdog_restarts_on_every_failure_but_not_after_a_stop() {
         value(&d, "SuccessExitStatus").is_none(),
         "no failure passes as success"
     );
+    // lot 2.0: a stop signal it did not request is a failure (restarted),
+    // and the restarted watchdog pulls the agent back in, when both were
+    // stopped at once
+    assert_ne!(ExitReason::UnrequestedSignal.code(), 0);
+    assert_eq!(
+        value(&section_directives(&body, "Unit"), "Wants"),
+        Some("northnarrow-agent.service")
+    );
     // backoff between restarts
     let first = secs(value(&d, "RestartSec").expect("RestartSec"));
     let max = secs(value(&d, "RestartMaxDelaySec").expect("RestartMaxDelaySec"));

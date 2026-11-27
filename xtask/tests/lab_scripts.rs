@@ -641,3 +641,165 @@ fn the_lab_enables_what_it_installs_and_every_upgrade_check_ends_with_a_cold_boo
                 .contains("(( fail == 0 )) && echo \"upgrade-check: OK\"\nexit $fail\nREMOTE\n}")
     );
 }
+
+// ── the SysRq trigger (lot 2.0) ──────────────────────────────────────────
+
+/// Every lab and range script that names the SysRq trigger file writes the
+/// help request `h` to it and nothing else — no request that signals,
+/// kills, reboots, powers off, remounts, crashes or calls the OOM killer is
+/// ever sent from the lab, whatever the build under test refuses. Each
+/// word naming the file is either a write by the suite's helper (`file
+/// write <path> h`) or the test of its existence; a redirect, `tee`, `dd`
+/// or any other letter is none of them.
+#[test]
+fn the_lab_writes_only_the_help_request_to_the_sysrq_trigger() {
+    let mut files = Vec::new();
+    for dir in ["deploy/lab", "deploy/adversarial", "docs/adversarial"] {
+        collect(&repo_root().join(dir), &mut files);
+    }
+    let mut writes = 0;
+    for f in &files {
+        let Ok(text) = fs::read_to_string(f) else {
+            continue;
+        };
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split(" #").next().unwrap_or("");
+            if code.trim_start().starts_with('#') || code.trim_start().starts_with("//") {
+                continue;
+            }
+            let words: Vec<&str> = code.split_whitespace().collect();
+            for (i, w) in words.iter().enumerate() {
+                if !w.contains("sysrq-trigger") {
+                    continue;
+                }
+                let prev = |k: usize| i.checked_sub(k).map(|j| words[j]).unwrap_or("");
+                let next = words.get(i + 1).copied().unwrap_or("");
+                let write = prev(2) == "file"
+                    && prev(1) == "write"
+                    && matches!(next.trim_end_matches(';'), "h");
+                let exists = prev(1) == "-e" && next == "]];";
+                assert!(
+                    write || exists,
+                    "{}:{}: the SysRq trigger is written only with `h`, by the suite's `file write`: {line}",
+                    f.display(),
+                    n + 1
+                );
+                writes += usize::from(write);
+            }
+        }
+    }
+    assert!(writes >= 3, "the suite's SysRq cases are found ({writes})");
+    // the rule itself: a planted other letter, a redirect, are caught
+    for bad in [
+        "nnpy file write /proc/sysrq-trigger e",
+        "echo b > /proc/sysrq-trigger",
+        "echo h >/proc/sysrq-trigger",
+        "printf c | tee /proc/sysrq-trigger",
+    ] {
+        let words: Vec<&str> = bad.split_whitespace().collect();
+        let i = words
+            .iter()
+            .position(|w| w.contains("sysrq-trigger"))
+            .unwrap();
+        let ok = i >= 2
+            && words[i - 2] == "file"
+            && words[i - 1] == "write"
+            && words.get(i + 1).is_some_and(|n| *n == "h");
+        assert!(!ok, "{bad}");
+    }
+
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect(&p, out);
+            } else if matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("sh" | "py" | "bash")
+            ) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Lot 2.0: every case id the anti-tamper suite names (a `run_case`, a
+/// `skipped_case`, a `selected`/`selected_any` test) is one its `--only`
+/// accepts (`only_list_ok`: `C` and 2 digits, or 3 from C100, then at most
+/// one letter) — an id it refuses makes `--only` exit before any case, and
+/// a lab round that selects it runs nothing (lot 2.0's first round of its
+/// keyboard-mask cases: `C113kb`).
+#[test]
+fn every_case_id_of_the_suite_is_one_its_only_accepts() {
+    let text = fs::read_to_string(repo_root().join("deploy/lab/adversarial/anti-tamper.sh"))
+        .expect("the suite");
+    // the rule this test mirrors, as the suite writes it
+    assert!(
+        text.contains(
+            "only_list_ok() { [[ ${1:-} =~ ^C([0-9]{2}|[1-9][0-9]{2})[a-z]?(,C([0-9]{2}|[1-9][0-9]{2})[a-z]?)*$ ]]; }"
+        ),
+        "only_list_ok changed: update this test's mirror of it"
+    );
+    fn accepted(id: &str) -> bool {
+        let Some(rest) = id.strip_prefix('C') else {
+            return false;
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let (num, tail) = rest.split_at(digits);
+        let num_ok = match num.len() {
+            2 => true,
+            3 => !num.starts_with('0'),
+            _ => false,
+        };
+        let tail_ok =
+            tail.is_empty() || (tail.len() == 1 && tail.chars().all(|c| c.is_ascii_lowercase()));
+        num_ok && tail_ok
+    }
+    for (id, ok) in [
+        ("C01", true),
+        ("C55a", true),
+        ("C113", true),
+        ("C113k", true),
+        ("C113kb", false),
+        ("C1", false),
+        ("C013", false),
+        ("C1130", false),
+        ("C113K", false),
+        ("D113", false),
+    ] {
+        assert_eq!(accepted(id), ok, "{id}");
+    }
+    let mut seen = 0;
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split(" #").next().unwrap_or("");
+        if code.trim_start().starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = code.split_whitespace().collect();
+        for (i, w) in words.iter().enumerate() {
+            if !matches!(
+                *w,
+                "run_case" | "skipped_case" | "selected" | "selected_any"
+            ) {
+                continue;
+            }
+            let Some(arg) = words.get(i + 1) else {
+                continue;
+            };
+            let arg = arg.trim_end_matches(';');
+            if !arg.starts_with('C') || arg.contains('$') || arg.contains('"') {
+                continue;
+            }
+            for id in arg.split(',') {
+                seen += 1;
+                assert!(
+                    accepted(id),
+                    "anti-tamper.sh:{}: case id {id} is one `--only` refuses: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+    assert!(seen > 300, "the suite's case ids are read ({seen})");
+}

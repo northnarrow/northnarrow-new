@@ -170,6 +170,9 @@ pub const DEATH_KINDS: &[&str] = &[
     // the agent since its last run (its units kept from starting) — the
     // role vacant for those boots, found at the next start
     "boots_without_agent",
+    // lot 2.0: a role stopped by a stop signal it did not request (no
+    // signed window in force, not the host's shutdown), started again
+    "unrequested_stop",
 ];
 
 /// The review of #586 (P3-2): the attack-class events of the run — nothing
@@ -283,6 +286,12 @@ pub const ADVISORY_KINDS: &[(&str, &str)] = &[
     (
         "quarantine_index_rebuilt",
         "a repair note: the quarantine's index rebuilt from its files",
+    ),
+    (
+        "sysrq_keyboard_signals",
+        "lot 2.0: the host's keyboard SysRq mask lets a keyboard signal processes — a host \
+         setting the agent does not rewrite; no sensor is degraded (a stop the agent did not \
+         request is signed and restarted)",
     ),
     (
         "boot_continuity_unknown",

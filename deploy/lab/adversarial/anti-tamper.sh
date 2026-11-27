@@ -3176,6 +3176,70 @@ else
     fi
 fi
 
+# ── lot 2.0: the SysRq trigger file ──────────────────────────────────────
+# A write of /proc/sysrq-trigger is refused at its write-open to every
+# caller outside the agent's family and a signed window, root included, and
+# signed (deny=sysrq); inside a window it goes through and its open is
+# recorded (deny=sysrq_window, Low). Both cases write the help request `h`
+# only — it prints the list of requests to the kernel log and does nothing
+# else: the lab never sends a request that signals, kills, reboots, powers
+# off, remounts or crashes (xtask/tests/lab_scripts.rs reads every write).
+#   C113  `h` outside a window: refused, signed;
+#   C113b `h` through a second procfs mount (another mount namespace);
+#   C113w `h` inside a window: let through, recorded.
+if selected_any C113,C113b,C113w && [[ ! -e /proc/sysrq-trigger ]]; then
+    skipped_case C113,C113b,C113w "the kernel has no SysRq trigger file" 1
+elif selected_any C113,C113b,C113w && ! wait_no_window 90; then
+    rows+=("| C113 | a write of the SysRq trigger | not run | — | DEVIATION (not run: a trusted-installer window still open after 90 s) |")
+    echo "C113 not run: a window still open" >&2; fail=1
+else
+    run_case C113 "the SysRq help request (h) to the trigger file (no window)" denied "deny=sysrq[^_]" 0 -- nnpy file write /proc/sysrq-trigger h
+    # C113b (the lot's mini-hunt): the same file through a second procfs
+    # mount, in a mount namespace of its own — the name on procfs is judged,
+    # whatever the mount (a bind mount or a symlink reach the same dentry)
+    if selected C113b && command -v unshare >/dev/null; then
+        export NNPY_SRC
+        run_case C113b "the SysRq help request (h) through a second procfs mount, in a mount namespace of its own (no window)" denied "deny=sysrq[^_]" 0 -- \
+            unshare -m --propagation private bash -c 'd=$(mktemp -d) && mount -t proc proc "$d" && python3 -I -c "$NNPY_SRC" file write "$d"/sysrq-trigger h; r=$?; umount "$d"; rmdir "$d"; exit $r'
+    fi
+    if selected C113w; then
+        grant_window 30; sleep 2
+        EV_FORBID="deny=sysrq[^_]" \
+            run_case C113w "the SysRq help request (h) to the trigger file inside a window" allowed "deny=sysrq_window" 0 -- nnpy file write /proc/sysrq-trigger h
+        wait_no_window 90 || echo "C113w: its window not seen ended within 90 s" >&2
+    fi
+fi
+
+# C113k (lot 2.0): the keyboard's SysRq mask (kernel.sysrq) cannot be
+# widened outside a window to the signalling of processes — 1 (every
+# request), or the host's own mask with bit 64 — refused by the sysctl
+# judges and signed (deny=sysctl); the host's own mask written back goes
+# through. Only the mask is written: the lab never sends a SysRq request,
+# from the trigger file (C113 above: `h` only) or from any keyboard.
+#   C113k kernel.sysrq=1 outside a window: refused, signed;
+#   C113m the host's mask with bit 64 outside a window: refused, signed;
+#   C113n the host's own mask (no bit 64) outside a window: let through.
+if selected_any C113k,C113m,C113n && [[ ! -w /proc/sys/kernel/sysrq ]]; then
+    skipped_case C113k,C113m,C113n "the kernel has no SysRq mask" 1
+elif selected_any C113k,C113m,C113n && ! wait_no_window 90; then
+    rows+=("| C113k | a write of the keyboard SysRq mask | not run | — | DEVIATION (not run: a trusted-installer window still open after 90 s) |")
+    echo "C113k not run: a window still open" >&2; fail=1
+elif selected_any C113k,C113m,C113n; then
+    SR0=$(cat /proc/sys/kernel/sysrq)
+    POST=$(post post_same_text /proc/sys/kernel/sysrq "$SR0") \
+        run_case C113k "kernel.sysrq=1, every SysRq function (no window)" denied "deny=sysctl" 0 -- nnpy file write /proc/sys/kernel/sysrq 1
+    POST=$(post post_same_text /proc/sys/kernel/sysrq "$SR0") \
+        run_case C113m "kernel.sysrq=$(( SR0 | 64 )), the host's mask $SR0 with the signalling bit 64 (no window)" denied "deny=sysctl" 0 -- nnpy file write /proc/sys/kernel/sysrq "$(( SR0 | 64 ))"
+    if (( SR0 != 1 && (SR0 & 64) == 0 )); then
+        EV_FORBID="deny=sysctl" run_case C113n "kernel.sysrq written with the host's own mask $SR0 (no window)" allowed "" 0 -- nnpy file write /proc/sys/kernel/sysrq "$SR0"
+    else
+        skipped_case C113n "the host's own mask $SR0 already lets the keyboard signal processes" 1
+    fi
+    # before lot 2.0 the writes went through: put back the host's mask
+    [[ "$(cat /proc/sys/kernel/sysrq)" == "$SR0" ]] || echo "$SR0" > /proc/sys/kernel/sysrq
+    restored C113k "kernel.sysrq" "$SR0" "$(cat /proc/sys/kernel/sysrq)"
+fi
+
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────
 # C55-C61 (C47-C54 are lab PR 152's new-entry cases, which also cover
 # create/link/symlink/mknod/mkdir/xattr in the protected directories; none

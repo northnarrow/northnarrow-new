@@ -378,6 +378,14 @@ const STATICS: &[Kept] = &[
          forked child)",
     ),
     kept(
+        "antitamper-bpf/src/stop_signal.rs",
+        "SLOTS",
+        Process,
+        "lot 2.0: the siginfo of the process's last stop signals (SIGTERM, SIGINT, SIGHUP), \
+         stored by the signal action the kernel runs for the process — a signal disposition is \
+         one per process, so is what it delivered",
+    ),
+    kept(
         "antitamper-bpf/src/kernel_roots.rs",
         "CPUS",
         HostFact,

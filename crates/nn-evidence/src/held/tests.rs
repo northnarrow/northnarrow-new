@@ -555,6 +555,8 @@ fn benign_states_are_advisories_not_degradations() {
         "quarantine_index_rebuilt",
         // lot 387: boots since the last run not knowable (no sensor degraded)
         "boot_continuity_unknown",
+        // lot 2.0: the host's keyboard SysRq mask (a host setting)
+        "sysrq_keyboard_signals",
     ];
     for k in advisories {
         assert_eq!(hold_of(k, "detected"), Hold::Advisory, "{k}");

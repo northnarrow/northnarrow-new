@@ -833,6 +833,11 @@ pub(crate) fn process_event(
                                  recorded",
                                 common::mount_guard::op_name(op)
                             )
+                        } else if *operation == nn_model::FsProtectOperation::SysrqWindow {
+                            // lot 2.0: let through by the window, recorded
+                            "not refused: a write-open of /proc/sysrq-trigger let through by the \
+                             signed trusted-installer window (refused outside one)"
+                                .to_string()
                         } else if *operation == nn_model::FsProtectOperation::MountWindow {
                             let (_, op, _, _, _) = common::mount_guard::record_of(*target_dev);
                             format!(

@@ -104,6 +104,11 @@ pub mod preload;
 /// role, read by the surviving one.
 #[cfg(target_os = "linux")]
 pub mod start_check;
+/// Lot 2.0: a stop signal's sender, as the kernel delivered it, and whether
+/// the stop it ends in was requested (the host's shutdown, a signed window
+/// in force) — the agent's and the watchdog's one rule.
+#[cfg(target_os = "linux")]
+pub mod stop_signal;
 /// systemd over its private socket, served by PID 1: what it reports the
 /// host and our units as, and its reload (external audit EBPF-001; lot
 /// 273c; lot 273d: here, so that the watchdog reads our units' properties

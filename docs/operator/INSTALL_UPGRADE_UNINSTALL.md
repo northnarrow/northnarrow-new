@@ -1260,8 +1260,10 @@ pins it recreates by its predecessor's hooks.
 The watchdog supervises the agent; its own failures are visible too.
 
 **Exit statuses.** The watchdog exits 0 only for a stop it was told to
-make: SIGTERM or SIGINT (a maintenance stop inside the trusted-installer
-window, a shutdown) or a shutdown signed by the admin quorum. Every failure
+make: SIGTERM or SIGINT inside a signed trusted-installer window (a
+maintenance stop) or in the host's shutdown, or a shutdown signed by the
+admin quorum; a stop signal it did not request is a failure (21, lot 2.0).
+Every failure
 has its own status, logged as `watchdog EXITING on a failure` on
 `watchdog.tamper` and recorded for the agent to sign (`watchdog_exit`):
 
@@ -1278,6 +1280,7 @@ has its own status, logged as `watchdog EXITING on a failure` on
 | 15 | the signal handlers could not be installed |
 | 16 | the start refused itself: a loader variable in its environment, or a mapped file that is neither its binary nor a library the release links (a host whose `/etc/ld.so.preload` makes every program load a library, section 1); recorded for the live agent to sign (`watchdog_start_refused`) |
 | 20 | the wait on the agent's pidfd failed (it used to exit 0, and was never restarted) |
+| 21 | a stop signal (SIGTERM, SIGINT) it did not request — no signed trusted-installer window in force at its delivery, not the host's shutdown (lot 2.0): restarted like any failure, and recorded for the agent to sign as `unrequested_stop` (with the signal and its sender), not `watchdog_exit` |
 | 30 | `--record-unit-failure`: the record could not be written |
 
 **Restarts.** The watchdog never stays down.

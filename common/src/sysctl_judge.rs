@@ -26,13 +26,13 @@ use crate::cgroup_limits::{
     SYSCTL_FTRACE_ENABLED, SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION,
     SYSCTL_MAX_MAP_COUNT, SYSCTL_NONE, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
     SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_PERIOD, SYSCTL_SCHED_RT_RUNTIME,
-    SYSCTL_THREADS_MAX, sysctl_refuses_every_write, sysctl_value_harmful,
+    SYSCTL_SYSRQ, SYSCTL_THREADS_MAX, sysctl_refuses_every_write, sysctl_value_harmful,
 };
 
 /// The guarded sysctls by the name `bpf_sysctl_get_name` gives without
 /// `BPF_F_SYSCTL_BASE_NAME` (their path under `/proc/sys`), and by the name
 /// `sysctl(8)` and the policy use, with their kinds.
-pub const SYSCTL_PATHS: [(&str, &str, u8); 10] = [
+pub const SYSCTL_PATHS: [(&str, &str, u8); 11] = [
     (
         "vm/overcommit_memory",
         "vm.overcommit_memory",
@@ -76,6 +76,8 @@ pub const SYSCTL_PATHS: [(&str, &str, u8); 10] = [
         "debug.kprobes-optimization",
         SYSCTL_KPROBES_OPTIMIZATION,
     ),
+    // lot 2.0
+    ("kernel/sysrq", "kernel.sysrq", SYSCTL_SYSRQ),
 ];
 
 /// The name buffer the program reads (`bpf_sysctl_get_name` writes the
@@ -241,7 +243,9 @@ pub enum SysctlVerdict {
 /// `kernel.ftrace_enabled` — 0 blinds the agent itself (the BPF
 /// trampolines stop, its deny hooks among them), and no other value is a
 /// tuning anyone needs — and (lot 280b) the kprobes' switches, which no
-/// host tunes either. `Err` says why.
+/// host tunes either; lot 2.0: `kernel.sysrq`, whose refused masks are the
+/// ones that let the keyboard signal processes (the agent among them).
+/// `Err` says why.
 pub const fn opt_out_allowed(kind: u8) -> Result<(), &'static str> {
     match kind {
         SYSCTL_NONE => Err("not a sysctl the agent guards"),
@@ -253,18 +257,22 @@ pub const fn opt_out_allowed(kind: u8) -> Result<(), &'static str> {
             "the kprobes' switches are never opted out: 0 unoptimises (debug.kprobes-optimization) \
              or disarms (kprobes/enabled) the agent's kprobes (a window lets it through)",
         ),
+        SYSCTL_SYSRQ => Err(
+            "kernel.sysrq is never opted out: a mask that lets the keyboard's SysRq requests signal \
+             processes stops the agent outside its signal hook (a window lets it through)",
+        ),
         _ => Ok(()),
     }
 }
 
 /// The kinds [`opt_out_allowed`] refuses whatever the slot says, as the
-/// eBPF programs test it (no string): `ftrace_enabled` and (lot 280b) the
-/// kprobes' switches.
+/// eBPF programs test it (no string): `ftrace_enabled`, (lot 280b) the
+/// kprobes' switches and (lot 2.0) `kernel.sysrq`.
 #[inline(always)]
 pub const fn never_opted_out(kind: u8) -> bool {
     matches!(
         kind,
-        SYSCTL_FTRACE_ENABLED | SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED
+        SYSCTL_FTRACE_ENABLED | SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED | SYSCTL_SYSRQ
     )
 }
 
@@ -416,6 +424,11 @@ mod tests {
             "kernel/overcommit_memory",
             "kernel/ftrace_dump_on_oops",
             "kernel/sched_rt_runtime_u",
+            // lot 2.0: the SysRq mask by its full path only
+            "sysrq",
+            "kernel/sysrq2",
+            "kernel/sysrq-trigger",
+            "vm/sysrq",
             "",
         ] {
             assert_eq!(k(other), SYSCTL_NONE, "{other}");
@@ -614,7 +627,12 @@ mod tests {
         }
         assert!(!never_opted_out(SYSCTL_NONE));
         for (_, _, kind) in SYSCTL_PATHS {
-            if kind != SYSCTL_FTRACE_ENABLED && kind != SYSCTL_KPROBES_OPTIMIZATION {
+            // lot 2.0: kernel.sysrq is never opted out either (its own
+            // named test below)
+            if kind != SYSCTL_FTRACE_ENABLED
+                && kind != SYSCTL_KPROBES_OPTIMIZATION
+                && kind != SYSCTL_SYSRQ
+            {
                 assert!(opt_out_allowed(kind).is_ok(), "{kind}");
             }
         }
@@ -684,6 +702,62 @@ mod tests {
             ),
             Refuse
         );
+    }
+
+    /// Lot 2.0 (named test): the keyboard's SysRq mask cannot be widened
+    /// to the signalling of processes outside a window — by the
+    /// `cgroup/sysctl` program on the kernel's copy (base 0: `0x40`, `0100`
+    /// are 64) and by the write deny on the bytes; a narrower mask goes
+    /// through; the family and a window pass; never opted out, even with a
+    /// slot that holds the value.
+    #[test]
+    fn the_keyboard_sysrq_mask_cannot_be_widened_outside_a_window() {
+        use SysctlVerdict::*;
+        assert_eq!(kind_of_name("kernel.sysrq"), SYSCTL_SYSRQ);
+        assert_eq!(k("kernel/sysrq"), SYSCTL_SYSRQ);
+        let v = |value| sysctl_kernel_verdict(SYSCTL_SYSRQ, false, value, None);
+        for on in [1, 64, 0x40 | 176, 438 | 64, 511, -1] {
+            assert_eq!(v(Some(on)), Refuse, "{on}");
+            assert_eq!(
+                sysctl_kernel_verdict(SYSCTL_SYSRQ, true, Some(on), None),
+                Allow
+            );
+            // a slot in force changes nothing
+            assert_eq!(
+                sysctl_kernel_verdict(SYSCTL_SYSRQ, false, Some(on), Some((-1, 511))),
+                Refuse,
+                "{on}"
+            );
+            assert_eq!(
+                verdict_of(SYSCTL_SYSRQ, false, true, on, Range::of(Some((-1, 511)))),
+                Refuse
+            );
+        }
+        for off in [0, 16, 176, 438, 128] {
+            assert_eq!(v(Some(off)), Allow, "{off}");
+        }
+        assert_eq!(v(None), Refuse);
+        assert!(opt_out_allowed(SYSCTL_SYSRQ).is_err());
+        assert!(never_opted_out(SYSCTL_SYSRQ));
+        // the write deny: the bytes, decimal only
+        for (bytes, want) in [
+            (&b"1\n"[..], Refuse),
+            (b"64", Refuse),
+            (b"0x40", Refuse),
+            (b"0100", Refuse),
+            (b"176\n", Allow),
+            (b"0", Allow),
+        ] {
+            assert_eq!(
+                sysctl_write_verdict(SYSCTL_SYSRQ, false, Range::NONE, || limit_value(bytes)).0,
+                want,
+                "{bytes:?}"
+            );
+            assert_eq!(
+                sysctl_write_verdict(SYSCTL_SYSRQ, true, Range::NONE, || limit_value(bytes)).0,
+                Allow
+            );
+        }
     }
 
     /// A slot is in force only armed and for this session.

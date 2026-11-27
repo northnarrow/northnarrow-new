@@ -1532,8 +1532,21 @@ pub const FS_OP_MOUNT_NOTED: u8 = 51;
 /// cgroups (`crate::ptrace_read`). Minor.
 pub const FS_OP_PTRACE_READ: u8 = 52;
 
+/// Lot 2.0: a write of `/proc/sysrq-trigger` (procfs) — each request
+/// letter acts on the whole host, outside every other hook — refused
+/// outside a signed trusted-installer window, for every caller outside
+/// the agent's family, root included, whatever it carries: at the
+/// write-open and at the write (`target_dev`/`target_ino` = the file's
+/// inode). The physical keyboard's SysRq is not a file and not judged.
+pub const FS_OP_SYSRQ: u8 = 53;
+
+/// Lot 2.0: NOT a refusal — what [`FS_OP_SYSRQ`] refuses, let through by
+/// the signed trusted-installer window at its write-open (the fields as
+/// its). Minor, as [`FS_OP_MOUNT_WINDOW`].
+pub const FS_OP_SYSRQ_WINDOW: u8 = 54;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_PTRACE_READ;
+pub const FS_OP_LAST: u8 = FS_OP_SYSRQ_WINDOW;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1595,6 +1608,10 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_MOUNT_NOTED
             // its re-check (b): a read-mode access to the agent refused
             | FS_OP_PTRACE_READ
+            // lot 2.0: the SysRq trigger refused at the write-open, signed
+            // at each attempt as the switches are; and a window's write
+            | FS_OP_SYSRQ
+            | FS_OP_SYSRQ_WINDOW
     )
 }
 
@@ -3147,6 +3164,8 @@ mod tests {
             FS_OP_MOUNT_WINDOW,
             FS_OP_MOUNT_NOTED,
             FS_OP_PTRACE_READ,
+            FS_OP_SYSRQ,
+            FS_OP_SYSRQ_WINDOW,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

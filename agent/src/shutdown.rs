@@ -168,6 +168,15 @@ fn stop_result(stop_reason: &str) -> Result<()> {
             "the watchdog's stuck recovery stopped the agent (it did not answer its STATUS pings)"
         );
     }
+    if stop_reason == nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON {
+        // Lot 2.0: a stop signal outside a signed window and the host's
+        // shutdown (signed High at its arrival) — a failure, not a clean
+        // stop: the watchdog, or systemd through its unit, restarts the agent.
+        anyhow::bail!(
+            "a stop signal the agent did not request stopped it (no signed window in force, not \
+             the host's shutdown)"
+        );
+    }
     if stop_reason == "decision_thread_failed" {
         // R12b: no thread to judge on — a failure, not a clean stop.
         anyhow::bail!(
@@ -204,6 +213,8 @@ mod tests {
             "decision_thread_failed",
             // lot 353: the watchdog's stuck recovery
             nn_proto::watchdog_hold::STUCK_STOP_REASON,
+            // lot 2.0: a stop signal nobody requested
+            nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON,
         ] {
             assert!(stop_result(r).is_err(), "{r}");
             assert!(!CLEAN_STOP_REASONS.contains(&r), "{r}");
