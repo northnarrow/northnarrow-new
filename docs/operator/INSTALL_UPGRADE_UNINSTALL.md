@@ -501,6 +501,61 @@ The window ends with the agent that granted it: the new agent of an upgrade
 starts with none (it zeroes the grants at every start), and opens it again
 only for a rollback; nothing after the restart executes from the tree.
 
+### 2.2 From `v0.1.0-alpha` to `v0.1.1-alpha`
+
+Nothing to prepare beyond a key with the `trusted-installer` role: the
+upgrade is the one above, or the package command of §6 with the newer
+package. The packages' version, `0.1.1~alpha-1`, sorts after the first
+alpha's `0.1.0~alpha-1`, so dpkg and rpm take it as an upgrade (no
+`--replacepkgs`):
+
+```sh
+sudo ./deploy/install.sh --upgrade --grant-key /path/to/admin.key                          # the tarball
+sudo NN_GRANT_KEY=/path/to/admin.key apt-get install ./northnarrow_0.1.1-alpha-1_amd64.deb  # the .deb
+sudo NN_GRANT_KEY=/path/to/admin.key dnf install ./northnarrow-0.1.1-alpha-1.x86_64.rpm     # the .rpm
+```
+
+Verify the release first (§5, §6.1). What to expect:
+
+- **The agent and the watchdog restart once**, on the new version
+  (`northnarrow-agent --version` prints `northnarrow-agent 0.1.1-alpha`).
+  That stop is made inside the upgrade's own trusted-installer window, so
+  it is a requested stop: no `unrequested_stop` finding follows it. Keys,
+  `agent_id` and the chains are kept, as in any upgrade.
+- **A new advisory, `sysrq_keyboard_signals`,** is listed by
+  `nn-admin status` when the host's `kernel.sysrq` lets a keyboard signal
+  processes (`1`, every SysRq function, or a mask that includes that
+  function). It degrades no sensor, and the agent never rewrites the
+  mask. The distributions' defaults do not raise it (Ubuntu 176, Debian
+  438, RHEL and AlmaLinux 16). To end it, set a narrower mask (in
+  `/etc/sysctl.d/` too, so that it holds after a reboot): a narrower mask
+  is never refused.
+- **Writes of `/proc/sysrq-trigger` are refused outside a window** (EPERM,
+  signed High, NN-L-AT-001), root's included. A script that uses the
+  trigger on purpose (a crash-dump test, an emergency reboot) runs inside
+  a trusted-installer window, where the write goes through and is
+  recorded (Low). Widening `kernel.sysrq` so that the keyboard can signal
+  processes is refused outside a window the same way.
+- **A stop signal the agent or the watchdog did not request** (no signed
+  window in force at its delivery, not the host's shutdown) is signed
+  `unrequested_stop` (High, naming the signal and its sender) and held in
+  `nn-admin status` until you acknowledge it with the command the status
+  prints; the role it stopped is started again. The watchdog then exits
+  with the new status 21 (§3.9). The supported ways to stop the agent are
+  unchanged (§3.7).
+
+Measured in our lab (lot R1, 2026-11-27, §6): the published
+`v0.1.0-alpha` `.deb` on Ubuntu 22.04 and `.rpm` on AlmaLinux 9.9,
+upgraded to packages of the release branch; the restart on the new
+version, no `unrequested_stop`, the anti-tamper signal cases and the
+SysRq cases passing after the upgrade, a cold boot, and a clean removal.
+
+`UPGRADE_NOTES_0.2.md` has everything else that changed since
+`v0.1.0-alpha` (stage S1 of the roadmap and the maintenance after the
+alpha). Its "Before you upgrade" list asks for no step for a release
+upgrade either: the new toolchains it names are for building from
+source.
+
 ## 3. Uninstall
 
 ```sh
@@ -1494,14 +1549,15 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 tree, and the tag is `v<ver>`: the release workflow's `verify-tag` job
 refuses a tag of another version (`verify-release-tag.sh version`), and
 one whose `CHANGELOG.md` does not open with that version's dated section.
-For the alpha, `<ver>` is `0.1.0-alpha` and `<rel>` is `1`:
-`northnarrow-0.1.0-alpha-x86_64-linux.tar.gz`,
-`northnarrow_0.1.0-alpha-1_amd64.deb`,
-`northnarrow-0.1.0-alpha-1.x86_64.rpm`. Inside, the packages carry the
-pre-release as their managers order it, `0.1.0~alpha-1` (`dpkg -l
+For the second alpha, `<ver>` is `0.1.1-alpha` and `<rel>` is `1`:
+`northnarrow-0.1.1-alpha-x86_64-linux.tar.gz`,
+`northnarrow_0.1.1-alpha-1_amd64.deb`,
+`northnarrow-0.1.1-alpha-1.x86_64.rpm`. Inside, the packages carry the
+pre-release as their managers order it, `0.1.1~alpha-1` (`dpkg -l
 northnarrow`, `rpm -q northnarrow`): `~` sorts before the release, so a
-final `0.1.0` upgrades it, and after `0.0.1`. Every binary's `--version`
-prints `0.1.0-alpha` (`northnarrow-agent 0.1.0-alpha`).
+final `0.1.1` upgrades it, and after every earlier version, the first
+alpha's `0.1.0~alpha-1` included (§2.2). Every binary's `--version`
+prints `0.1.1-alpha` (`northnarrow-agent 0.1.1-alpha`).
 
 The tarball, the packages and the SBOMs carry a SLSA build-provenance
 attestation signed by GitHub's OIDC identity for this repository and
@@ -1794,9 +1850,20 @@ package manifest. Both units came back after a cold boot. `rpm -e` was
 refused without the key and, with it, stopped and detached everything and
 kept `/etc/northnarrow`; `uninstall.sh --package --purge` then left no file,
 unit, pin, BPF program, nft table or iptables chain of NorthNarrow's. No
-SELinux denial was logged. Not tested yet: Fedora, Rocky and RHEL itself,
-an upgrade between two released versions, and the attestation check on
-the host (§5). Report what you see on those.
+SELinux denial was logged. Lot R1 (2026-11-27) ran the upgrade from the
+published `v0.1.0-alpha` packages to packages of the `v0.1.1-alpha`
+release branch (§2.2): the `.deb` on Ubuntu 22.04 (5.15.0-204) with
+`apt-get`, the `.rpm` on AlmaLinux 9.9 with `rpm -U`, each built on the
+guest from the branch (a lab build, packed on purpose with
+`NN_PKG_LAB_FEATURES=1`; the release workflow builds the tag's). Both
+were refused without `NN_GRANT_KEY` (the first alpha kept running); with
+it the units restarted on `0.1.1-alpha`, the keys and `agent_id` were
+kept, the binaries matched the new package and its manifest, and no
+`unrequested_stop` followed. Both units, the pins and the agent's BPF
+programs were back after a cold boot, and removing and purging left
+nothing of NorthNarrow's. Not tested yet: Fedora, Rocky and RHEL itself,
+an upgrade between two packages both built by the release workflow, and
+the attestation check on the host (§5). Report what you see on those.
 
 The packages install the package layout: binaries in `/usr/bin`, units in
 `/usr/lib/systemd/system`, and in `/usr/share/northnarrow` the data tree

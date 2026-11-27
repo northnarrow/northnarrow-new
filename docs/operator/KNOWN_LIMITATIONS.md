@@ -1,7 +1,8 @@
 # Known limitations of the alpha
 
-> Checked again for the v0.1.0-alpha tag, and for `main` after stage S1
-> (2026-11-27): an item S1 changed names its lot.
+> Checked again for the v0.1.0-alpha tag, for `main` after stage S1, and
+> for the v0.1.1-alpha tag (2026-11-27): an item S1 or a later lot changed
+> names its lot.
 
 This page is for people who test the NorthNarrow alpha. It lists what we
 know does not work yet, or works only in part, so that you can tell a
@@ -444,10 +445,11 @@ not cause as an incident.
   - on a kernel where the mount guard is not attached, every such mount is
     a signed degradation, and the mount watch (`mount_over_protected`)
     remains;
-  - the emergency remount (`SysRq-u`) is not refused: it makes every
-    block-backed file system read-only and is signed High
-    (`state_fs_read_only`); restrict `kernel.sysrq` if the host needs no
-    emergency remount.
+  - the emergency remount (`SysRq-u`) typed on a keyboard is not refused
+    (since lot 2.0 a write of the SysRq trigger file is, outside a
+    window): it makes every block-backed file system read-only and is
+    signed High (`state_fs_read_only`); restrict `kernel.sysrq` if the
+    host needs no emergency remount.
 
   *For you:* some administration needs a window: a runtime `systemd-sysext`
   or `confext` refresh, a remount of `/proc`, `/sys`, the cgroup root or the
@@ -459,7 +461,7 @@ not cause as an incident.
   *Evidence:* `a_protected_mounts_attributes_changed_are_reported`;
   `a_mount_over_protected_is_signed_high`;
   `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 357;
-  internal check Phase 8b §7.
+  lot 2.0; internal check Phase 8b §7.
 - **The pin directory's lock: residuals, each signed.** The directory
   that keeps the agent's kernel programs pinned is locked in place. For the
   alpha the lock does not cover every case. In each, the agent keeps its

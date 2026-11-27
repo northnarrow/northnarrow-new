@@ -26,7 +26,7 @@ members = [
 exclude = ["agent-ebpf", "fuzz"]
 
 [workspace.package]
-version = "0.1.0-alpha"
+version = "0.1.1-alpha"
 # Lot 396 (#605): edition 2024 (rustc 1.85 or later; `rust-version` below
 # stayed 1.89 then). `resolver` above stays "2": edition 2024 would default to
 # "3", the rust-version-aware one, and this lot changes no dependency

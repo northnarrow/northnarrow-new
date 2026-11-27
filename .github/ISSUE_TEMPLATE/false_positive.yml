@@ -34,7 +34,8 @@ body:
     id: release
     attributes:
       label: Release, distribution and kernel
-      placeholder: "0.1.0-alpha (tarball), Debian 13, 6.12.57"
+      description: "The release (`0.1.1-alpha`, `0.1.0-alpha`, or a build of `main` with its commit) and how you installed it, `PRETTY_NAME` from `/etc/os-release` and `uname -r`."
+      placeholder: "0.1.1-alpha (tarball), Debian 13, 6.12.57"
     validations:
       required: true
   - type: dropdown

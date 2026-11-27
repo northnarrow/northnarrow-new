@@ -160,7 +160,7 @@ pub struct ScanResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScannerHello {
     pub version: u32,
-    /// Engine and version (`northnarrow-scan 0.1.0-alpha: sha256, lists, elf`).
+    /// Engine and version (`northnarrow-scan 0.1.1-alpha: sha256, lists, elf`).
     pub engine: String,
     pub uid: u32,
     /// The seccomp filter is installed (always, or the scanner exits).

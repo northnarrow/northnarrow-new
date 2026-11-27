@@ -2254,7 +2254,7 @@ fn rpm_release_check_refuses_what_the_host_cannot_vouch_for() {
         let new = base.join(name).join("new");
         fs::create_dir_all(&from).unwrap();
         fs::create_dir_all(&new).unwrap();
-        let rpm_name = "northnarrow-0.1.0-alpha-1.x86_64.rpm";
+        let rpm_name = "northnarrow-0.1.1-alpha-1.x86_64.rpm";
         fs::write(from.join(rpm_name), rpm).unwrap();
         fs::write(new.join(rpm_name), rpm).unwrap();
         fs::write(from.join("RPM-GPG-KEY-northnarrow.asc"), key_bytes).unwrap();

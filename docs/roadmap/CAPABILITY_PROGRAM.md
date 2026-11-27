@@ -15370,3 +15370,50 @@ no level changed.
     `XDR_ROADMAP_TAPPE_NEW.md` marked historical; the design documents'
     open limits stated as behaviour. Lab: none of its own (the stage round
     above is lot 1.5's). Host: the full gates.
+- **Lot R1 — the v0.1.1-alpha release: the version everywhere, the
+  CHANGELOG section dated, the upgrade from the published alpha in the lab
+  (release engineering and docs; no level change).**
+  - What was open: everything merged since `v0.1.0-alpha` (stage S1, M4's
+    #635, M5's #636, lot 2.0's #639) was in no tag, and the tree still
+    said `0.1.0-alpha`; lot 2.0 had no CHANGELOG entry and no upgrade note;
+    the upgrade between two released versions had never run in the lab.
+  - Done:
+    - **The version.** `0.1.1-alpha` in the workspace and `agent-ebpf`, the
+      three lockfiles' entries of our crates, `nn-admin --version` (the
+      golden help and pipes), the wire fixture's version string (one byte
+      of its pinned frame), the packages' examples, the issue forms
+      (`0.1.0-alpha` kept), SECURITY.md's supported versions, the install
+      and upgrade commands of the README and the guides. What
+      `git grep 0.1.0-alpha` still finds is history, or the version
+      upgraded from.
+    - **The CHANGELOG.** `## [0.1.1-alpha] - 2026-11-27`, grouped as
+      Security (lot 2.0 first), Fixed, Changed, Added;
+      `verify-release-tag.sh version v0.1.1-alpha` passes. The ratchet
+      `xtask/tests/release_version.rs` keeps every check and adds the
+      packages' order (`0.1.1~alpha` after the published `0.1.0~alpha`,
+      before `0.1.1`) and the refusal of a `v0.1.0-alpha` tag of this
+      tree.
+    - **The upgrade notes.** `UPGRADE_NOTES_0.2.md` applies from
+      `v0.1.1-alpha` on and gets lot 2.0's §9;
+      `INSTALL_UPGRADE_UNINSTALL.md` §2.2 says what the upgrade from the
+      first alpha does; `KNOWN_LIMITATIONS.md`'s SysRq item names what
+      lot 2.0 refuses.
+  - Lab, as measured (2026-11-27; our own guests, the lab's pkg-check
+    flow: the branch built on the guest, the lab build packed on purpose
+    with `NN_PKG_LAB_FEATURES=1`, its BPF guard in observe):
+
+    | guest | upgrade | after the upgrade | anti-tamper signal cases + C113* | cold boot | removal |
+    |---|---|---|---|---|---|
+    | Ubuntu 22.04, 5.15.0-204 | the published `0.1.0~alpha-1` `.deb` (its `SHA256SUMS` signature checked) to `0.1.1~alpha-1` with `apt-get`; refused without `NN_GRANT_KEY`, the first alpha untouched | units restarted, `northnarrow-agent 0.1.1-alpha`, keys and `agent_id` kept, `dpkg --verify` clean, binary integrity verified against the package manifest, no `unrequested_stop` | 21 of 21 OK (C01 C02 C28 C31 C32 C33 C38 C65, C112–C112x, C113 C113b C113w C113k C113m C113n; mask 176) | both units, 103 pins, 92 own BPF ids, the same 30 s later | `dpkg -P` refused without the key, then nothing left |
+    | AlmaLinux 9.9, 5.14.0-741 el9_9, SELinux enforcing | the published `0.1.0~alpha-1` `.rpm` (dnf's signature check) to `0.1.1~alpha-1` with `rpm -U`; refused without `NN_GRANT_KEY` | the same (`rpm -V` clean), 0 SELinux denials | 21 of 21 OK (mask 16) | both units, 107 pins, 96 own BPF ids, the same 30 s later | `rpm -e` refused without the key, then `uninstall.sh --package --purge`: nothing left but the imported key |
+
+    The first round on Ubuntu 22.04 passed the same up to the cold boot,
+    but kept its check directory in `/tmp`, which Ubuntu empties at boot:
+    the guest came back with `0.1.1-alpha` running (both units, 103 pins),
+    was purged, and the second round above ran whole. Seen and carried
+    forward (behaviour, not this lot's code): after the cold boot of the
+    packaged agent on Ubuntu 22.04, a held `witness_note_uncertified` (S1
+    saw it on AlmaLinux 9); on AlmaLinux 9, after C38 (the watchdog
+    stopped and started again inside a 20 s window), a held
+    `watchdog_gone`, not seen on 22.04.
+  - Host: the full gates, all green.
