@@ -108,6 +108,24 @@ pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
     attach_target_offset(cmd).is_some() && attach_type == ATTACH_CGROUP_SYSCTL
 }
 
+/// Lot 2.2 (the cgroup BPF guard): an attach of a cgroup program type
+/// ([`cgroup_attach_class`]) whose target the `bpf` hook reads — refused on
+/// the agent's unit cgroups and `northnarrow.slice` (and below them)
+/// outside a window, PID 1's included: none of our units declares a
+/// property PID 1 would attach a program for.
+#[inline(always)]
+pub const fn judges_cgroup_attach(cmd: u32, attach_type: u32) -> bool {
+    attach_target_offset(cmd).is_some() && cgroup_attach_class(attach_type) != 0
+}
+
+/// Lot 2.2: a class whose attach to the ROOT cgroup is let through and
+/// recorded High (`wire::BPF_CMD_ROOT_CGROUP_ATTACH`): a packet program
+/// there filters the agent's traffic, a device program its `/dev` opens.
+#[inline(always)]
+pub const fn root_attach_signed(class: u8) -> bool {
+    class == CGROUP_ATTACH_PACKET || class == CGROUP_ATTACH_DEVICE
+}
+
 /// Lot 2.1 (S2 scaffold): the cgroup program attach types of
 /// `enum bpf_attach_type` — every type whose `BPF_PROG_ATTACH` /
 /// `BPF_LINK_CREATE` target is a cgroup's descriptor
@@ -458,6 +476,58 @@ mod tests {
             CGROUP_ATTACH_SYSCTL
         );
         assert_eq!(cgroup_attach_class(u32::MAX), 0);
+    }
+
+    /// Lot 2.2: every cgroup attach type is judged at both attach commands
+    /// and at no other command; no other type is; the root attaches signed
+    /// are the packet and device classes alone.
+    #[test]
+    fn every_cgroup_attach_type_is_judged() {
+        for (name, value, class) in CGROUP_ATTACH_TYPES {
+            assert!(judges_cgroup_attach(BPF_PROG_ATTACH, value), "{name}");
+            assert!(judges_cgroup_attach(BPF_LINK_CREATE, value), "{name}");
+            assert!(!judges_cgroup_attach(BPF_PROG_LOAD, value), "{name}");
+            assert!(!judges_cgroup_attach(BPF_LINK_UPDATE, value), "{name}");
+            assert_eq!(
+                root_attach_signed(class),
+                class == CGROUP_ATTACH_PACKET || class == CGROUP_ATTACH_DEVICE,
+                "{name}"
+            );
+        }
+        // the sysctl attach the root rule judges is judged here too
+        assert!(judges_cgroup_attach(BPF_PROG_ATTACH, ATTACH_CGROUP_SYSCTL));
+        // tracing, XDP, tcx, netkit and the rest are not cgroup types
+        for other in [
+            4u32,
+            5,
+            7,
+            16,
+            17,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            37,
+            38,
+            39,
+            44,
+            46,
+            47,
+            48,
+            u32::MAX,
+        ] {
+            if CGROUP_ATTACH_TYPES.iter().any(|(_, v, _)| *v == other) {
+                continue;
+            }
+            assert!(!judges_cgroup_attach(BPF_PROG_ATTACH, other), "{other}");
+            assert!(!judges_cgroup_attach(BPF_LINK_CREATE, other), "{other}");
+        }
+        assert!(root_attach_signed(cgroup_attach_class(1)), "inet egress");
+        assert!(root_attach_signed(cgroup_attach_class(6)), "device");
+        assert!(!root_attach_signed(cgroup_attach_class(10)), "connect4");
+        assert!(!root_attach_signed(0));
     }
 
     /// The parser counts the way the C compiler does: an alias takes no

@@ -234,6 +234,11 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
             // a window's write of it
             "| FS_OP_SYSRQ",
             "| FS_OP_SYSRQ_WINDOW",
+            // lot 2.2: a cgroup BPF attach on our cgroups, the kernel-read
+            // option's refusals
+            "| FS_OP_BPF_CGROUP_ATTACH",
+            "| FS_OP_KERNEL_READ",
+            "| FS_OP_PERF_EVENT",
         ],
     )
     .unwrap();

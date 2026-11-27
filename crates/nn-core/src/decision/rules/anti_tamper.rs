@@ -633,6 +633,38 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 2.2: the role marks, the BPF guard, the kernel-read
+            // option, the shared mappings.
+            FsProtectOperation::RoleUnmarked => format!(
+                "to map executable code into a process that runs the agent's or the watchdog's \
+                 binary from an image the agent did not mark as its own (inode \
+                 {target_dev}:{target_ino}; 0:0 is anonymous memory) — the process has no role \
+                 from then on: it is protected as a target, exempt from nothing, and never takes \
+                 a vacant role"
+            ),
+            FsProtectOperation::BpfCgroupAttach => format!(
+                "to attach a cgroup BPF program (attach type {target_ino}, class {target_dev}) \
+                 to the agent's unit cgroups or northnarrow.slice outside a trusted-installer \
+                 window — a packet program there cuts the heartbeat and the export, a device \
+                 program the agent's /dev opens"
+            ),
+            FsProtectOperation::KernelRead => format!(
+                "a read the kernel-read option refuses (class {target_dev:#x}, lockdown reason \
+                 {target_ino}: physical memory, tracefs, kprobes or perf) outside a \
+                 trusted-installer window — each reads kernel or process memory, the agent's \
+                 keys among it"
+            ),
+            FsProtectOperation::PerfEvent => format!(
+                "a perf event the kernel-read option refuses (what {target_dev}: 1 a uprobe \
+                 PMU, 2 CPU-wide sampling of user registers or stacks; event type {target_ino}) \
+                 outside a trusted-installer window — each reads the memory of every process, \
+                 the agent's among them"
+            ),
+            FsProtectOperation::SharedMap => format!(
+                "to map a protected file (inode {target_dev}:{target_ino}) shared and writable \
+                 — its page stores would reach the file with no further check, inside a \
+                 trusted-installer window too"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -1481,6 +1513,12 @@ mod tests {
             FsProtectOperation::Sigio,
             // lot 2.0
             FsProtectOperation::Sysrq,
+            // lot 2.2
+            FsProtectOperation::RoleUnmarked,
+            FsProtectOperation::BpfCgroupAttach,
+            FsProtectOperation::KernelRead,
+            FsProtectOperation::PerfEvent,
+            FsProtectOperation::SharedMap,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))

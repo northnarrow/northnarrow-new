@@ -185,6 +185,40 @@ const SITES: &[(&str, &str, usize, Route)] = &[
             "a handle on one of the agent's links (by id or its pin), a handle by id on its maps or programs or one under its pin directories, a detach or update of one of its links",
         ),
     ),
+    // lot 2.2: the cgroup BPF guard, the kernel-read option, the shared
+    // writable mappings
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        1,
+        Enforced(
+            "a cgroup program attached to the agent's unit cgroups or northnarrow.slice (or below them) outside a window, PID 1's for a unit property included: a packet program cuts the heartbeat and the export, a device program the agent's /dev opens (lot 2.2)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_kernel_read_guard",
+        1,
+        Enforced(
+            "under the signed kernel-read option, a foreign lockdown question of physical memory (/dev/mem, /proc/kcore), tracefs, kprobes or perf outside a window: each reads kernel or process memory, the agent's keys among it (lot 2.2)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_perf_event_guard",
+        1,
+        Enforced(
+            "under the signed kernel-read option, a foreign uprobe PMU event or CPU-wide sampling of user registers or stacks outside a window: it reads every process's memory, the agent's among them (lot 2.2)",
+        ),
+    ),
+    (
+        "role_maps.rs",
+        "try_role_mmap_file",
+        1,
+        Enforced(
+            "a shared mapping, writable or one mprotect can make writable, of a file the agent protects against writes, inside a window too: its page stores reach the file with no further hook (lot 2.2)",
+        ),
+    ),
     (
         "cgroup_files.rs",
         "refuse_switch",
@@ -1914,3 +1948,131 @@ mod lexical {
         found
     }
 }
+
+/// Lot 2.2 (the re-check of #550, N1, its userland point): the resolved
+/// gate reaches a closed list of functions of `agent/src/boot` — each that
+/// takes a `detect_only` parameter, each a call hands `detect_only` or
+/// `gate.on` to, each struct field initialised from them, and each other
+/// name a `let` binds them to. A new receiver (a new switch written from
+/// the gate, a response path that reads it) fails here until it is named
+/// and its consumer checked (`xtask/tests/alpha_profile.rs`).
+#[test]
+fn the_gate_reaches_a_closed_list_of_boot_functions() {
+    use syn::visit::Visit;
+    struct V {
+        file: String,
+        found: BTreeSet<String>,
+    }
+    fn is_gate(e: &Expr) -> bool {
+        match ast::peel(e) {
+            Expr::Path(p) => p.path.is_ident("detect_only"),
+            Expr::Field(f) => {
+                matches!(&f.member, syn::Member::Named(m) if m == "on")
+                    && matches!(ast::peel(&f.base), Expr::Path(p) if p.path.is_ident("gate"))
+            }
+            _ => false,
+        }
+    }
+    impl<'ast> Visit<'ast> for V {
+        fn visit_signature(&mut self, s: &'ast syn::Signature) {
+            for input in &s.inputs {
+                if let syn::FnArg::Typed(t) = input {
+                    let mut names = Vec::new();
+                    ast::pat_idents(&t.pat, &mut names);
+                    if names.iter().any(|n| n == "detect_only") {
+                        self.found.insert(format!("{}: fn {}", self.file, s.ident));
+                    }
+                }
+            }
+            visit::visit_signature(self, s);
+        }
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if c.args.iter().any(is_gate) {
+                let callee = match ast::peel(&c.func) {
+                    Expr::Path(p) => ast::last(&p.path),
+                    other => ast::compact(other),
+                };
+                self.found.insert(format!("{}: call {callee}", self.file));
+            }
+            visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, c: &'ast syn::ExprMethodCall) {
+            if c.args.iter().any(is_gate) {
+                self.found
+                    .insert(format!("{}: call .{}", self.file, c.method));
+            }
+            visit::visit_expr_method_call(self, c);
+        }
+        fn visit_field_value(&mut self, f: &'ast syn::FieldValue) {
+            if is_gate(&f.expr) {
+                if let syn::Member::Named(m) = &f.member {
+                    self.found.insert(format!("{}: field {m}", self.file));
+                }
+            }
+            visit::visit_field_value(self, f);
+        }
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if let Some(init) = &l.init {
+                if is_gate(&init.expr) {
+                    let mut names = Vec::new();
+                    ast::pat_idents(&l.pat, &mut names);
+                    for n in names {
+                        self.found.insert(format!("{}: let {n}", self.file));
+                    }
+                }
+            }
+            visit::visit_local(self, l);
+        }
+    }
+    let root = repo_root();
+    let sources = ast::tree_sources(&root, "agent/src/boot");
+    let mut found = BTreeSet::new();
+    for (rel, text) in &sources {
+        let file = ast::production(rel, text);
+        let mut v = V {
+            file: rel.trim_start_matches("agent/src/boot/").to_string(),
+            found: BTreeSet::new(),
+        };
+        v.visit_file(&file);
+        found.extend(v.found);
+    }
+    let want: BTreeSet<String> = GATE_RECEIVERS.iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(
+        found, want,
+        "the functions of agent/src/boot the gate reaches changed: name the new one in \
+         GATE_RECEIVERS and check its consumer in xtask/tests/alpha_profile.rs"
+    );
+}
+
+/// Lot 2.2: [`the_gate_reaches_a_closed_list_of_boot_functions`]'s list, as
+/// the boot reads today.
+const GATE_RECEIVERS: &[&str] = &[
+    "attach.rs: call .execq_config",
+    "attach.rs: call execpol_mode",
+    "attach.rs: field detect_only",
+    "attach.rs: fn execpol_mode",
+    "attach.rs: fn load",
+    "attach.rs: fn self_test",
+    "cli.rs: fn execq_config",
+    "integrity.rs: call __macro__warn",
+    "integrity.rs: call capabilities",
+    "integrity.rs: call demo_rules_gate",
+    "integrity.rs: field detect_only",
+    "integrity.rs: field dry_run",
+    "integrity.rs: let detect_only",
+    "mod.rs: call arm",
+    "mod.rs: call build",
+    "mod.rs: call ladder",
+    "mod.rs: call load",
+    "mod.rs: call self_test",
+    "policy.rs: call arming",
+    "policy.rs: fn load",
+    "posture.rs: call boot",
+    "posture.rs: call new",
+    "posture.rs: fn ladder",
+    "ready.rs: field detect_only",
+    "ready.rs: fn arm",
+    "response.rs: call __macro__info",
+    "response.rs: call effective_response",
+    "response.rs: fn build",
+];

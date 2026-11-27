@@ -36,6 +36,27 @@ pub const EXEC_MARKS_MAX: u32 = 256;
 /// The image is one the release starts a role process from (lot 2.2).
 pub const MARK_ROLE: u32 = 1 << 0;
 
+/// Lot 2.2: the pinned one-slot array the agent sets to
+/// [`EXEC_MARKS_ARMED_ON`] once it has written the marks: before that the
+/// mapping hooks judge nothing (an empty map would take every role away).
+pub const EXEC_MARKS_ARMED_MAP_NAME: &str = "EXEC_MARK_ARMED";
+/// [`EXEC_MARKS_ARMED_MAP_NAME`]'s value once the marks are written.
+pub const EXEC_MARKS_ARMED_ON: u32 = 1;
+
+/// Lot 2.2: the pinned map of the processes that lost their role — a
+/// process running the agent's or the watchdog's binary, or holding a role,
+/// that mapped executable code from an image without [`MARK_ROLE`] (or
+/// anonymous memory). Keyed by tgid, valued by its start; written by the
+/// mapping hooks only (frozen at its creation: no descriptor writes it, the
+/// agent's included), its entry removed at the process's exit. Such a
+/// process is protected as a target, exempt from nothing, and never takes
+/// a vacant role.
+pub const ROLE_UNMARKED_MAP_NAME: &str = "ROLE_UNMARKED";
+/// Its capacity: the processes that run our binaries are a handful; a full
+/// map leaves the role to a process it cannot record, so the hook also
+/// signs that (the record is never lost with the entry).
+pub const ROLE_UNMARKED_MAX: u32 = 64;
+
 /// Bits 1 to 7: free for stage S2's lots. None is defined.
 pub const MARKS_S2_FREE: u32 = 0x0000_00fe;
 
@@ -65,9 +86,69 @@ pub const fn has_unknown_marks(marks: u32) -> bool {
     marks & !MARKS_KNOWN != 0
 }
 
+/// Lot 2.2 (the watchdog's slot, A2): whether a successor may take the
+/// agent's vacated role. Once the watchdog says it arms the slot
+/// (`arm_supported`, lot 2.5 writes it), the vacated agent slot opens only
+/// while the live watchdog's arm is fresh (`arm_deadline_ns` after
+/// `now_ns`); with no live watchdog (`watchdog_live` false: its slot vacant
+/// too) nothing can arm it, and the successor's own test decides (the
+/// fallback). Before the watchdog supports it, nothing changes.
+#[inline(always)]
+pub const fn agent_slot_open(
+    arm_supported: bool,
+    watchdog_live: bool,
+    arm_deadline_ns: u64,
+    now_ns: u64,
+) -> bool {
+    !arm_supported || !watchdog_live || now_ns < arm_deadline_ns
+}
+
+/// Lot 2.2: the pinned two-slot array of the watchdog's arm: slot
+/// [`ARM_SLOT_SUPPORTED`] 1 once the watchdog arms the agent's slot (lot
+/// 2.5), slot [`ARM_SLOT_DEADLINE`] the arm's `CLOCK_BOOTTIME` deadline.
+pub const WATCHDOG_ARM_MAP_NAME: &str = "WATCHDOG_ARM";
+pub const ARM_SLOT_SUPPORTED: u32 = 0;
+pub const ARM_SLOT_DEADLINE: u32 = 1;
+/// The longest arm the hook honours (the watchdog's respawn is quick).
+pub const ARM_MAX_NS: u64 = 30_000_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 2.2: the agent's vacated slot opens with a fresh arm of a live
+    /// watchdog, or with no live watchdog (the fallback), or before the
+    /// watchdog supports the arm; never with a stale arm of a live one.
+    #[test]
+    fn the_agent_slot_needs_the_live_watchdog_s_arm() {
+        assert!(agent_slot_open(false, true, 0, 100), "not supported yet");
+        assert!(agent_slot_open(true, false, 0, 100), "both vacant");
+        assert!(agent_slot_open(true, true, 101, 100), "armed");
+        assert!(!agent_slot_open(true, true, 100, 100), "the arm expired");
+        assert!(!agent_slot_open(true, true, 0, 100), "never armed");
+        const { assert!(ARM_MAX_NS <= 60_000_000_000) };
+        assert_ne!(ARM_SLOT_SUPPORTED, ARM_SLOT_DEADLINE);
+    }
+
+    #[test]
+    fn the_map_names_are_distinct() {
+        let names = [
+            EXEC_MARKS_MAP_NAME,
+            EXEC_MARKS_ARMED_MAP_NAME,
+            ROLE_UNMARKED_MAP_NAME,
+            WATCHDOG_ARM_MAP_NAME,
+        ];
+        for (i, a) in names.iter().enumerate() {
+            assert!(
+                a.len() < 16,
+                "{a}: the kernel keeps 15 bytes of a map's name"
+            );
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        const { assert!(ROLE_UNMARKED_MAX >= 8) };
+    }
 
     #[test]
     fn the_mark_ranges_do_not_overlap() {

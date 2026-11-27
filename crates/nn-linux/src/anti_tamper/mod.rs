@@ -721,6 +721,28 @@ fn attach_reporting(
         warn!(reason = %why, "anti-tamper mount guard: the agent's namespace not guarded");
         report.degraded.push(why);
     }
+    // Lot 2.2: the role marks, once the agent's own executables are
+    // registered — the marks written, then the mapping hooks attached
+    // (pinned before the pin root is protected below). A failure leaves no
+    // role judged by its mappings: signed degraded.
+    if let Err(why) = bpf_defense::arm_role_marks(ebpf, &btf, pin_root, own) {
+        warn!(reason = %why, "role marks NOT armed — a role is not judged by its executable mappings");
+        report.degraded.push(format!("role marks: {why}"));
+    }
+    // Lot 2.2 (the design's boot-zero): the per-tree window's maps emptied;
+    // a drop count an earlier run left in the window ring is signed.
+    match bpf_defense::zero_window_maps(ebpf) {
+        Ok(0) => {}
+        Ok(n) => report.degraded.push(format!(
+            "window ring: {n} record(s) the kernel could not write while no agent drained it"
+        )),
+        Err(e) => {
+            warn!(error = %e, "window maps NOT emptied at the start");
+            report
+                .degraded
+                .push(format!("window maps not emptied at the start: {e}"));
+        }
+    }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.
     if let Some(root) = pin_root {

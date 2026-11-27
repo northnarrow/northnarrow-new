@@ -685,6 +685,36 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "KERNEL_READ_POLICY",
+        Kernel,
+        "lot 2.2: the signed policy's kernel-read classes, set where the per-loader opt-outs are, armed in the one eBPF object at its start (its configuration frozen there)",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "KERNEL_READ_GUARDS",
+        Kernel,
+        "lot 2.2: which kernel-read guards the one eBPF object's start attached, read when a policy is applied",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "KERNEL_READ_ARMED",
+        Kernel,
+        "lot 2.2: the kernel-read classes the one eBPF object's start armed, for status",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "ROLE_MARKS_WRITTEN",
+        Kernel,
+        "lot 2.2: how many images the pinned EXEC_MARKS of the one eBPF object names, as last written, for status",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "ROLE_MARK_EXES",
+        Kernel,
+        "lot 2.2: the agent's and the watchdog's executables the start registered in the one eBPF object, for the refresh of its role marks",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
         "LOADER_OPT_OUTS",
         Kernel,
         "lot 290: the signed per-loader opt-outs in force (an executable's device and inode, the refused BPF program types it may load), the mirror of the pinned BPF_LOADER_OPTOUT of the one eBPF object, written at the start and by `policy set`, read by its registration",

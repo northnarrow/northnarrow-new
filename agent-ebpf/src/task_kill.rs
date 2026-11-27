@@ -86,10 +86,11 @@ pub fn is_protected_pid(tgid: u32) -> bool {
 }
 
 /// `tgid` is trusted as a caller (the agent and the watchdog; never a
-/// worker).
+/// worker). Lot 2.2 (scaffold+): and it has not lost its role to an
+/// unmarked executable mapping (`crate::role_maps`).
 #[inline(always)]
 pub fn is_exempt_pid(tgid: u32) -> bool {
-    northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid))
+    northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid)) && crate::role_maps::nn_role_lost(u64::from(tgid)) == 0
 }
 
 /// External audit EBPF-001: when PID 1 may signal a protected process.

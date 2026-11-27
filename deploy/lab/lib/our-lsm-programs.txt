@@ -36,6 +36,7 @@ inode_rename
 inode_rmdir
 inode_setattr
 inode_unlink
+kernel_read_guard
 module_load_data_observe
 module_lock_observe
 module_read_file_observe
@@ -50,6 +51,7 @@ mount_guard_sb_remount
 mount_guard_sb_umount
 nn_task_free
 open_sensor_rmdir
+perf_event_guard
 probe_bprm
 probe_file_open
 protected_create_deny
@@ -65,6 +67,8 @@ protected_setxattr_deny
 protected_symlink_deny
 protected_write_deny
 ptrace_access_check
+role_file_mprotect
+role_mmap_file
 socket_connect_deny
 task_kill
 task_setioprio_deny

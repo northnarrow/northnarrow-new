@@ -157,8 +157,10 @@ fn telemetry_status(
         // lot 2.1 (S2 scaffold): filled by lots 2.3 (the window's tree) and
         // 2.2 (the role marks, the kernel-read option)
         installer_window_tree: None,
-        role_marks: None,
-        kernel_read_refused: None,
+        role_marks: nn_linux::anti_tamper::bpf_defense::role_marks_status(
+            antitamper_bpf::prepare_pin_root(),
+        ),
+        kernel_read_refused: Some(nn_linux::anti_tamper::bpf_defense::kernel_read_refused_now()),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

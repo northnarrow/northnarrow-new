@@ -1064,30 +1064,57 @@ pub const FS_GRANT_V2_MAP_NAME: &str = "FS_GRANT_V2";
 /// start ([`start_ticks`]) — and the window lifts its refusals only for the
 /// members ([`TreeMember`]): the root, the processes on the line from the
 /// root down to the requester (forked before the grant), and every process
-/// a member forks while the window is open, until the window closes. `generation` numbers the grants of this boot (never 0): a member
-/// entry of an earlier window is no member of this one.
+/// a member forks while the window is open, until the window closes.
+///
+/// Lot 2.2 (the layout the design hands it, before any hook reads it):
+/// `generation` is 64-bit and never reused within a boot (the session
+/// nonce separates boots); the deadline is on `CLOCK_BOOTTIME`
+/// (`bpf_ktime_get_boot_ns` in the hooks, `CLOCK_BOOTTIME` in the agent),
+/// so time spent in suspend counts; the agent writes its heartbeat into the
+/// slot every few seconds, and the window lifts nothing once the heartbeat
+/// is [`WINDOW_AGENT_GRACE_NS`] old (a window whose agent is gone closes
+/// itself in the kernel); `first_grant_boot_ns` bounds a renewal
+/// ([`WINDOW_MAX_NS`] from the first grant).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct FsGrantV2 {
     /// This boot's session nonce (`AGENT_SESSION[0]`), as [`FsGrant`].
     pub nonce: u32,
-    /// The grant's number this boot, from 1; 0 is no grant.
-    pub generation: u32,
-    /// `CLOCK_MONOTONIC` deadline, as [`FsGrant`].
-    pub expires_ns: u64,
     /// The root's tgid.
     pub root_tgid: u32,
-    pub _pad: u32,
+    /// The grant's number this boot, from 1; 0 is no grant.
+    pub generation: u64,
+    /// `CLOCK_BOOTTIME` deadline (ns).
+    pub expires_boot_ns: u64,
     /// The root's start ([`start_ticks`]).
     pub root_start_ticks: u64,
+    /// The agent's last heartbeat (`CLOCK_BOOTTIME` ns).
+    pub heartbeat_boot_ns: u64,
+    /// When this generation was first granted (`CLOCK_BOOTTIME` ns).
+    pub first_grant_boot_ns: u64,
 }
 
+/// Lot 2.2: the agent-absent grace (N = 60 s, the design's section 5).
+pub const WINDOW_AGENT_GRACE_NS: u64 = 60_000_000_000;
+
+/// Lot 2.2: the longest a window lives from its first grant, renewals
+/// included (600 s).
+pub const WINDOW_MAX_NS: u64 = 600_000_000_000;
+
 impl FsGrantV2 {
-    /// Whether the window is open at monotonic `now_ns` under session
-    /// `session`: [`FsGrant::active`]'s test, and a grant number.
-    pub fn active(&self, now_ns: u64, session: u32) -> bool {
-        self.nonce != 0 && self.nonce == session && self.generation != 0 && now_ns < self.expires_ns
+    /// Whether the window is open at boot-time `now_boot_ns` under session
+    /// `session`: this boot's grant, numbered, before its deadline, and its
+    /// agent's heartbeat younger than [`WINDOW_AGENT_GRACE_NS`] (a
+    /// heartbeat from the future — a slot written by hand — is no
+    /// heartbeat).
+    pub fn active(&self, now_boot_ns: u64, session: u32) -> bool {
+        self.nonce != 0
+            && self.nonce == session
+            && self.generation != 0
+            && now_boot_ns < self.expires_boot_ns
+            && self.heartbeat_boot_ns <= now_boot_ns
+            && now_boot_ns - self.heartbeat_boot_ns < WINDOW_AGENT_GRACE_NS
     }
 
     /// Whether the window lifts its refusals for the calling process: its
@@ -1102,7 +1129,7 @@ impl FsGrantV2 {
         member: Option<&TreeMember>,
         start_ticks: u64,
         io_worker: bool,
-        now_ns: u64,
+        now_boot_ns: u64,
         session: u32,
     ) -> bool {
         match member {
@@ -1110,10 +1137,18 @@ impl FsGrantV2 {
                 !io_worker
                     && m.generation == self.generation
                     && m.start_ticks == start_ticks
-                    && self.active(now_ns, session)
+                    && self.active(now_boot_ns, session)
             }
             None => false,
         }
+    }
+
+    /// Lot 2.2: the deadline a renewal to `want_boot_ns` gets — never past
+    /// [`WINDOW_MAX_NS`] from the first grant, never earlier than the
+    /// deadline in force (a renewal moves the deadline only, later).
+    pub fn renewed_deadline(&self, want_boot_ns: u64) -> u64 {
+        let cap = self.first_grant_boot_ns.saturating_add(WINDOW_MAX_NS);
+        want_boot_ns.min(cap).max(self.expires_boot_ns)
     }
 }
 
@@ -1134,14 +1169,152 @@ pub const TREE_MEMBERS_MAX: u32 = 4096;
 pub struct TreeMember {
     /// The member's start ([`start_ticks`]).
     pub start_ticks: u64,
-    /// The [`FsGrantV2::generation`] it joined.
-    pub generation: u32,
+    /// The [`FsGrantV2::generation`] it joined (lot 2.2: 64-bit).
+    pub generation: u64,
     /// [`TREE_MEMBER_ROOT`] or 0.
     pub flags: u32,
+    pub _pad: u32,
 }
 
 /// [`TreeMember::flags`]: the entry is the window's root.
 pub const TREE_MEMBER_ROOT: u32 = 1;
+
+// ── Lot 2.2: the window's records and leases (the design's sections 2, 7) ─
+
+/// The ring of the window's records ([`WindowEventRaw`]): separate from
+/// telemetry and from the denial ring, with its own budget. Process-local
+/// in lot 2.2, as every event ring of the object; its sequence and drop
+/// counters are pinned (a gap across a restart stays visible).
+pub const WINDOW_EVENTS_MAP_NAME: &str = "WINDOW_EVENTS";
+/// Its size (a power of two, as a ring's must be).
+pub const WINDOW_EVENTS_RING_BYTES: u32 = 64 * 1024;
+/// The pinned per-CPU drop counters of [`WINDOW_EVENTS_MAP_NAME`]: the
+/// records a full ring could not take, signed by the agent as a record of
+/// their own.
+pub const WINDOW_EVENT_DROPS_MAP_NAME: &str = "WINDOW_EVENT_DROPS";
+/// The pinned per-CPU sequence of [`WINDOW_EVENTS_MAP_NAME`]: each record
+/// carries its CPU's next number, so a gap is visible.
+pub const WINDOW_EVENT_SEQ_MAP_NAME: &str = "WINDOW_EVENT_SEQ";
+
+/// A window record, as the hooks write it into [`WINDOW_EVENTS_MAP_NAME`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct WindowEventRaw {
+    /// The CPU's sequence number ([`WINDOW_EVENT_SEQ_MAP_NAME`]), from 1.
+    pub seq: u64,
+    /// `CLOCK_BOOTTIME` ns.
+    pub boot_ns: u64,
+    /// The window's generation (0: none open).
+    pub generation: u64,
+    /// The actor's start ([`start_ticks`]).
+    pub start_ticks: u64,
+    /// What the record is about (a protected object, a lease slot).
+    pub detail: u64,
+    /// The actor's tgid.
+    pub tgid: u32,
+    /// The CPU that wrote it (the sequence's).
+    pub cpu: u32,
+    /// [`WINDOW_EVENT_KINDS`].
+    pub kind: u8,
+    /// The record's context class ([`DENIAL_WINDOW_NONE`] …).
+    pub class: u8,
+    /// The denial code, when the record is a refusal.
+    pub operation: u8,
+    pub _pad: [u8; 5],
+}
+
+/// [`WindowEventRaw::kind`]: the window's lifecycle and its refusals, by
+/// the name their records carry.
+pub const WINDOW_EVENT_GRANT: u8 = 1;
+pub const WINDOW_EVENT_RENEWAL: u8 = 2;
+pub const WINDOW_EVENT_CLOSE: u8 = 3;
+pub const WINDOW_EVENT_CONTROLLED_STOP: u8 = 4;
+pub const WINDOW_EVENT_LEASE_ARMED: u8 = 5;
+pub const WINDOW_EVENT_LEASE_USED: u8 = 6;
+pub const WINDOW_EVENT_EVICTION: u8 = 7;
+pub const WINDOW_EVENT_GRACE_CLOSE: u8 = 8;
+pub const WINDOW_EVENT_OUTSIDER_REFUSED: u8 = 9;
+pub const WINDOW_EVENT_KINDS: [(u8, &str); 9] = [
+    (WINDOW_EVENT_GRANT, "grant"),
+    (WINDOW_EVENT_RENEWAL, "renewal"),
+    (WINDOW_EVENT_CLOSE, "close"),
+    (WINDOW_EVENT_CONTROLLED_STOP, "controlled_stop"),
+    (WINDOW_EVENT_LEASE_ARMED, "lease_armed"),
+    (WINDOW_EVENT_LEASE_USED, "lease_used"),
+    (WINDOW_EVENT_EVICTION, "eviction"),
+    (WINDOW_EVENT_GRACE_CLOSE, "grace_close"),
+    (WINDOW_EVENT_OUTSIDER_REFUSED, "outsider_refused"),
+];
+
+/// The name of a [`WindowEventRaw::kind`].
+pub fn window_event_kind_name(kind: u8) -> Option<&'static str> {
+    WINDOW_EVENT_KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, n)| *n)
+}
+
+/// The pinned slots of the single-use leases for PID 1's file actions on
+/// our units' enablement links ([`WindowLease`]).
+pub const WINDOW_LEASES_MAP_NAME: &str = "WINDOW_LEASES";
+/// Their number: a small number per window (the flows need one per link).
+pub const WINDOW_LEASES_MAX: u32 = 8;
+/// How long an unused lease lives at most (a few seconds).
+pub const WINDOW_LEASE_TTL_NS: u64 = 5_000_000_000;
+
+/// [`WindowLease::action`].
+pub const LEASE_CREATE: u32 = 1;
+pub const LEASE_REMOVE: u32 = 2;
+
+/// A single-use lease: one exact link (its directory's inode and its
+/// name, hashed as [`pin_name_hash`] hashes a name), one action, the
+/// window's generation, consumed by its first use and void after its
+/// deadline. Written by the agent for a member (lot 2.2's writer); consumed
+/// by the hook that judges PID 1's link action (lot 2.3).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct WindowLease {
+    pub generation: u64,
+    pub dir: InodeKey,
+    pub name_hash: u64,
+    /// `CLOCK_BOOTTIME` deadline (ns).
+    pub expires_boot_ns: u64,
+    /// The member that armed it.
+    pub member_tgid: u32,
+    /// [`LEASE_CREATE`] or [`LEASE_REMOVE`].
+    pub action: u32,
+    /// 1 once used: a used lease is void.
+    pub used: u32,
+    pub _pad: u32,
+}
+
+impl WindowLease {
+    /// Whether this lease lets `action` on the link `name_hash` in `dir`
+    /// through, under the window `grant` at boot-time `now_boot_ns` and
+    /// session `session`: unused, of this generation, before its deadline,
+    /// for that very link and action, with the window open.
+    pub fn usable_for(
+        &self,
+        grant: &FsGrantV2,
+        dir: InodeKey,
+        name_hash: u64,
+        action: u32,
+        now_boot_ns: u64,
+        session: u32,
+    ) -> bool {
+        self.used == 0
+            && self.generation != 0
+            && self.generation == grant.generation
+            && now_boot_ns < self.expires_boot_ns
+            && self.dir == dir
+            && self.name_hash == name_hash
+            && self.action == action
+            && (action == LEASE_CREATE || action == LEASE_REMOVE)
+            && grant.active(now_boot_ns, session)
+    }
+}
 
 // ── Lot 2.1 (S2 scaffold): the second word of a protected inode ─────────
 
@@ -1225,6 +1398,50 @@ pub const KERNEL_READ_LOCKDOWN: [(&str, u32); 5] = [
     ("LOCKDOWN_KPROBES", KERNEL_READ_KPROBES),
     ("LOCKDOWN_PERF", KERNEL_READ_PERF),
 ];
+
+/// Lot 2.2: the kernel-read option's configuration array (`Array<u32>`,
+/// frozen at the agent's registration): slot [`KREAD_SLOT_MASK`] the
+/// classes in force, slots [`KREAD_SLOT_REASONS`].. the running kernel's
+/// value of each [`KERNEL_READ_LOCKDOWN`] enumerator in its order (0: not
+/// resolved, never matched — `LOCKDOWN_NONE` is 0), slot
+/// [`KREAD_SLOT_UPROBE_PMU`] the uprobe PMU's perf type (0: none).
+pub const KERNEL_READ_CONF_MAP_NAME: &str = "KERNEL_READ_CONF";
+pub const KREAD_SLOT_MASK: u32 = 0;
+pub const KREAD_SLOT_REASONS: u32 = 1;
+pub const KREAD_SLOT_UPROBE_PMU: u32 = KREAD_SLOT_REASONS + KERNEL_READ_LOCKDOWN.len() as u32;
+pub const KERNEL_READ_CONF_SLOTS: u32 = KREAD_SLOT_UPROBE_PMU + 1;
+
+/// Lot 2.2: `FS_OP_PERF_EVENT`'s `target_dev` — what the perf hook refused.
+pub const PERF_REFUSED_UPROBE_PMU: u8 = 1;
+pub const PERF_REFUSED_USER_SAMPLING: u8 = 2;
+
+/// Lot 2.2: what the perf hook refuses under [`KERNEL_READ_PERF`], from the
+/// event's attributes: a uprobe PMU event (`attr.type` the uprobe PMU's
+/// type, `uprobe_pmu` 0 when the kernel has none), or a CPU-wide event
+/// (`security_type` `PERF_SECURITY_CPU`, 1) sampling user registers or
+/// stacks (`sample_type`'s `PERF_SAMPLE_REGS_USER` or
+/// `PERF_SAMPLE_STACK_USER`). 0: nothing. A per-task event asks the ptrace
+/// check, which judges its target.
+#[inline(always)]
+pub const fn perf_refusal(
+    attr_type: u32,
+    sample_type: u64,
+    security_type: u32,
+    uprobe_pmu: u32,
+) -> u8 {
+    const PERF_SECURITY_CPU: u32 = 1;
+    const PERF_SAMPLE_REGS_USER: u64 = 1 << 12;
+    const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
+    if uprobe_pmu != 0 && attr_type == uprobe_pmu {
+        PERF_REFUSED_UPROBE_PMU
+    } else if security_type == PERF_SECURITY_CPU
+        && sample_type & (PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER) != 0
+    {
+        PERF_REFUSED_USER_SAMPLING
+    } else {
+        0
+    }
+}
 
 /// The class named `name` in [`KERNEL_READ_CLASSES`].
 pub fn kernel_read_class(name: &str) -> Option<u32> {
@@ -1752,13 +1969,13 @@ pub const FS_OP_SYSRQ: u8 = 53;
 pub const FS_OP_SYSRQ_WINDOW: u8 = 54;
 
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SYSRQ_WINDOW;
+pub const FS_OP_LAST: u8 = FS_OP_SHARED_MAP;
 
 // Lot 2.1 (S2 scaffold): the denial codes stage S2's lots will emit,
 // reserved here in their lots' order, so that two lots never take the same
-// number. None is emitted yet: [`FS_OP_LAST`] moves to a code with the lot
-// that emits it and names it (nn-model's operation, the posture's class),
-// and until then a record that carried one would be read as unknown.
+// number. [`FS_OP_LAST`] moves to a code with the lot that emits it and
+// names it (nn-model's operation, the posture's class); until then a record
+// that carried one would be read as unknown. Lot 2.2 emits 55 to 59.
 
 /// Lot 2.2: a process that claims a role with an executable mapping of
 /// an image without the role mark (`crate::exec_marks`), refused the role.
@@ -1785,8 +2002,8 @@ pub const FS_OP_BDEV_WRITE: u8 = 61;
 /// kernel-read option ([`KERNEL_READ_BLOCK_DEVICE`]).
 pub const FS_OP_BDEV_READ: u8 = 62;
 
-/// The reserved codes, with the name their records will carry and the lot
-/// that emits them.
+/// The S2 codes, with the name their records carry and the lot that emits
+/// them; those of a lot that has landed are at or below [`FS_OP_LAST`].
 pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 8] = [
     (FS_OP_ROLE_UNMARKED, "role_unmarked", "2.2"),
     (FS_OP_BPF_CGROUP_ATTACH, "bpf_cgroup_attach", "2.2"),
@@ -1862,6 +2079,13 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             // at each attempt as the switches are; and a window's write
             | FS_OP_SYSRQ
             | FS_OP_SYSRQ_WINDOW
+            // lot 2.2: a foreign cgroup BPF attach on our cgroups, refused
+            // as the root `cgroup/sysctl` attach is; a lockdown question
+            // or a perf event the kernel-read option refuses (a tracing
+            // tool's loop meets them)
+            | FS_OP_BPF_CGROUP_ATTACH
+            | FS_OP_KERNEL_READ
+            | FS_OP_PERF_EVENT
     )
 }
 
@@ -2092,6 +2316,34 @@ pub const DENIAL_WINDOW_OUTSIDER: u8 = 1;
 /// this refusal: a key file ([`INODE_EXT_WINDOW_KEPT`]), an io_uring
 /// worker, a member traced from outside the tree.
 pub const DENIAL_WINDOW_KEPT: u8 = 2;
+/// Lot 2.2 (the design's section 7, the context class): a member's act
+/// the window let through (Low).
+pub const DENIAL_WINDOW_IN_TREE: u8 = 3;
+/// Lot 2.2: PID 1's action through a lease, with the member that armed
+/// it (Low).
+pub const DENIAL_WINDOW_PID1_LEASE: u8 = 4;
+/// Lot 2.2: a member that left the tree, with the file or the variable
+/// (High, never lower).
+pub const DENIAL_WINDOW_EXEC_EVICTED: u8 = 5;
+
+/// Lot 2.2: the context classes, by the name the records carry.
+pub const DENIAL_WINDOW_CLASSES: [(u8, &str); 6] = [
+    (DENIAL_WINDOW_NONE, "no-window"),
+    (DENIAL_WINDOW_OUTSIDER, "outsider-during-window"),
+    (DENIAL_WINDOW_KEPT, "kept-in-window"),
+    (DENIAL_WINDOW_IN_TREE, "in-tree"),
+    (DENIAL_WINDOW_PID1_LEASE, "pid1-lease"),
+    (DENIAL_WINDOW_EXEC_EVICTED, "exec-evicted"),
+];
+
+/// Lot 2.2: a record of this class is never softened below High by the
+/// window: an outsider's refusal, a kept refusal, an eviction.
+pub const fn window_class_never_softened(class: u8) -> bool {
+    matches!(
+        class,
+        DENIAL_WINDOW_OUTSIDER | DENIAL_WINDOW_KEPT | DENIAL_WINDOW_EXEC_EVICTED
+    )
+}
 
 impl FsProtectDenialRaw {
     pub const fn zeroed() -> Self {
@@ -2138,6 +2390,14 @@ pub const BPF_CMD_VACATED_ROLE_GET_FD: u32 = 0xFFFF_0004;
 /// Userland only: the kernel never emits it, and a raw record that carries
 /// it is read as [`BPF_CMD_FOREIGN_GET_FD`] (`nn_model`'s decoding).
 pub const BPF_CMD_LISTING_GET_FD: u32 = 0xFFFF_0005;
+/// Lot 2.2 (the cgroup BPF guard): a foreign packet or device program
+/// attached to the ROOT cgroup (`BPF_PROG_ATTACH` / `BPF_LINK_CREATE`, a
+/// cgroup attach type of the packet or device class) — let through (it
+/// governs the whole host, not the agent's cgroups alone, and container
+/// runtimes and firewalls attach there), recorded High: a drop-all egress
+/// program there cuts the heartbeat and the export too. The attach type is
+/// the record's argument.
+pub const BPF_CMD_ROOT_CGROUP_ATTACH: u32 = 0xFFFF_0006;
 /// Lot 370 (F10-4): `ROLE_TGIDS`' value for a role whose holder exited this
 /// boot (0: never held). No thread group has this number.
 pub const ROLE_VACATED: u32 = u32::MAX;
@@ -2249,6 +2509,7 @@ pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
         BPF_CMD_FRESH_INSTANCE_GET_FD => "fresh_instance_get_fd",
         BPF_CMD_VACATED_ROLE_GET_FD => "vacated_role_get_fd",
         BPF_CMD_LISTING_GET_FD => "listing_get_fd",
+        BPF_CMD_ROOT_CGROUP_ATTACH => "root_cgroup_attach",
         _ => "other",
     }
 }
@@ -2934,17 +3195,24 @@ mod tests {
     }
 
     /// Lot 2.1 (S2 scaffold): a v2 grant is FsGrant's test plus a grant
-    /// number, in a slot of its own size.
+    /// number, in a slot of its own size. Lot 2.2: the layout the design
+    /// hands it — a 64-bit number, a boot-time deadline, the agent's
+    /// heartbeat.
+    fn grant(nonce: u32, generation: u64, expires: u64, beat: u64) -> FsGrantV2 {
+        FsGrantV2 {
+            nonce,
+            root_tgid: 4242,
+            generation,
+            expires_boot_ns: expires,
+            root_start_ticks: 77,
+            heartbeat_boot_ns: beat,
+            first_grant_boot_ns: 0,
+        }
+    }
+
     #[test]
     fn fs_grant_v2_is_bound_to_its_session_deadline_and_number() {
-        let g = FsGrantV2 {
-            nonce: 0xABCD,
-            generation: 3,
-            expires_ns: 1_000,
-            root_tgid: 4242,
-            _pad: 0,
-            root_start_ticks: 77,
-        };
+        let g = grant(0xABCD, 3, 1_000, 0);
         assert!(g.active(999, 0xABCD));
         assert!(!g.active(1_000, 0xABCD), "expired");
         assert!(!g.active(0, 0x1234), "another boot's session");
@@ -2953,28 +3221,52 @@ mod tests {
             "no grant number"
         );
         assert!(!FsGrantV2::default().active(0, 0));
-        assert_eq!(core::mem::size_of::<FsGrantV2>(), 32);
+        // lot 2.2: a number past 32 bits is a number
+        assert!(grant(0xABCD, 1 << 40, 1_000, 0).active(10, 0xABCD));
+        assert_eq!(core::mem::size_of::<FsGrantV2>(), 48);
         assert_eq!(core::mem::align_of::<FsGrantV2>(), 8);
-        assert_eq!(core::mem::size_of::<TreeMember>(), 16);
+        assert_eq!(core::mem::size_of::<TreeMember>(), 24);
         assert_ne!(FS_GRANT_V2_MAP_NAME, "FS_GRANT");
+    }
+
+    /// Lot 2.2: the agent-absent grace — a window lifts nothing once its
+    /// agent's heartbeat is 60 s old, or from the future (a slot written by
+    /// hand), whatever its deadline.
+    #[test]
+    fn a_v2_window_closes_itself_without_its_agent() {
+        let far = 10 * WINDOW_MAX_NS;
+        let g = grant(7, 1, far, 5_000);
+        assert!(g.active(5_000, 7));
+        assert!(g.active(5_000 + WINDOW_AGENT_GRACE_NS - 1, 7));
+        assert!(!g.active(5_000 + WINDOW_AGENT_GRACE_NS, 7), "headless");
+        assert!(!g.active(4_999, 7), "a heartbeat from the future");
+        assert_eq!(WINDOW_AGENT_GRACE_NS, 60_000_000_000);
+    }
+
+    /// Lot 2.2: a renewal moves the deadline later only, never past
+    /// 600 s from the first grant.
+    #[test]
+    fn a_renewal_never_passes_the_maximum_window() {
+        let g = FsGrantV2 {
+            first_grant_boot_ns: 1_000,
+            ..grant(7, 1, 1_000 + 100, 0)
+        };
+        assert_eq!(g.renewed_deadline(2_000), 2_000);
+        assert_eq!(g.renewed_deadline(u64::MAX), 1_000 + WINDOW_MAX_NS);
+        assert_eq!(g.renewed_deadline(10), 1_100, "never earlier");
+        assert_eq!(WINDOW_MAX_NS, 600_000_000_000);
     }
 
     /// Lot 2.1: the window lifts for a member of this grant, the same
     /// process, no io_uring worker, while it is open — and for no one else.
     #[test]
     fn a_v2_window_lifts_only_for_its_members() {
-        let g = FsGrantV2 {
-            nonce: 7,
-            generation: 2,
-            expires_ns: 1_000,
-            root_tgid: 10,
-            _pad: 0,
-            root_start_ticks: 500,
-        };
+        let g = grant(7, 2, 1_000, 0);
         let m = TreeMember {
             start_ticks: 600,
             generation: 2,
             flags: 0,
+            _pad: 0,
         };
         assert!(g.lifts_for(Some(&m), 600, false, 10, 7));
         assert!(!g.lifts_for(None, 600, false, 10, 7), "no entry");
@@ -2988,8 +3280,96 @@ mod tests {
             !g.lifts_for(Some(&old), 600, false, 10, 7),
             "an earlier window's"
         );
+        // lot 2.2: the generation compares all 64 bits
+        let wrapped = TreeMember {
+            generation: 2 + (1 << 32),
+            ..m
+        };
+        assert!(
+            !g.lifts_for(Some(&wrapped), 600, false, 10, 7),
+            "a generation equal in its low half only"
+        );
         assert!(!g.lifts_for(Some(&m), 600, false, 1_000, 7), "expired");
         assert!(!g.lifts_for(Some(&m), 600, false, 10, 8), "another session");
+    }
+
+    /// Lot 2.2: a lease lets through one action on one link, once, in its
+    /// window's generation, before its deadline, while the window is open.
+    #[test]
+    fn a_lease_is_single_use_and_bound() {
+        let g = grant(7, 4, 1_000_000, 0);
+        let dir = InodeKey { dev: 8, ino: 99 };
+        let l = WindowLease {
+            generation: 4,
+            dir,
+            name_hash: pin_name_hash(b"northnarrow-agent.service"),
+            expires_boot_ns: 500,
+            member_tgid: 42,
+            action: LEASE_REMOVE,
+            used: 0,
+            _pad: 0,
+        };
+        let h = l.name_hash;
+        assert!(l.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7));
+        assert!(
+            !WindowLease { used: 1, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7),
+            "used"
+        );
+        assert!(
+            !l.usable_for(&g, dir, h, LEASE_CREATE, 10, 7),
+            "another action"
+        );
+        assert!(
+            !l.usable_for(&g, dir, h ^ 1, LEASE_REMOVE, 10, 7),
+            "another link"
+        );
+        let other = InodeKey { dev: 8, ino: 100 };
+        assert!(
+            !l.usable_for(&g, other, h, LEASE_REMOVE, 10, 7),
+            "another directory"
+        );
+        assert!(!l.usable_for(&g, dir, h, LEASE_REMOVE, 500, 7), "expired");
+        assert!(
+            !WindowLease { generation: 3, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7),
+            "an earlier window's"
+        );
+        assert!(
+            !WindowLease { generation: 0, ..l }.usable_for(
+                &FsGrantV2 { generation: 0, ..g },
+                dir,
+                h,
+                LEASE_REMOVE,
+                10,
+                7
+            ),
+            "no window"
+        );
+        assert!(
+            !WindowLease { action: 3, ..l }.usable_for(&g, dir, h, 3, 10, 7),
+            "no such action"
+        );
+        assert!(
+            !l.usable_for(&g, dir, h, LEASE_REMOVE, 10, 8),
+            "another session"
+        );
+        assert_eq!(core::mem::size_of::<WindowLease>(), 56);
+        const { assert!(WINDOW_LEASES_MAX >= 2 && WINDOW_LEASES_MAX <= 16) };
+        const { assert!(WINDOW_LEASE_TTL_NS <= 10_000_000_000) };
+    }
+
+    /// Lot 2.2: the window ring's record — its kinds named once each, its
+    /// size fixed, the ring a power of two.
+    #[test]
+    fn the_window_records_are_named_and_sized() {
+        for (i, (k, name)) in WINDOW_EVENT_KINDS.iter().enumerate() {
+            assert_eq!(usize::from(*k), i + 1, "{name}");
+            assert_eq!(window_event_kind_name(*k), Some(*name));
+        }
+        assert_eq!(window_event_kind_name(0), None);
+        assert_eq!(window_event_kind_name(10), None);
+        assert_eq!(core::mem::size_of::<WindowEventRaw>(), 56);
+        assert!(WINDOW_EVENTS_RING_BYTES.is_power_of_two());
+        assert_ne!(WINDOW_EVENTS_MAP_NAME, "FS_PROTECT_EVENTS");
     }
 
     /// Lot 2.1: the start in ticks is procfs's division of the boot-time
@@ -3047,6 +3427,33 @@ mod tests {
         assert_eq!(kernel_read_class(""), None);
     }
 
+    /// Lot 2.2: the perf hook refuses a uprobe PMU event and CPU-wide
+    /// sampling of user registers or stacks, nothing else; the
+    /// configuration's slots follow the lockdown list.
+    #[test]
+    fn the_perf_refusals_are_the_uprobe_pmu_and_user_sampling() {
+        const REGS_USER: u64 = 1 << 12;
+        const STACK_USER: u64 = 1 << 13;
+        const CALLCHAIN: u64 = 1 << 5;
+        assert_eq!(perf_refusal(9, 0, 0, 9), PERF_REFUSED_UPROBE_PMU);
+        assert_eq!(perf_refusal(9, 0, 0, 0), 0, "no uprobe PMU on this kernel");
+        assert_eq!(
+            perf_refusal(0, STACK_USER, 1, 9),
+            PERF_REFUSED_USER_SAMPLING
+        );
+        assert_eq!(perf_refusal(0, REGS_USER, 1, 9), PERF_REFUSED_USER_SAMPLING);
+        assert_eq!(
+            perf_refusal(0, STACK_USER, 0, 9),
+            0,
+            "per-task: the ptrace check's"
+        );
+        assert_eq!(perf_refusal(0, CALLCHAIN, 1, 9), 0, "kernel call chains");
+        assert_eq!(perf_refusal(1, 0, 2, 9), 0);
+        assert_eq!(KREAD_SLOT_REASONS + 5, KREAD_SLOT_UPROBE_PMU);
+        assert_eq!(KERNEL_READ_CONF_SLOTS, 7);
+        assert_ne!(PERF_REFUSED_UPROBE_PMU, PERF_REFUSED_USER_SAMPLING);
+    }
+
     /// Lot 2.1: the reserved codes follow the last one emitted, in order,
     /// once each, under names of their own.
     #[test]
@@ -3054,11 +3461,17 @@ mod tests {
         for (i, (code, name, lot)) in S2_RESERVED_FS_OPS.iter().enumerate() {
             assert_eq!(
                 usize::from(*code),
-                usize::from(FS_OP_LAST) + 1 + i,
+                usize::from(FS_OP_SYSRQ_WINDOW) + 1 + i,
                 "{name}"
             );
             assert!(*lot == "2.2" || *lot == "2.3", "{name}");
-            assert!(!is_minor_denial(*code) && !is_sole_trace(*code), "{name}");
+            // lot 2.2's codes are emitted (named, classed); 2.3's are not yet
+            if *lot == "2.2" {
+                assert!(*code <= FS_OP_LAST, "{name}");
+            } else {
+                assert!(*code > FS_OP_LAST, "{name}");
+                assert!(!is_minor_denial(*code) && !is_sole_trace(*code), "{name}");
+            }
             assert_eq!(
                 S2_RESERVED_FS_OPS
                     .iter()
@@ -3068,6 +3481,8 @@ mod tests {
                 "{name}"
             );
         }
+        // the last code emitted is lot 2.2's last
+        assert_eq!(FS_OP_LAST, FS_OP_SHARED_MAP);
     }
 
     /// Lot 2.1: the window's byte is the first of the old padding — the
@@ -3080,6 +3495,23 @@ mod tests {
         assert_eq!(core::mem::offset_of!(FsProtectDenialRaw, window), 49);
         assert_eq!(core::mem::size_of::<FsProtectDenialRaw>(), 56);
         assert_ne!(DENIAL_WINDOW_OUTSIDER, DENIAL_WINDOW_KEPT);
+    }
+
+    /// Lot 2.2: the context classes — distinct, named once each; the
+    /// window never softens an outsider's, a kept or an eviction record,
+    /// and softens nothing else by this test.
+    #[test]
+    fn the_window_classes_are_distinct_and_never_soften_an_outsider() {
+        for (i, (c, name)) in DENIAL_WINDOW_CLASSES.iter().enumerate() {
+            assert_eq!(usize::from(*c), i, "{name}");
+        }
+        assert!(window_class_never_softened(DENIAL_WINDOW_OUTSIDER));
+        assert!(window_class_never_softened(DENIAL_WINDOW_KEPT));
+        assert!(window_class_never_softened(DENIAL_WINDOW_EXEC_EVICTED));
+        assert!(!window_class_never_softened(DENIAL_WINDOW_NONE));
+        assert!(!window_class_never_softened(DENIAL_WINDOW_IN_TREE));
+        assert!(!window_class_never_softened(DENIAL_WINDOW_PID1_LEASE));
+        assert!(!window_class_never_softened(6));
     }
     use core::mem::{align_of, size_of};
 
@@ -3400,6 +3832,10 @@ mod tests {
             bpf_cmd_name(BPF_CMD_VACATED_ROLE_GET_FD),
             "vacated_role_get_fd"
         );
+        assert_eq!(
+            bpf_cmd_name(BPF_CMD_ROOT_CGROUP_ATTACH),
+            "root_cgroup_attach"
+        );
     }
 
     /// External audit EBPF-015: a new entry is refused only in a NOCREATE
@@ -3582,6 +4018,11 @@ mod tests {
             FS_OP_PTRACE_READ,
             FS_OP_SYSRQ,
             FS_OP_SYSRQ_WINDOW,
+            FS_OP_ROLE_UNMARKED,
+            FS_OP_BPF_CGROUP_ATTACH,
+            FS_OP_KERNEL_READ,
+            FS_OP_PERF_EVENT,
+            FS_OP_SHARED_MAP,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

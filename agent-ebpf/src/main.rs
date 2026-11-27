@@ -87,6 +87,7 @@ mod opaque;
 mod open_sensor;
 mod ptrace_check;
 mod read_repeat;
+mod role_maps;
 mod sensor_probe;
 mod sigio_guard;
 mod socket_connect;
@@ -99,6 +100,7 @@ mod tcp_close;
 mod tcp_connect;
 mod tls_hello;
 mod udp_sendmsg_outbound;
+mod window_maps;
 mod uiter;
 mod zero;
 

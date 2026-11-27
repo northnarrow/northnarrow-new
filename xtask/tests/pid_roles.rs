@@ -83,6 +83,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 293: the process a file's owner signal is for — a target; no
         // caller is asked (the I/O's context is no sender)
         ("sigio_guard.rs", 1, 0),
+        // lot 2.2: the mapper of a protected file shared and writable, and
+        // the holder of a role mapping executable code — callers
+        ("role_maps.rs", 0, 2),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -110,6 +113,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "cgroup_join.rs",
             "sysctl_guard.rs",
             "sigio_guard.rs",
+            "role_maps.rs",
         ]
         .contains(&name.as_str())
         {

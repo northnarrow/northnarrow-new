@@ -159,7 +159,36 @@ const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed
 /// read, why)` — none reads a file a process or a user names into an empty
 /// answer that a protection then publishes. The readers that keep the last
 /// good state (`LastGood`, a `Condition` in the error's arm) are not sites.
+/// Lot 2.2: the role images' sources.
+const ROLEMARK: &str = "lot 2.2: a source of the role images (a role process's maps, \
+                        /etc/nsswitch.conf, /etc/ld.so.preload, the uprobe PMU's type): an \
+                        unreadable one adds nothing — fewer marks or no perf PMU to refuse, never a \
+                        wider role (a role process mapping an unmarked image loses its role, \
+                        signed); a preload list that cannot be read excludes nothing, and the \
+                        library it would name is in the maps only if the loader read it";
+
 const KNOWN: &[(&str, &str, &str)] = &[
+    // lot 2.2: the role marks' and the kernel-read option's sources
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_to_string(\"/sys/bus/event_source/devices/uprobe/type\")",
+        ROLEMARK,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_to_string(p)",
+        ROLEMARK,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_to_string(\"/proc/self/maps\")",
+        ROLEMARK,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_to_string(format!(\"/proc/{pid}/maps\"))",
+        ROLEMARK,
+    ),
     // lot 373: the exec's and its parent's start before the package
     // manager's walk; a package's dpkg list and an account's uid under the
     // host's root (R012, NN-L-NET-013), each failing toward no exemption
