@@ -7,7 +7,7 @@
 **Sovereign endpoint defence for Linux.**<br/>
 Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic on the host · verified in a lab you can rerun.
 
-🆕 **Since the alpha:** stage S1 done — Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors, AlmaLinux 9 and the `.rpm` tested. [What's new →](#whats-new-since-the-alpha)
+🆕 **`v0.1.1-alpha`:** the SysRq trigger refused outside a trusted-installer window and a stop the agent did not request restarted and signed, plus stage S1 — Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors, AlmaLinux 9 and the `.rpm` tested. [What's new →](#whats-new-in-v011-alpha)
 
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
@@ -17,7 +17,7 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
-[What's new](#whats-new-since-the-alpha) ·
+[What's new](#whats-new-in-v011-alpha) ·
 [Working on now](#working-on-now) ·
 [Today](#what-it-does-today-and-what-it-does-not) ·
 [Architecture](#architecture) ·
@@ -33,16 +33,17 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 </div>
 
 > [!IMPORTANT]
-> **Alpha: `v0.1.0-alpha`, 23 November 2026.** For testing on machines you can throw away, not
-> yet for protecting real ones.
+> **Alpha: `v0.1.1-alpha`, 27 November 2026** (the second alpha; the first, `v0.1.0-alpha`, was
+> tagged on 23 November). For testing on machines you can throw away, not yet for protecting
+> real ones.
 >
 > - **Observe-only.** A fresh install runs the [`alpha` profile](docs/operator/ALPHA_PROFILE.md):
 >   the agent detects, judges and records as it would in production, and does not act on a user
 >   program: each verdict is recorded as what it *would have* done. Its self-protection and the
 >   host-integrity refusals (untrusted kernel modules, kexec, foreign BPF programs) stay enforced.
-> - **Linux x86_64 only**, verified in our lab on five kernels, which the nightly CI also runs:
->   5.15, 6.1, 6.8, 6.12 and 7.0 (Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13). Since the
->   alpha, `main` is verified on AlmaLinux 9 (5.14) too.
+> - **Linux x86_64 only**, verified in our lab on six kernels, which the nightly CI also runs:
+>   5.14, 5.15, 6.1, 6.8, 6.12 and 7.0 (AlmaLinux 9; Ubuntu 22.04, 24.04 and 26.04; Debian 12
+>   and 13).
 > - **Built with AI assistance, under the founder's direction.** A single-founder project from
 >   the EU. The founder sets the direction, decides and reviews. The code, and much of the
 >   design, were written with Claude Code (Anthropic's AI coding assistant). Reviews and
@@ -53,10 +54,11 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 
 ---
 
-## What's new since the alpha
+## What's new in `v0.1.1-alpha`
 
-Merged after `v0.1.0-alpha` (23 November 2026):
+`v0.1.1-alpha` (27 November 2026) is everything merged after `v0.1.0-alpha` (23 November 2026):
 
+- Self-defence: the SysRq trigger is refused outside a trusted-installer window, a stop the agent or the watchdog did not request restarts it and is signed, and the keyboard's SysRq mask cannot be widened to signal processes outside a window ([#639](https://github.com/northnarrow/northnarrow-new/pull/639)).
 - Rust edition 2024 and toolchain 1.100 ([#607](https://github.com/northnarrow/northnarrow-new/pull/607), [#609](https://github.com/northnarrow/northnarrow-new/pull/609)).
 - aya 0.16 in user space, and aya-ebpf 0.3 with LLVM 22 for the kernel programs, which come out up to 13% smaller ([#614](https://github.com/northnarrow/northnarrow-new/pull/614), [#618](https://github.com/northnarrow/northnarrow-new/pull/618)).
 - 0 open Dependabot alerts: moving to `rustls-rustcrypto` removed the Marvin RSA advisory and an old `rustls-webpki` ([#610](https://github.com/northnarrow/northnarrow-new/pull/610), [#612](https://github.com/northnarrow/northnarrow-new/pull/612), [#626](https://github.com/northnarrow/northnarrow-new/pull/626)); `chrono` replaced by `jiff` ([#615](https://github.com/northnarrow/northnarrow-new/pull/615)).
@@ -69,7 +71,7 @@ Merged after `v0.1.0-alpha` (23 November 2026):
 - With the experimental exec quarantine on, a stop of the agent no longer leaves the processes it held stopped ([#635](https://github.com/northnarrow/northnarrow-new/pull/635)); a DNS response read before its query now answers it ([#636](https://github.com/northnarrow/northnarrow-new/pull/636)).
 - Stage S1 is done: on six kernels (5.14 el9 to 7.0) every program loads, the highest uses 53.3% of the verifier budget and every stack chain is within 448 of 512 bytes ([#637](https://github.com/northnarrow/northnarrow-new/pull/637), [the round](docs/validation/results/stage-s1-2026-11-26.md)).
 
-Upgrading from `v0.1.0-alpha`: [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md). What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+Upgrading from `v0.1.0-alpha`: [`INSTALL_UPGRADE_UNINSTALL.md` §2.2](docs/operator/INSTALL_UPGRADE_UNINSTALL.md#22-from-v010-alpha-to-v011-alpha), then [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md). What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
 
 ---
 
@@ -428,9 +430,10 @@ to the kernel's running list rather than a fixed list
 ([Enabling the `bpf` LSM](docs/operator/KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line)),
 bpffs at `/sys/fs/bpf`, systemd, and `nft`.
 
-**From the release.** `<ver>` below is `0.1.0-alpha`, and the packages are
-`northnarrow_0.1.0-alpha-1_amd64.deb` and `northnarrow-0.1.0-alpha-1.x86_64.rpm` (versioned
-`0.1.0~alpha-1` inside: dpkg's and rpm's form of a pre-release). Without `gh` 2.49 or newer, the
+**From the release.** `<ver>` below is `0.1.1-alpha`, and the packages are
+`northnarrow_0.1.1-alpha-1_amd64.deb` and `northnarrow-0.1.1-alpha-1.x86_64.rpm` (versioned
+`0.1.1~alpha-1` inside: dpkg's and rpm's form of a pre-release, which sorts after the first
+alpha's `0.1.0~alpha-1`). Without `gh` 2.49 or newer, the
 guide's [§4](docs/operator/ALPHA_TESTER_GUIDE.md#4-install-and-verify) verifies the release with its
 signed `SHA256SUMS.asc` and `gpgv` instead. With `gh`, a release is verified and installed like this:
 
@@ -487,7 +490,8 @@ health check, and any failure restores and restarts the previous version
 binaries and its eBPF object with the manifest, and refuses to start on a mismatch.
 
 - Upgrading from `v0.1.0-alpha`: read
-  [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md).
+  [`INSTALL_UPGRADE_UNINSTALL.md` §2.2](docs/operator/INSTALL_UPGRADE_UNINSTALL.md#22-from-v010-alpha-to-v011-alpha),
+  then [`UPGRADE_NOTES_0.2.md`](docs/operator/UPGRADE_NOTES_0.2.md).
 - Upgrading from `v0.0.1-tappa9.0`: read
   [`UPGRADE_NOTES_AUDIT_16f7563.md`](docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md), then
   [`UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md).
@@ -600,7 +604,7 @@ independent validation.
   `v*` tag (`--cert-identity-regex '…release\.yml@refs/tags/v'`, `--deny-self-hosted-runners`),
   so the artefacts of a run on a branch do not verify as a release. Building and signing are
   separate jobs, and the job that compiles the dependency tree cannot request the signing token.
-  `v0.1.0-alpha` is the first tag released this way.
+  `v0.1.0-alpha` was the first tag released this way, `v0.1.1-alpha` the second.
 - **Packages.** The `.rpm` is signed on tag builds, in its own job. Check it with `rpm -K` or
   dnf's `localpkg_gpgcheck` against
   [`deploy/release/RPM-GPG-KEY-northnarrow.asc`](deploy/release/RPM-GPG-KEY-northnarrow.asc),

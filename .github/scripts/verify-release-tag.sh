@@ -27,7 +27,7 @@
 # version (lot 383, the alpha's version), in the checkout of the tagged
 # commit, refuses (exit 1) unless:
 #   - <tag> is `v` and the workspace version of Cargo.toml
-#     ([workspace.package] version): `v0.1.0-alpha` for "0.1.0-alpha". The
+#     ([workspace.package] version): `v0.1.1-alpha` for "0.1.1-alpha". The
 #     artefacts are named and versioned from Cargo.toml (mk-tarball.sh,
 #     mk-packages.sh), so a tag of another version would publish them under
 #     a name that is not theirs (a `v0.1.0-alpha` tag once had 0.0.1 ones);

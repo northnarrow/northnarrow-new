@@ -1,6 +1,9 @@
 # Alpha tester guide
 
-> For NorthNarrow 0.1.0-alpha (the `v0.1.0-alpha` release).
+> For NorthNarrow 0.1.1-alpha (the `v0.1.1-alpha` release, the second
+> alpha). Testing the first one, `v0.1.0-alpha`? The steps are the same;
+> to move a host from it to the second, see
+> [INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §2.2.
 
 NorthNarrow is an open-source endpoint detection and response (EDR) agent
 for Linux. It watches what runs on a host, the files it touches and the
@@ -135,7 +138,7 @@ into one directory:
 
 ```sh
 # a build from before the tag (no release page yet)? Skip to "Before the release exists" below
-ver=<ver>                            # the release you test, e.g. 0.1.0-alpha
+ver=<ver>                            # the release you test, e.g. 0.1.1-alpha
 base=https://github.com/northnarrow/northnarrow-new/releases/download/v$ver
 curl -fLO "$base/northnarrow-$ver-x86_64-linux.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -144,10 +147,11 @@ curl -fLO "$base/SHA256SUMS.asc"
 
 For the `.deb` instead of the tarball, download it the same way, by the
 name the release page lists (`northnarrow_<ver>-<rel>_amd64.deb`: for the
-alpha `northnarrow_0.1.0-alpha-1_amd64.deb`), next to `SHA256SUMS` and
-`SHA256SUMS.asc`. Installed, the package's version reads `0.1.0~alpha-1`
-(`dpkg -l northnarrow`): dpkg's form of the same pre-release, which sorts
-before a final `0.1.0`.
+second alpha `northnarrow_0.1.1-alpha-1_amd64.deb`), next to `SHA256SUMS`
+and `SHA256SUMS.asc`. Installed, the package's version reads
+`0.1.1~alpha-1` (`dpkg -l northnarrow`): dpkg's form of the same
+pre-release, which sorts after the first alpha's `0.1.0~alpha-1` and
+before a final `0.1.1`.
 
 Verify them with the release key committed at the release tag, never
 with a copy from the release page
@@ -271,7 +275,7 @@ source) cannot be proven to be the release:
   For a CI build the installer prints `tarball matches SHA256SUMS` (not
   "signed"), and `sudo nn-admin host-check` shows `release verified at
   install` as a WARN naming the flag. Both are expected for such a build.
-  Its version reads `0.1.0-alpha`, as the release's: the `Build:` line of
+  Its version reads `0.1.1-alpha`, as the release's: the `Build:` line of
   its tree's `README-RELEASE.md` names the commit it was built from (and
   `install.sh --upgrade` prints it).
 - A `.deb` of such a build has only its `SHA256SUMS` line: nothing

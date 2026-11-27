@@ -1,18 +1,25 @@
 # Upgrade notes: 0.2
 
-What changes for an operator who upgrades from `v0.1.0-alpha` to a build of
-`main` after it, on the way to the next release (0.2). It covers the
-maintenance after the alpha and stage S1 of the roadmap (the verifier's
-margin, the eBPF compiler, the cross-cutting migrations). The changes up to
-the alpha are in `UPGRADE_NOTES_WAVE4.md` (frozen at the alpha) and
-`UPGRADE_NOTES_AUDIT_16f7563.md`. `CHANGELOG.md`, its *Unreleased* block,
-has each change by its lot. The stage's lab round, on six kernels:
+> These notes apply from `v0.1.1-alpha` onward: it is the first tag that carries the changes below.
+
+What changes for an operator who upgrades from `v0.1.0-alpha` to
+`v0.1.1-alpha`, and to the builds of `main` after it, on the way to the
+next release (0.2). It covers three self-protection and robustness fixes,
+the maintenance after the alpha and stage S1 of the roadmap (the
+verifier's margin, the eBPF compiler, the cross-cutting migrations). The
+changes up to the alpha are in `UPGRADE_NOTES_WAVE4.md` (frozen at the
+alpha) and `UPGRADE_NOTES_AUDIT_16f7563.md`. `CHANGELOG.md`, its
+`[0.1.1-alpha]` section, has each change by its lot. The stage's lab
+round, on six kernels:
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/results/stage-s1-2026-11-26.md>.
 
-No tag carries these changes yet. A build of `main` still says
-`0.1.0-alpha` (`0.1.0~alpha` in the packages): to put one over an installed
-alpha, use `install.sh --upgrade`, or `rpm -U --replacepkgs` for the
-`.rpm` (§8).
+`v0.1.1-alpha` says `0.1.1-alpha` (`0.1.1~alpha` in the packages), which
+dpkg and rpm sort after the first alpha's `0.1.0~alpha`: the upgrade is
+`install.sh --upgrade`, or the package command with the newer package and
+`NN_GRANT_KEY` (`INSTALL_UPGRADE_UNINSTALL.md` §2.2). A build of `main`
+made after the tag says `0.1.1-alpha` too, until the next tag: to put one
+over an installed `v0.1.1-alpha`, use `install.sh --upgrade`, or
+`rpm -U --replacepkgs` for the `.rpm` (§8).
 
 ## Before you upgrade
 
@@ -33,6 +40,17 @@ alpha, use `install.sh --upgrade`, or `rpm -U --replacepkgs` for the
    one or two `stopping` entries, and a WARN's text changed (§7).
 6. **More FIM records:** a watched file read again after an `exec` is
    recorded again (§5).
+7. **The SysRq trigger file is refused outside a trusted-installer
+   window** (§9). A script that writes `/proc/sysrq-trigger` on purpose
+   (a crash-dump test, an emergency reboot) gets `EPERM` and a signed
+   High, unless it runs inside a window.
+8. **A stop signal the agent or the watchdog did not request restarts
+   the role and is signed** (§9), and the watchdog exits with a new
+   status, 21. Monitoring that reads the watchdog's exit status sees it.
+9. **`kernel.sysrq`:** a write that would let the keyboard signal
+   processes is refused outside a window; a host whose mask already lets
+   it gets the advisory `sysrq_keyboard_signals` in `nn-admin status`
+   (§9). The distributions' default masks raise neither.
 
 ## 1. The toolchain and the eBPF compiler (lots 396, 397, 400a, 1.2)
 
@@ -48,7 +66,7 @@ alpha, use `install.sh --upgrade`, or `rpm -U --replacepkgs` for the
   (rustc 1.99, LLVM 22.1.8), with bpf-linker 0.10.3 as before. The
   verifier processes fewer instructions in all (−6.7 % on 5.15, −13.2 % on
   7.0, the lab's measure), and no program fails on the lab's six kernels
-  (§10).
+  (§11).
 - CI keeps the eBPF object it tested, with its sha256, as the artefact
   `ebpf-object`; the release workflow prints the sha256 of the object it
   embeds. Comparing the two before a tag is still a maintainer's step by
@@ -89,7 +107,7 @@ alpha, use `install.sh --upgrade`, or `rpm -U --replacepkgs` for the
   Per-mount flags (read-only, `noexec`) do not go through that function
   and stay with the round. A kernel without the function starts the agent
   with a signed degradation ("… not at once"); the six lab kernels have it
-  (§10).
+  (§11).
 - **For you, on util-linux 2.39 and later** (Debian 13's 2.41; check
   `mount --version` for `fd-based-mount`): `mount --make-*` and `mount -o
   remount,bind,ro` use `mount_setattr(2)`. They succeed, and the integrity
@@ -117,7 +135,7 @@ alpha, use `install.sh --upgrade`, or `rpm -U --replacepkgs` for the
   name the fallback (`raw_tp:sys_enter (execve, user memory)`, `(openat,
   …)`), and the degradation (`exec_sensor`, `file_open_sensor`) names the
   CPUs each attach point was seen and missed on. The lab measured 10 of 10
-  execs recorded on each of 4 CPUs (§10).
+  execs recorded on each of 4 CPUs (§11).
 - Its cost: a filter on the number of every system call of the host,
   while it runs.
 - The test runs once, at the boot (`SENSOR_CONTRACT.md` §5c).
@@ -200,12 +218,66 @@ experimental, off by default).
   `NN_GRANT_KEY`, the keys and the agent's id kept), a cold boot with both
   units active, `rpm -e` and `uninstall.sh --package --purge` leaving
   nothing, and no SELinux denial in any phase.
-- Fedora, Rocky and RHEL itself, and an upgrade between two released
-  versions, are not tested (`KNOWN_LIMITATIONS.md`, "Kernels and
-  distributions").
+- Lot R1 (2026-11-27): the published `v0.1.0-alpha` `.rpm` upgraded with
+  `rpm -U` to a `.rpm` of the `v0.1.1-alpha` release branch on AlmaLinux
+  9.9, and the same with the `.deb` on Ubuntu 22.04 (`INSTALL_UPGRADE_UNINSTALL.md`
+  §6).
+- Fedora, Rocky and RHEL itself, and an upgrade between two packages both
+  built by the release workflow, are not tested (`KNOWN_LIMITATIONS.md`,
+  "Kernels and distributions").
 - Nothing to configure.
 
-## 9. Smaller changes
+## 9. Self-defence: the SysRq trigger, stops not requested, the keyboard mask (lot 2.0)
+
+- **The SysRq trigger file is refused outside a window.** A write of
+  `/proc/sysrq-trigger`, at its open and on a descriptor already open, is
+  refused to every caller outside the agent's family, root included,
+  whatever request it carries, unless a signed trusted-installer window
+  is open: `EPERM`, and a signed NN-L-AT-001 (`deny=sysrq`, High). Each
+  SysRq request acts on the whole host, outside every other hook. Inside a
+  window the write goes through and its open is recorded
+  (`deny=sysrq_window`, Low).
+- **A stop the agent did not request is not a clean stop.** A stop
+  signal (SIGTERM, SIGINT, SIGHUP for the agent; SIGTERM, SIGINT for the
+  watchdog) is a clean stop only in the host's shutdown or with a signed
+  trusted-installer window in force at its delivery. Any other still ends
+  the process, and now:
+  - the agent signs an `unrequested_stop` finding (High) that names the
+    signal and its sender as the kernel delivered them, stops with the
+    reason `unrequested_signal` (not a clean reason, so the off-host
+    verifier reports the stop), and exits with an error; the watchdog
+    starts it again, as after any death;
+  - the watchdog exits with the new status **21** and leaves an
+    `unrequested_stop` record, which the agent signs (High); systemd
+    restarts the watchdog (`Restart=always`), and its start brings the
+    agent back when it is down too;
+  - the finding is held in `nn-admin status` until an acknowledgement
+    covers it, like a role's death.
+
+  The stops that were requested keep their behaviour: `install.sh`,
+  `uninstall.sh` and the upgrade stop the units inside their own window,
+  and so does the operator's trusted-installer flow
+  (`INSTALL_UPGRADE_UNINSTALL.md` §3.7); the host's shutdown; an
+  admin-signed shutdown.
+- **The keyboard SysRq mask cannot be widened outside a window.**
+  `kernel.sysrq` is one of the guarded sysctls: a write that would let a
+  keyboard signal processes is refused outside a signed window, by both
+  sysctl judges, and signed (`deny=sysctl`, naming `kernel.sysrq` and the
+  value). It is never opted out by the per-rule policy's `sysctl-allow`.
+  A narrower mask goes through, as do the distributions' defaults
+  (Ubuntu 176, Debian 438, RHEL and AlmaLinux 16).
+- **The agent never rewrites the host's mask.** A mask found letting a
+  keyboard signal processes (set at boot by `sysctl.d`, or inside a
+  window) is the integrity round's signed advisory
+  `sysrq_keyboard_signals` ("SysRq can signal processes from a
+  keyboard"), listed by `nn-admin status` under the advisories while it
+  holds, and ended when the mask is narrowed. No sensor is degraded by it.
+- **For you:** run a script that uses the trigger file on purpose inside
+  a window; narrow a `kernel.sysrq` that lets a keyboard signal
+  processes if the host does not need it; acknowledge an
+  `unrequested_stop` once you know who sent the signal.
+
+## 10. Smaller changes
 
 - **The export worker (lot 1.8).** A failing OS random generator in the
   syslog sink's TLS key exchange is now that sink's fault, with no key
@@ -218,7 +290,7 @@ experimental, off by default).
   have refused every worker's hello there. No lab kernel has ABI 10.
 - Nothing to configure.
 
-## 10. What the stage's lab round measured
+## 11. What the stage's lab round measured
 
 On `main` at `7f4834ce`, the eBPF object of that commit's CI run, six
 kernels, 2026-11-26:

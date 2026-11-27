@@ -1,34 +1,68 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions
-follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0, and
-`0.1.0-alpha` everything since, up to the first alpha. A section's date is
-the day of its tag, written in the last commit before the tag (until then
-it reads `unreleased`); release.yml's `verify-tag` refuses a tag that is
-not `v` and the workspace version, or whose section is not the first one
-here, dated (CONTRIBUTING.md, "Releases").
+follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0,
+`0.1.0-alpha` everything since, up to the first alpha, and each later
+section what was merged between its tag and the one before. A section's
+date is the day of its tag, written in the last commit before the tag
+(until then it reads `unreleased`); release.yml's `verify-tag` refuses a
+tag that is not `v` and the workspace version, or whose section is not the
+first one here, dated (CONTRIBUTING.md, "Releases").
 
-### Unreleased: on `main` since `v0.1.0-alpha`
+## [0.1.1-alpha] - 2026-11-27
 
-Merged after the `v0.1.0-alpha` tag, in no tag yet: the maintenance after
-the alpha and stage S1 of the roadmap after the alpha (ROADMAP.md in the
-source tree; foundations: verifier margin, the eBPF compiler, the cross-cutting
-migrations). It is a level-3 heading on purpose: until the next tag the
-first `## ` section stays the tagged `[0.1.0-alpha]`, which
-`verify-release-tag.sh version` and `xtask/tests/release_version.rs`
-require; the last commit before the next tag makes this block that
-version's dated section. What changes for an operator is in
-`UPGRADE_NOTES_0.2.md`; the stage's lab round is
-`docs/validation/results/stage-s1-2026-11-26.md` in the source tree.
+Tag `v0.1.1-alpha`: the second alpha, everything merged since
+`v0.1.0-alpha` — three self-protection and robustness fixes, the
+maintenance after the alpha, and stage S1 of the roadmap after the alpha
+(ROADMAP.md in the source tree; foundations: the verifier's margin, the
+eBPF compiler, the cross-cutting migrations). The workspace, `--version`,
+the tarball and the packages say `0.1.1-alpha`; the `.deb` and the `.rpm`
+carry it as `0.1.1~alpha`, which sorts after `0.1.0~alpha` and before
+`0.1.1`, so the package managers take it as an upgrade of the first alpha.
+What changes for an operator who upgrades from `v0.1.0-alpha` is in
+`UPGRADE_NOTES_0.2.md` and in `INSTALL_UPGRADE_UNINSTALL.md` §2.2; the
+stage's lab round is `docs/validation/results/stage-s1-2026-11-26.md` in
+the source tree.
 
-#### Changed
-- Lot 396 (#607): Rust edition 2024 for the workspace, `fuzz/` and
-  `agent-ebpf/`. No behaviour change and no dependency moved. The eBPF
-  object's programs were checked on the five lab kernels against rc15's
-  figures: none fails or grows by more than 1 %.
-- Lot 397 (#609): the pinned Rust toolchain is 1.100.0. Every CI cache of
-  a `target/` is keyed on its toolchain file
-  (`a_cached_target_is_keyed_on_its_toolchain`).
+### Security
+- Lot 2.0 (#639): self-defence.
+  - **The SysRq trigger is refused outside a trusted-installer window.** A
+    write of `/proc/sysrq-trigger`, at its open and on an already open
+    descriptor, is refused to every caller outside the agent's family,
+    root included, whatever request it carries, unless a signed
+    trusted-installer window is open. Each refusal is signed (NN-L-AT-001,
+    `deny=sysrq`, High). Inside a window the write goes through and is
+    recorded (`deny=sysrq_window`, Low).
+  - **A stop the agent did not request restarts it and is recorded.** A
+    stop signal delivered to the agent or the watchdog with no signed
+    trusted-installer window in force, outside the host's shutdown, is no
+    longer a clean stop. The agent signs an `unrequested_stop` finding
+    (High) that names the signal and its sender, stops with the reason
+    `unrequested_signal`, and the watchdog starts it again; the watchdog
+    exits with the new status 21 and leaves an `unrequested_stop` record,
+    and systemd restarts it (its start brings the agent back when the
+    agent is down too). The stops that were requested keep their
+    behaviour: the window's stop of `install.sh`, `uninstall.sh` and the
+    upgrade, the host's shutdown, an admin-signed shutdown.
+  - **The keyboard SysRq mask cannot be widened outside a window.** A
+    write of `kernel.sysrq` that would let the keyboard signal processes
+    is refused outside a signed window, by both sysctl judges, and signed
+    (`deny=sysctl`, naming `kernel.sysrq` and the value); it is never
+    opted out by the per-rule policy. A narrower mask goes through (the
+    distributions' defaults do). The agent never rewrites the host's mask:
+    a mask found letting the keyboard signal processes is the integrity
+    round's signed advisory `sysrq_keyboard_signals`, listed by
+    `nn-admin status` while it holds.
+  - Tests: `stop_signal::tests::a_stop_signal_is_requested_only_in_the_shutdown_or_a_window`,
+    `run_loop::tests::an_unrequested_stop_signal_is_no_clean_stop`,
+    `systemd_units::the_watchdog_restarts_on_every_failure_but_not_after_a_stop`,
+    `cgroup_limits::tests::the_keyboard_sysrq_mask_cannot_be_widened_to_signal_processes`,
+    `sysctl_guard::tests::the_keyboard_sysrq_mask_is_an_advisory_never_rewritten`;
+    ratchets `xtask/tests/stop_signals.rs`, `cgroup_guard.rs`,
+    `lab_scripts.rs`. Lab cases C113, C113b, C113w, C113k, C113m, C113n.
+- Lot 1.1 (#617): a `move_mount(2)` of an attached peer copy of a
+  protected mount is refused in any namespace outside a trusted-installer
+  window, and signed (High).
 - Lot 398 (#610): the export's TLS provider is rustls-rustcrypto
   0.1.0-pre.0. rustls-webpki 0.102 left both lockfiles (8 Dependabot
   alerts closed), and RUSTSEC-2023-0071 (Marvin, rsa 0.10.0) and
@@ -36,10 +70,61 @@ version's dated section. What changes for an operator is in
   groups and signature schemes are unchanged
   (`the_provider_offers_lot_276s_algorithms`). `procfs` left the agent's
   dependency graph.
-- Lot 399 (#612): clap 4.6.9, rand 0.10.4, zeroize 1.9.2, uuid 1.29.3,
-  landlock 0.4.8. On a kernel with Landlock ABI 10 or later the worker
-  still declares ABI 9, the rights it asks for, so the core accepts its
-  hello (`a_kernel_above_the_rights_asked_declares_the_rights_asked`).
+- Lot M3 (#630): the xtask tests read YAML with serde-saphyr instead of a
+  reader built on unsafe-libyaml (RUSTSEC-2024-0449), and the fuzz seeds of
+  `elf_audit` are hex text instead of binary files.
+- Lot 1.8 (#616): a failing OS random generator in the export worker's key
+  exchange is the syslog sink's fault, with no key made from it, not a
+  panic (`a_failing_generator_is_a_sink_fault_not_a_panic`). The test
+  PKI's private keys carry a `TEST-ONLY KEY` header and are excluded from
+  secret scanning. `rustix` is in the crates both lockfiles must lock
+  alike.
+
+### Fixed
+- Lot M4 (#635, closes #633): with the exec quarantine on (experimental),
+  a stop of the agent during a burst of new executables no longer leaves
+  the processes it held stopped. The stop waits for the quarantine's
+  controller only within its deadline, then releases from the stopping
+  thread every process the kernel's map still names (resumed, or killed
+  when a kill is owed), and signs it. The deadline's own exit and a
+  dropped handle release them too.
+- Lot M5 (#636): a DNS response read before its query now answers it.
+  The two rings are read by two pumps in no order; the answered question
+  stayed "asked, never answered", and a later connect of that process to
+  an address no response named got no NN-L-NET-028 record
+  (`the_judgements_do_not_depend_on_the_order_the_two_pumps_read`).
+- Lot 1.3 (#625): on a kernel where a syscall tracepoint fires only on
+  CPU 0 (Ubuntu 26.04's 7.0), the exec and file-open sensors' tracepoint
+  modes move to the raw `sys_enter` tracepoint. A boot self-test on every
+  online CPU chooses, and the choice is signed. The verifier gates of the
+  lab check a stack chain of at most 448 of 512 bytes and print each
+  program's share of the 900,000-instruction gate.
+- Lot 1.4 (#629): the read-repeat filter now keys on the task and its
+  image, so a file read again after an `exec` gets its own record
+  (`fim_cred_read_after_an_exec_gets_its_own_record`).
+- Lots 1.7a (#624) and 1.7b (#628): two readers of mount tables, found by
+  the new syntax-tree ratchets (Added), now accept any byte in a mount
+  name (the watchdog's FUSE search and the views' own table).
+- Lot 1.5 (#637): the lab's `sensor-feasibility` runner executes the file
+  `/usr/bin/true` resolves to, which is a symlink on Ubuntu 26.04
+  (`a_system_binary_behind_a_symlink_runs_as_the_file_it_names`).
+
+### Changed
+- Lot 396 (#607): Rust edition 2024 for the workspace, `fuzz/` and
+  `agent-ebpf/`. No behaviour change and no dependency moved. The eBPF
+  object's programs were checked on the five lab kernels against rc15's
+  figures: none fails or grows by more than 1 %.
+- Lot 397 (#609): the pinned Rust toolchain is 1.100.0. Every CI cache of
+  a `target/` is keyed on its toolchain file
+  (`a_cached_target_is_keyed_on_its_toolchain`).
+- Lot 1.2 (#618): the eBPF crate is on aya-ebpf 0.3 and aya-build 0.2.1,
+  built by `nightly-2026-08-05` (rustc 1.99, LLVM 22.1.8) with bpf-linker
+  0.10.3. The verifier processes fewer instructions in all: −6.7 % on
+  5.15, −13.2 % on 7.0. Three bound tests LLVM 22 moved and one LSM verdict
+  it folded into arithmetic are fixed at the source (`opaque`, `lsm_ret`,
+  which fails closed; `xtask/tests/ebpf_barriers.rs`). CI keeps the
+  object it tested as the artefact `ebpf-object` with its sha256, and the
+  release prints the sha256 of the object it embeds.
 - Lot 400a (#614): aya 0.16 and aya-obj 0.6 in user space, MSRV 1.98,
   parking_lot 0.13. The eBPF object is byte-identical. Every load of the
   embedded object goes through one loader whose target-BTF source refuses
@@ -53,51 +138,6 @@ version's dated section. What changes for an operator is in
   written by chrono 0.4.45, the golden files), and RFC 3339 is read with
   chrono's grammar. postcard is 1.2.0, with the wire format pinned. The
   `cargo audit` exception for chrono (RUSTSEC-2026-0543) is gone.
-- Lot 1.2 (#618): the eBPF crate is on aya-ebpf 0.3 and aya-build 0.2.1,
-  built by `nightly-2026-08-05` (rustc 1.99, LLVM 22.1.8) with bpf-linker
-  0.10.3. The verifier processes fewer instructions in all: −6.7 % on
-  5.15, −13.2 % on 7.0. Three bound tests LLVM 22 moved and one LSM verdict
-  it folded into arithmetic are fixed at the source (`opaque`, `lsm_ret`,
-  which fails closed; `xtask/tests/ebpf_barriers.rs`). CI keeps the
-  object it tested as the artefact `ebpf-object` with its sha256, and the
-  release prints the sha256 of the object it embeds.
-- Lot 1.4 (#629): the sensors' cost. The read-repeat filter now keys on the
-  task and its image, so a file read again after an `exec` gets its own
-  record (`fim_cred_read_after_an_exec_gets_its_own_record`). The DNS
-  response program skips a socket connected to a port other than 53
-  before it calls any helper. `BPF_F_NO_COMMON_LRU` is not applied: the
-  A/B showed no gain, and a burst on one CPU kept a third of the entries.
-  Every program's deepest call chain is within 448 of the verifier's 512
-  bytes (`tcp_close` 480 → 288), with no debt left
-  (`no_program_s_stack_chain_is_over_448_bytes`).
-
-#### Added
-- Lot 1.1 (#617): the mount guard. `sb_mount` and `move_mount` are each an
-  entry program and the stages it tail-calls: every mount-guard program is
-  below 52 % of the 900,000-instruction gate on 5.15 and 6.1 (it was
-  92.3 %). A `move_mount(2)` of an attached peer copy of a protected mount
-  is refused in any namespace outside a trusted-installer window. A change
-  of propagation made through `mount_setattr(2)` on a guarded mount is
-  counted as the kernel makes it (an `fentry` on
-  `change_mnt_propagation`), and the guard follows it within a second. An
-  agent run by hand in PID 1's namespace keeps PID 1's guard entry, and
-  each re-creation of the pin directory's lock is numbered in its finding.
-- Lot 1.3 (#625): on a kernel where a syscall tracepoint fires only on
-  CPU 0 (Ubuntu 26.04's 7.0), the exec and file-open sensors' tracepoint
-  modes move to the raw `sys_enter` tracepoint. A boot self-test on every
-  online CPU chooses, and the choice is signed. The verifier gates of the
-  lab check a stack chain of at most 448 of 512 bytes and print each
-  program's share of the 900,000-instruction gate.
-- Lots 1.7a (#624) and 1.7b (#628): eleven code ratchets read the sources
-  as Rust (`xtask/tests/support/ast.rs`) instead of as text. The
-  spellings the reviews used against the lexical scans are caught. Two
-  readers of mount tables, found by the new ratchets, now accept any byte
-  in a mount name (the watchdog's FUSE search and the views' own table).
-- Lot 1.8 (#616): a failing OS random generator in the export worker's key
-  exchange is the syslog sink's fault, not a panic
-  (`a_failing_generator_is_a_sink_fault_not_a_panic`). The test PKI's
-  private keys carry a `TEST-ONLY KEY` header and are excluded from secret
-  scanning. `rustix` is in the crates both lockfiles must lock alike.
 - Lot 1.10 (#632): AlmaLinux 9 (5.14 el9, SELinux enforcing) is the
   nightly's sixth guest, and the `.rpm` is tested in the lab
   (`nn-lab.sh rpm-release-check`: the alpha's signed package installed,
@@ -106,40 +146,51 @@ version's dated section. What changes for an operator is in
   checked by its sha256 and refused on a mismatch. The lab's guests get
   one LTO setting and bounded build jobs (`NN_LAB_LTO`, `NN_LAB_JOBS`), a
   free-space check (`NN_LAB_MIN_FREE_GB`) and `nn-lab.sh grow-disk`.
+- Lot 399 (#612): clap 4.6.9, rand 0.10.4, zeroize 1.9.2, uuid 1.29.3,
+  landlock 0.4.8. On a kernel with Landlock ABI 10 or later the worker
+  still declares ABI 9, the rights it asks for, so the core accepts its
+  hello (`a_kernel_above_the_rights_asked_declares_the_rights_asked`).
+- Lot 1.4 (#629): the sensors' cost. The DNS response program skips a
+  socket connected to a port other than 53 before it calls any helper.
+  `BPF_F_NO_COMMON_LRU` is not applied: the A/B showed no gain, and a
+  burst on one CPU kept a third of the entries. Every program's deepest
+  call chain is within 448 of the verifier's 512 bytes (`tcp_close` 480 →
+  288), with no debt left (`no_program_s_stack_chain_is_over_448_bytes`).
+- Lot M1 (#626): github/codeql-action 4.39.4, nix 0.32.
+- Lot R1 (this release): the version is `0.1.1-alpha` everywhere the
+  repository names the current one (the workspace and the eBPF crate,
+  the three lockfiles, `nn-admin --version`, the packages, the issue
+  forms, SECURITY.md's supported versions, the install and upgrade
+  commands of the guides); `release_version.rs` also checks that dpkg
+  sorts `0.1.1~alpha` after the published `0.1.0~alpha` and that a
+  `v0.1.0-alpha` tag of this tree is refused. The upgrade from the
+  published `v0.1.0-alpha` packages was run in the lab: the `.deb` on
+  Ubuntu 22.04 and the `.rpm` on AlmaLinux 9.9, then the anti-tamper
+  signal cases and the SysRq cases, a cold boot and a clean removal
+  (`INSTALL_UPGRADE_UNINSTALL.md` §6).
+
+### Added
+- Lot 1.1 (#617): the mount guard. `sb_mount` and `move_mount` are each an
+  entry program and the stages it tail-calls: every mount-guard program is
+  below 52 % of the 900,000-instruction gate on 5.15 and 6.1 (it was
+  92.3 %). A change of propagation made through `mount_setattr(2)` on a
+  guarded mount is counted as the kernel makes it (an `fentry` on
+  `change_mnt_propagation`), and the guard follows it within a second. An
+  agent run by hand in PID 1's namespace keeps PID 1's guard entry, and
+  each re-creation of the pin directory's lock is numbered in its finding.
+- Lots 1.7a (#624) and 1.7b (#628): eleven code ratchets read the sources
+  as Rust (`xtask/tests/support/ast.rs`) instead of as text. The
+  spellings the reviews used against the lexical scans are caught.
 - Lot 1.5 (#637): the stage S1 lab round on six kernels and the kernel
   census (`docs/validation/results/stage-s1-2026-11-26.md`). Every program
   loads on the six kernels (the optional ones aside); the highest is
   53.3 % of the gate on 5.15 and 6.1, and every stack chain is at most 448
-  bytes. The lab's `sensor-feasibility` runner executes the file
-  `/usr/bin/true` resolves to, which is a symlink on Ubuntu 26.04
-  (`a_system_binary_behind_a_symlink_runs_as_the_file_it_names`).
+  bytes.
 - Lot M2 (#627): the OpenSSF Scorecard workflow and its badge.
-- Lot M3 (#630): the xtask tests read YAML with serde-saphyr instead of a
-  reader built on unsafe-libyaml (RUSTSEC-2024-0449), and the fuzz seeds of
-  `elf_audit` are hex text instead of binary files.
-
-#### Fixed
-- Lot M4 (#635, closes #633): with the exec quarantine on (experimental),
-  a stop of the agent during a burst of new executables no longer leaves
-  the processes it held stopped. The stop waits for the quarantine's
-  controller only within its deadline, then releases from the stopping
-  thread every process the kernel's map still names (resumed, or killed
-  when a kill is owed), and signs it. The deadline's own exit and a
-  dropped handle release them too.
-- Lot M5 (#636): a DNS response read before its query now answers it.
-  The two rings are read by two pumps in no order; the answered question
-  stayed "asked, never answered", and a later connect of that process to
-  an address no response named got no NN-L-NET-028 record
-  (`the_judgements_do_not_depend_on_the_order_the_two_pumps_read`).
-
-#### Dependencies and CI
-- Lot M1 (#626): github/codeql-action 4.39.4, nix 0.32.
-
-#### Documentation
 - Lot 395 (#606): the project's new logo.
 - Lots D0 (#631) and D1 (#634): ROADMAP.md states the 22 stages after the
   alpha, and the README says what is new since it.
-- Lot 1.9: the stage S1 documents. `docs/roadmap/CAPABILITY_PROGRAM.md`
+- Lot 1.9 (#638): the stage S1 documents. `docs/roadmap/CAPABILITY_PROGRAM.md`
   gets one note per stage from S1 on. New `UPGRADE_NOTES_0.2.md`;
   `UPGRADE_NOTES_WAVE4.md` is frozen at the alpha (two facts corrected).
   `KNOWN_LIMITATIONS.md`, `KERNEL_COMPATIBILITY.md` (the stage's margins,

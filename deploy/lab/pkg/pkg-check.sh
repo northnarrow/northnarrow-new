@@ -53,9 +53,9 @@ trap 'rm -rf "$PKGDIR"' EXIT
 for r in 1 2 3; do
     NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
-# lot 383: <ver>-<rel> in the file name, <ver> with a pre-release (0.1.0-alpha)
+# lot 383: <ver>-<rel> in the file name, <ver> with a pre-release (0.1.1-alpha)
 pkg() { ls "$PKGDIR"/* | grep -E "[-_][0-9][0-9A-Za-z.-]*-$1[._](amd64|x86_64)" | head -1; }
-# the package's own version of release $1 (the pre-release's `-` as `~`: 0.1.0~alpha-2)
+# the package's own version of release $1 (the pre-release's `-` as `~`: 0.1.1~alpha-2)
 want_ver() { NN_PKG_PRINT_VERSIONS=1 NN_PKG_RELEASE=$1 deploy/release/mk-packages.sh | awk '$1 == "deb" {print $2}'; }
 # Lab follow-up (lab PR 165): the per-process outbound block needs nft. The
 # package declares it (on the .deb a Pre-Depends: dpkg refuses before the

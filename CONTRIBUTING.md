@@ -90,11 +90,11 @@ The CI runs the same checks on Linux x86_64. A red PR is not merged.
   ```
 
 - The version (lot 383): the tag is `v` plus the workspace version
-  (`[workspace.package] version` in `Cargo.toml`: `v0.1.0-alpha` for
-  `0.1.0-alpha`), and `CHANGELOG.md` opens with that version's section,
+  (`[workspace.package] version` in `Cargo.toml`: `v0.1.1-alpha` for
+  `0.1.1-alpha`), and `CHANGELOG.md` opens with that version's section,
   dated. Until the tag, the section says `- unreleased`; in the last
   commit before the tag, the day of the tag (UTC) is written in its place:
-  `## [0.1.0-alpha] - YYYY-MM-DD`. The `verify-tag` job checks it
+  `## [0.1.1-alpha] - YYYY-MM-DD`. The `verify-tag` job checks it
   (`verify-release-tag.sh version`): a tag of another version, an
   `[Unreleased]` above the version, or a section with no date stops there.
   Before the push: `.github/scripts/verify-release-tag.sh version vX.Y.Z`.

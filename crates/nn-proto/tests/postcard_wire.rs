@@ -164,7 +164,7 @@ fn export_setup(syslog: bool) -> ToWorker {
         req: Request::ExportSetup(ExportSetup {
             agent_id: "0123456789abcdef0123456789abcdef".into(),
             hostname: "host-1.lab".into(),
-            version: "0.1.0-alpha".into(),
+            version: "0.1.1-alpha".into(),
             pubkey: [0x5a; 32],
             file: Some(FileSetup {
                 max_bytes: 64 << 20,
@@ -323,7 +323,7 @@ const PINNED: &[(&str, &str)] = &[
         "ipc export setup",
         concat!(
             "800104203031323334353637383961626364656630313233343536373839616263646566",
-            "0a686f73742d312e6c61620b302e312e302d616c7068615a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "0a686f73742d312e6c61620b302e312e312d616c7068615a5a5a5a5a5a5a5a5a5a5a5a5a",
             "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a018080802020010120010db80000000000",
             "00000000000001f2320c72656365697665722e6c616282012d2d2d2d2d2d2d2d2d2d2d2d",
             "2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d",
@@ -336,7 +336,7 @@ const PINNED: &[(&str, &str)] = &[
         "ipc export setup, file only",
         concat!(
             "800104203031323334353637383961626364656630313233343536373839616263646566",
-            "0a686f73742d312e6c61620b302e312e302d616c7068615a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "0a686f73742d312e6c61620b302e312e312d616c7068615a5a5a5a5a5a5a5a5a5a5a5a5a",
             "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a01808080202000",
         ),
     ),
