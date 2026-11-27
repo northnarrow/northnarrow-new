@@ -513,6 +513,8 @@ binaries and its eBPF object with the manifest, and refuses to start on a mismat
 
 ## Report what you find
 
+Tried it? **[Tell us how it went](https://github.com/northnarrow/northnarrow-new/discussions/645)**, even just "it works" or "it won't start". The rest of this section is for precise reports.
+
 - **A bug, a false positive or a detection gap:** open an issue with its template
   ([new issue](https://github.com/northnarrow/northnarrow-new/issues/new/choose)): *Bug report*,
   *False positive* or *Detection gap*. Read
