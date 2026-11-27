@@ -714,6 +714,24 @@ const STATICS: &[Kept] = &[
         "lot 2.2: the agent's and the watchdog's executables the start registered in the one eBPF object, for the refresh of its role marks",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/role_watch.rs",
+        "FOREIGN",
+        Telemetry,
+        "lot 2.2 (the review of #644, F4): the cgroup BPF programs not the agent's its census found last round, for status",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/role_watch.rs",
+        "PRELOADED",
+        Telemetry,
+        "lot 2.2 (the review of #644, F3): the preloaded libraries the last round found mapped into a role process, for status",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/role_watch.rs",
+        "SOON",
+        Process,
+        "lot 2.2 (the review of #644, F4 a): the process's one link self-check round, woken by its one bpf ring pump at a cgroup attach",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
         "LOADER_OPT_OUTS",
         Kernel,

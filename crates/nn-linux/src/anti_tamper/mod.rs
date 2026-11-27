@@ -54,6 +54,9 @@ pub mod mount_guard;
 pub mod network_isolate;
 /// Lot 359 (the re-check 3 of #567, N4): the lock of the pin directory.
 pub mod pin_lock;
+/// Lot 2.2 (the review of #644): the preloaded libraries in the role
+/// processes, the census of the cgroup BPF programs on the agent's cgroups.
+pub mod role_watch;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
 /// stub the recon flagged).
@@ -724,7 +727,8 @@ fn attach_reporting(
     // Lot 2.2: the role marks, once the agent's own executables are
     // registered — the marks written, then the mapping hooks attached
     // (pinned before the pin root is protected below). A failure leaves no
-    // role judged by its mappings: signed degraded.
+    // role judged by its mappings (the arm flag cleared: the review of
+    // #644, F5): signed degraded.
     if let Err(why) = bpf_defense::arm_role_marks(ebpf, &btf, pin_root, own) {
         warn!(reason = %why, "role marks NOT armed — a role is not judged by its executable mappings");
         report.degraded.push(format!("role marks: {why}"));

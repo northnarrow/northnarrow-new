@@ -1085,6 +1085,10 @@ fn high_kind(kind: &str) -> bool {
             | crate::witness::ROLES_VACATED_GAP
             // the review of #597 (P2-1)
             | crate::shutdown_remount::NO_SHUTDOWN_KIND
+            // lot 2.2 (the review of #644): a preloaded library in a role
+            // process, a foreign cgroup program on the agent's cgroups
+            | crate::anti_tamper::role_watch::PRELOAD_KIND
+            | crate::anti_tamper::role_watch::CGROUP_FOREIGN_KIND
             // lot 2.0: a role stopped by a signal it did not request
             | UNREQUESTED_STOP
     )
@@ -3169,6 +3173,19 @@ pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
     append_entry(audit_log, AUDIT_OP, extra, "detected");
 }
 
+/// Lot 2.2 (the review of #644): the end of a finding another task of the
+/// agent signed with [`report_event`] (`integrity_drift_cleared`, the same
+/// kind and detail): the status no longer lists it.
+pub fn report_cleared(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    warn!(
+        kind = f.kind,
+        detail = %f.detail,
+        "integrity drift cleared — the state reported earlier is gone"
+    );
+    let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false });
+    append_entry(audit_log, CLEARED_OP, extra, "cleared");
+}
+
 /// Start the check (from `main`, once the audit log exists). R09c (lab PR
 /// 257): the gate is nn-core's [`Vouch`](nn_core::config::overlay_auth::Vouch),
 /// the agent's `OverlayGate`.
@@ -3265,6 +3282,18 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 2.2 (the review of #644, F3, F4): a preloaded library in a role
+    /// process and a foreign cgroup program on the agent's cgroups are
+    /// signed High.
+    #[test]
+    fn the_role_watch_s_findings_are_high() {
+        assert!(high_kind(crate::anti_tamper::role_watch::PRELOAD_KIND));
+        assert!(high_kind(
+            crate::anti_tamper::role_watch::CGROUP_FOREIGN_KIND
+        ));
+        assert!(!high_kind("bpffs_mount"));
+    }
 
     /// Lot 357 (re-check 3 of #563, R3-1 and R3-3): the integrity round's
     /// reads and writes of the agent's own directories — the overlays, the

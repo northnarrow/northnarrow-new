@@ -425,7 +425,7 @@ unsafe fn fuse_dev(dentry: *const u8) -> u64 {
 /// first nine bytes: `wire::execq::is_virtiofs_name`). Optional offsets,
 /// one at a time (5.15 rule 3).
 #[inline(always)]
-unsafe fn fs_type_is_virtiofs(sb: *const u8) -> bool {
+pub(crate) unsafe fn fs_type_is_virtiofs(sb: *const u8) -> bool {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
         let Some(o_type) = off_opt!(SUPER_BLOCK_S_TYPE_OFFSET) else {

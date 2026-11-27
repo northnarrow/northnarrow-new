@@ -1520,12 +1520,17 @@ fn the_kernel_read_option_refuses_what_it_names() {
     .unwrap();
 }
 
-/// Lot 2.2 (named): a role is held only with marked executable code —
-/// the mapping hooks judge a role holder or a process running our binaries
-/// once the marks are armed, an unmarked (or anonymous) image records the
-/// loss in the map only the hooks write, and the loss is read where an
+/// Lot 2.2 (named; the review of #644, decision D10): a role is held only
+/// with a marked main image and trusted code — the mapping hooks judge a
+/// role holder or a process running our binaries once the marks are armed,
+/// each mapping when it is made (an `mprotect` of a mapping already
+/// executable is not judged again): the main image must carry the role
+/// mark, any other mapped file must be marked or pass the trust test
+/// (`exec_marks::role_mapping_verdict`), anonymous memory never does. The
+/// loss is recorded in the map only the hooks write, and read where an
 /// exemption is decided and where a vacant role is taken; the agent
-/// freezes that map and writes the marks before it attaches the hooks.
+/// freezes that map and writes the marks before it attaches the hooks, and
+/// clears the arm flag when the write fails.
 #[test]
 fn an_unmarked_executable_mapping_takes_the_role_away() {
     let r = code("agent-ebpf/src/role_maps.rs");
@@ -1536,15 +1541,50 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
             "if role_lost(tgid) {\n            return 0;\n        }",
             "let holds = crate::task_kill::is_exempt_pid(tgid);",
             "if !holds && !crate::bpf_defense::task_runs_own_binary(task) {",
-            "marks = EXEC_MARKS.get(&k).copied();",
-            "if !unmarked_for_role(marks) {\n            return 0;\n        }",
+            "if flags & VM_EXEC != 0 {\n                return 0;\n            }",
+            "file = bpf_probe_read_kernel::<u64>((vma as *const u8).add(o_file) as *const u64).unwrap_or(0);",
+            "let main_marks = match crate::bpf_defense::task_exe_key(task) {\n            Some(k) => EXEC_MARKS.get(&k).copied(),",
+            "file_marks = EXEC_MARKS.get(&k).copied();",
+            "if unmarked_for_role(file_marks) {\n                        facts = code_facts(file as *const u8, inode as *const u8);",
+            "if role_mapping_verdict(main_marks, file_marks, facts) == CODE_TRUSTED {\n            return 0;\n        }",
             "let _ = ROLE_UNMARKED.insert(&tgid, &start, 0);",
             "crate::inode_protect::emit_attempt(FS_OP_ROLE_UNMARKED, key);",
         ],
     )
     .unwrap();
-    assert!(r.contains("if (raw_arg(ctx, 1) | raw_arg(ctx, 2)) & PROT_EXEC != 0 {\n            let _ = nn_role_map(file);"));
-    assert!(r.contains("if (raw_arg(&ctx, 1) | raw_arg(&ctx, 2)) & PROT_EXEC != 0 {\n            let _ = nn_role_map(0);"));
+    // every field of the trust test read, the mount's idmapping included
+    in_order(
+        body(&r, "code_facts"),
+        &[
+            "off!(INODE_I_MODE_OFFSET)",
+            "off!(INODE_I_UID_OFFSET)",
+            "off_opt!(INODE_I_NLINK_OFFSET)",
+            "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
+            "crate::execq::fs_type_is_virtiofs(sb)",
+            "off_opt!(SUPER_BLOCK_S_USER_NS_OFFSET)",
+            "idmapped: mount_idmapped(file),",
+        ],
+    )
+    .unwrap();
+    // the idmapping by its layout: maps of its own (6.7 on), an owner
+    // (6.3 to 6.6), or the mount's user namespace (5.12 to 6.2)
+    in_order(
+        body(&r, "mount_idmapped"),
+        &[
+            "let o_userns = off_opt!(VFSMOUNT_MNT_USERNS_OFFSET);",
+            "let o_map = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET);",
+            "if let Some(o) = o_userns {",
+            "return userns_level(ns) != 0;",
+            "if let Some(o) = off_opt!(MNT_IDMAP_UID_NR_EXTENTS_OFFSET) {\n            return bpf_probe_read_kernel::<u32>(map.add(o) as *const u32).unwrap_or(0) != 0;\n        }",
+            "match off_opt!(MNT_IDMAP_OWNER_OFFSET) {",
+            "!= 0\n            }\n            None => {\n                crate::fail_open::bump(",
+        ],
+    )
+    .unwrap();
+    assert!(r.contains("if (raw_arg(ctx, 1) | raw_arg(ctx, 2)) & PROT_EXEC != 0 {\n            let _ = nn_role_map(file, 0);"));
+    assert!(body(&r, "role_file_mprotect").contains(
+        "if (raw_arg(&ctx, 1) | raw_arg(&ctx, 2)) & PROT_EXEC != 0 {\n            let vma = raw_arg(&ctx, 0);\n            if vma != 0 {\n                let _ = nn_role_map(0, vma);"
+    ));
     let k = code("agent-ebpf/src/task_kill.rs");
     assert!(k.contains(
         "northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid)) && crate::role_maps::nn_role_lost(u64::from(tgid)) == 0"
@@ -1569,12 +1609,76 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
         body(&u, "arm_role_marks"),
         &[
             "freeze_named(ebpf, ROLE_UNMARKED_MAP_NAME)?;",
-            "write_role_marks(&mut map, &want, &mapped_inodes(watchdog))?",
-            "a.set(0, &EXEC_MARKS_ARMED_ON, 0)",
+            "write_role_marks(&mut map, &want)",
+            "set_marks_armed(&mut a, written.is_ok())?;",
+            "let n = written?;",
             "attach_guard_hook(ebpf, program, hook, btf, pin_root, enforce)",
         ],
     )
     .unwrap();
+    // F5: a refresh that fails disarms the marks
+    in_order(
+        body(&u, "refresh_role_marks"),
+        &[
+            "match write_role_marks(&mut map, &want) {",
+            "set_marks_armed(&mut a, false)",
+        ],
+    )
+    .unwrap();
+    // D10: the marks are the main images; no library is looked for
+    let images = body(&u, "role_images");
+    for needle in ["/maps", "nsswitch", "ld.so.preload"] {
+        assert!(!images.contains(needle), "role_images reads {needle}");
+    }
+}
+
+/// Lot 2.2 (the review of #644, F3 and F4): the role watch runs at the
+/// agent's start and each round of the link self-check, and at once after
+/// a cgroup attach the kernel let through (the `bpf` ring's row wakes it);
+/// each finding is signed when it appears and its end when it goes; the
+/// census only asks the kernel (`BPF_PROG_QUERY`), it never detaches.
+#[test]
+fn the_cgroup_census_runs_after_each_attach_and_never_detaches() {
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    assert!(m.contains("                    cgroup_attach_wakes_census,\n"));
+    assert!(body(&m, "cgroup_attach_wakes_census").contains(
+        "if crate::anti_tamper::role_watch::is_cgroup_attach_row(raw.cmd, raw.arg) {\n        crate::anti_tamper::role_watch::census_soon();"
+    ));
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "spawn_link_self_check"),
+        &[
+            "if !first {\n                    super::role_watch::wait_round(",
+            "ids.extend(crate::sysctl_cgroup::own_prog_id());",
+            "super::role_watch::preload_findings(watchdog),\n                        super::role_watch::census(&own_ids),",
+            "let (fresh, gone) = signed.fresh(&now, kept);",
+            "crate::self_integrity::report_event(audit_log.as_ref(), f);",
+            "crate::self_integrity::report_cleared(audit_log.as_ref(), f);",
+        ],
+    )
+    .unwrap();
+    let w = code("crates/nn-linux/src/anti_tamper/role_watch.rs");
+    let census = body(&w, "census");
+    assert!(census.contains("crate::sysctl_cgroup::query_cgroup(fd, t)"));
+    for forbidden in [
+        "BPF_PROG_DETACH",
+        "bpf_cmd::BPF_PROG_DETACH",
+        "query_flags: 1",
+    ] {
+        assert!(
+            !w.contains(forbidden),
+            "the census detaches nothing: {forbidden}"
+        );
+    }
+    assert!(
+        body(&w, "census_with")
+            .contains("for (attach, t, _) in common::bpf_cmd::CGROUP_ATTACH_TYPES {")
+    );
+    let s = code("crates/nn-linux/src/sysctl_cgroup.rs");
+    assert!(
+        body(&s, "query_cgroup").contains("query_flags: 0,"),
+        "the cgroup's own programs, not what it inherits"
+    );
 }
 
 /// Lot 2.2 (named): a shared mapping of a write-protected file opened for

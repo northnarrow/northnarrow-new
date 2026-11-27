@@ -125,6 +125,22 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
+        "f.kind",
+        Source::PassThrough(
+            "report_cleared (lot 2.2): the end of a `Finding` report_event signed, its kind read at \
+             its construction",
+        ),
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/role_watch.rs",
+        "k",
+        Source::PassThrough(
+            "lot 2.2, Signed::fresh: the end of a finding it signed, one of its two constants \
+             (`PRELOAD_KIND`, `CGROUP_FOREIGN_KIND`)",
+        ),
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
         "s.kind",
         Source::PassThrough("the sysctl guard's finding (`kind:` literals of sysctl_guard.rs)"),
     ),

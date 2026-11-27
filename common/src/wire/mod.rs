@@ -1400,7 +1400,8 @@ pub const KERNEL_READ_LOCKDOWN: [(&str, u32); 5] = [
 ];
 
 /// Lot 2.2: the kernel-read option's configuration array (`Array<u32>`,
-/// frozen at the agent's registration): slot [`KREAD_SLOT_MASK`] the
+/// pinned, written by the agent whenever a signed policy is applied — at
+/// its start and by `nn-admin policy set`; not frozen): slot [`KREAD_SLOT_MASK`] the
 /// classes in force, slots [`KREAD_SLOT_REASONS`].. the running kernel's
 /// value of each [`KERNEL_READ_LOCKDOWN`] enumerator in its order (0: not
 /// resolved, never matched — `LOCKDOWN_NONE` is 0), slot

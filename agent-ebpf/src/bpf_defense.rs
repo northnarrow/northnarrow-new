@@ -1122,7 +1122,7 @@ pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
 /// `(dev, ino)` of `task`'s executable (`mm->exe_file`); `None` for a
 /// kernel thread (no `mm`).
 #[inline(always)]
-unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
+pub(crate) unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
         if task.is_null() {
@@ -1207,7 +1207,8 @@ fn fresh_instance_test() -> bool {
     if role != ROLE_AGENT && role != ROLE_WATCHDOG {
         return false;
     }
-    // lot 2.2: a process that mapped an unmarked image has no role to take
+    // lot 2.2: a process that lost its role (D10: an unmarked main image, or a
+    // mapping that was not trusted code) has no role to take
     if crate::role_maps::nn_role_lost(pid_tgid >> 32) != 0 {
         return false;
     }
@@ -1264,7 +1265,7 @@ unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
         ptgid == 1
             && nn_in_role_unit(task as u64, u64::from(slot)) == 1
             && crate::cgroup_join::caller_marks_clean()
-            // lot 2.2: and no executable mapping of an unmarked image
+            // lot 2.2: and no role lost to a mapping (D10)
             && crate::role_maps::nn_role_lost(bpf_get_current_pid_tgid() >> 32) == 0
     }
 }

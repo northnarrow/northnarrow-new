@@ -189,6 +189,16 @@ pub(crate) fn check(
             }
             for m in &r.absent {
                 let effect = absent_field_effect(m.name, m.struct_name);
+                // lot 2.2: one kernel object's other layout — no path lost
+                if !common::btf_offsets::absent_degrades(m.name) {
+                    info!(
+                        offset = m.name,
+                        kernel_struct = m.struct_name,
+                        effect,
+                        "kernel field of another layout absent"
+                    );
+                    continue;
+                }
                 warn!(
                     offset = m.name,
                     kernel_struct = m.struct_name,
@@ -439,7 +449,11 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
             println!(
                 "btf-check {}: {} — {} slots resolved, {} differ from the build kernel, {} absent, {} hook arguments checked",
                 path.display(),
-                if r.absent.is_empty() {
+                // lot 2.2: a layout another kernel version has is no cost
+                if r.absent
+                    .iter()
+                    .all(|m| !common::btf_offsets::absent_degrades(m.name))
+                {
                     "SUPPORTED"
                 } else {
                     "SUPPORTED (degraded)"
@@ -559,6 +573,12 @@ fn absent_field_effect(name: &str, struct_name: &str) -> &'static str {
         northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
     } else if struct_name == "iov_iter" || struct_name == "iter_type" {
         "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
+    } else if struct_name == "mnt_idmap" {
+        // Lot 2.2 (the review of #644, D10): two layouts of one kernel
+        // object across versions — one of them is always absent
+        "the mount idmapping's other layout (an owner 6.3 to 6.6, maps of its own \
+         from 6.7, the mount's user namespace before 6.3): the role's trust test reads \
+         the one this kernel has; nothing is lost"
     } else if name == "TASK_STRUCT_FS_OFFSET" {
         "the exploit guard is not attached (it reads task_struct.fs); the signed \
          degradation and nn-admin status say so"
@@ -593,6 +613,12 @@ mod absent_field_effect_tests {
             assert!(e.contains("are off"), "{name}: {e}");
         }
         assert!(absent_field_effect("BTRFS_INODE_ROOT_OFFSET", "btrfs_inode").contains("btrfs"));
+        // lot 2.2: the idmapping's other layout, never a sensor lost
+        let idmap = absent_field_effect("MNT_IDMAP_OWNER_OFFSET", "mnt_idmap");
+        assert!(
+            idmap.contains("nothing is lost") && !idmap.contains("are off"),
+            "{idmap}"
+        );
         let neutral = absent_field_effect("X", "file");
         let hook = absent_field_effect("INODE_SETATTR_DENTRY_ARG", "bpf_lsm_inode_setattr");
         assert_ne!(hook, neutral);
