@@ -7,7 +7,7 @@
 **Sovereign endpoint defence for Linux.**<br/>
 Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic on the host · verified in a lab you can rerun.
 
-🆕 **`v0.1.1-alpha`:** the SysRq trigger refused outside a trusted-installer window and a stop the agent did not request restarted and signed, plus stage S1 — Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors, AlmaLinux 9 and the `.rpm` tested. [What's new →](#whats-new-in-v011-alpha)
+🆕 **`v0.1.1-alpha`:** the SysRq trigger refused outside a trusted-installer window and a stop the agent did not request restarted and signed, plus stage S1 — Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors, AlmaLinux 9 and the `.rpm` tested. [What's new →](#whats-new)
 
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
@@ -17,7 +17,7 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
-[What's new](#whats-new-in-v011-alpha) ·
+[What's new](#whats-new) ·
 [Working on now](#working-on-now) ·
 [Today](#what-it-does-today-and-what-it-does-not) ·
 [Architecture](#architecture) ·
@@ -54,6 +54,8 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 
 ---
 
+<a id="whats-new"></a>
+
 ## What's new in `v0.1.1-alpha`
 
 `v0.1.1-alpha` (27 November 2026) is everything merged after `v0.1.0-alpha` (23 November 2026):
@@ -80,8 +82,11 @@ Upgrading from `v0.1.0-alpha`: [`INSTALL_UPGRADE_UNINSTALL.md` §2.2](docs/opera
 
 Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
 
-- Done: [S1 Foundations](ROADMAP.md#s1), with its lab round on six kernels ([results](docs/validation/results/stage-s1-2026-11-26.md)) and its [upgrade notes](docs/operator/UPGRADE_NOTES_0.2.md).
-- Next, [S2 Self-protection after the alpha](ROADMAP.md#s2): the installer window limited to the process tree that opened it, upgrades with no protection gap, and the residual items accepted for the alpha closed.
+- Done: [S1 Foundations](ROADMAP.md#s1), with its lab round on six kernels ([results](docs/validation/results/stage-s1-2026-11-26.md)) and its [upgrade notes](docs/operator/UPGRADE_NOTES_0.2.md); released as [`v0.1.1-alpha`](https://github.com/northnarrow/northnarrow-new/releases/tag/v0.1.1-alpha).
+- Now, [S2 Self-protection after the alpha](ROADMAP.md#s2):
+  - done: the SysRq trigger refused outside a trusted-installer window, and a stop the agent did not request restarts it and is signed;
+  - done: the stage's scaffold and the design of the installer window per process tree, checked by an adversarial review and a second model before any of its code;
+  - next: the BPF guard and role marks, then the per-tree window itself.
 <!-- working-on:end -->
 
 ---
