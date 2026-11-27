@@ -330,47 +330,184 @@ mod tests {
         }
     }
 
-    /// The review of #644 (D10, F1 and F2): a root-owned library on a local
-    /// filesystem is trusted when it is mapped, whatever the marks say — a
-    /// new C library or loader after an upgrade, an NSS module and its
-    /// dependencies opened with `dlopen` after the marks were armed.
+    /// The review of #644 (D10, F1): the C library and the loader replaced
+    /// under a running role (dpkg renames the new file over the old one):
+    /// the restarted role maps the NEW files, unmarked, root's, on the
+    /// local filesystem — trusted code, the role kept. The old files, now
+    /// deleted, are never judged again (the hooks judge a mapping when it is
+    /// made); a file already deleted when it is mapped has no name.
     #[test]
-    fn a_root_library_on_a_local_filesystem_is_trusted_code() {
-        assert_eq!(code_verdict(&lib()), CODE_TRUSTED);
-        let exec = CodeFacts { mode: S_IFREG | 0o755, ..lib() };
-        assert_eq!(code_verdict(&exec), CODE_TRUSTED);
-        let unknown_nlink = CodeFacts { nlink: None, ..lib() };
+    fn a_library_upgraded_under_a_running_role_keeps_the_role_at_its_restart() {
+        let main = Some(MARK_ROLE);
+        let new_libc = lib();
+        let new_ldso = CodeFacts {
+            mode: S_IFREG | 0o755,
+            ..lib()
+        };
+        assert_eq!(
+            role_mapping_verdict(main, None, Some(new_libc)),
+            CODE_TRUSTED
+        );
+        assert_eq!(
+            role_mapping_verdict(main, None, Some(new_ldso)),
+            CODE_TRUSTED
+        );
+        // the main image, or the other role's binary
+        assert_eq!(role_mapping_verdict(main, main, None), CODE_TRUSTED);
+        let deleted_when_mapped = CodeFacts {
+            nlink: Some(0),
+            ..lib()
+        };
+        assert_eq!(
+            role_mapping_verdict(main, None, Some(deleted_when_mapped)),
+            CODE_NO_NAME
+        );
+        // a kernel whose i_nlink is unknown: not refused for it
+        let unknown_nlink = CodeFacts {
+            nlink: None,
+            ..lib()
+        };
         assert_eq!(code_verdict(&unknown_nlink), CODE_TRUSTED);
-        let virtiofs = CodeFacts { magic: FUSE_SUPER_MAGIC, virtiofs: true, ..lib() };
-        assert_eq!(code_verdict(&virtiofs), CODE_TRUSTED);
-        // a new library with no mark, mapped by a role process: trusted
-        let m = Some(MARK_ROLE);
-        assert_eq!(role_mapping_verdict(m, None, Some(lib())), CODE_TRUSTED);
-        assert_eq!(role_mapping_verdict(m, Some(0), Some(lib())), CODE_TRUSTED);
-        // the main image itself, or the other role's binary
-        assert_eq!(role_mapping_verdict(m, m, None), CODE_TRUSTED);
     }
 
-    /// D10: each reason a mapped file is not trusted code, one at a time.
+    /// The review of #644 (D10, F2): an NSS module (and its dependencies)
+    /// opened with `dlopen` after the marks were armed — no mark, root's,
+    /// local — keeps the running role; on a VM's `virtiofs` share (the
+    /// hypervisor's, FUSE's magic) too.
     #[test]
-    fn untrusted_code_is_named_by_its_first_reason() {
+    fn an_nss_module_opened_after_the_start_keeps_the_role() {
+        let main = Some(MARK_ROLE);
+        assert_eq!(role_mapping_verdict(main, None, Some(lib())), CODE_TRUSTED);
+        assert_eq!(
+            role_mapping_verdict(main, Some(0), Some(lib())),
+            CODE_TRUSTED
+        );
+        assert_eq!(
+            role_mapping_verdict(main, Some(1 << 8), Some(lib())),
+            CODE_TRUSTED,
+            "an S12 mark alone changes nothing"
+        );
+        let virtiofs = CodeFacts {
+            magic: FUSE_SUPER_MAGIC,
+            virtiofs: true,
+            ..lib()
+        };
+        assert_eq!(
+            role_mapping_verdict(main, None, Some(virtiofs)),
+            CODE_TRUSTED
+        );
+    }
+
+    /// D10: an untrusted mapping takes the role away (the hook records the
+    /// loss and signs it on any verdict but trusted: the xtask ratchet
+    /// `an_unmarked_executable_mapping_takes_the_role_away`) — each reason,
+    /// one at a time.
+    #[test]
+    fn an_untrusted_mapping_takes_the_role_away_by_its_first_reason() {
         let cases = [
-            (CodeFacts { mode: 0o020_644, ..lib() }, CODE_NOT_REGULAR),
-            (CodeFacts { mode: 0o644, ..lib() }, CODE_NOT_REGULAR),
+            (
+                CodeFacts {
+                    mode: 0o020_644,
+                    ..lib()
+                },
+                CODE_NOT_REGULAR,
+            ),
+            (
+                CodeFacts {
+                    mode: 0o644,
+                    ..lib()
+                },
+                CODE_NOT_REGULAR,
+            ),
             (CodeFacts { uid: 1000, ..lib() }, CODE_NOT_ROOT),
-            (CodeFacts { mode: S_IFREG | 0o664, ..lib() }, CODE_WRITABLE),
-            (CodeFacts { mode: S_IFREG | 0o646, ..lib() }, CODE_WRITABLE),
-            (CodeFacts { mode: S_IFREG | 0o777, ..lib() }, CODE_WRITABLE),
-            (CodeFacts { nlink: Some(0), ..lib() }, CODE_NO_NAME),
-            (CodeFacts { magic: FUSE_SUPER_MAGIC, ..lib() }, CODE_REMOTE_FS),
-            (CodeFacts { magic: 0x6969, ..lib() }, CODE_REMOTE_FS),
-            (CodeFacts { magic: 0xfe53_4d42, ..lib() }, CODE_REMOTE_FS),
-            (CodeFacts { magic: 0x2003_0528, ..lib() }, CODE_REMOTE_FS),
-            (CodeFacts { magic: 0x6969, virtiofs: true, ..lib() }, CODE_REMOTE_FS),
-            (CodeFacts { foreign_sb: true, ..lib() }, CODE_FOREIGN_SB),
-            (CodeFacts { idmapped: true, ..lib() }, CODE_IDMAPPED),
+            (
+                CodeFacts {
+                    mode: S_IFREG | 0o664,
+                    ..lib()
+                },
+                CODE_WRITABLE,
+            ),
+            (
+                CodeFacts {
+                    mode: S_IFREG | 0o646,
+                    ..lib()
+                },
+                CODE_WRITABLE,
+            ),
+            (
+                CodeFacts {
+                    mode: S_IFREG | 0o777,
+                    ..lib()
+                },
+                CODE_WRITABLE,
+            ),
+            (
+                CodeFacts {
+                    nlink: Some(0),
+                    ..lib()
+                },
+                CODE_NO_NAME,
+            ),
+            (
+                CodeFacts {
+                    magic: FUSE_SUPER_MAGIC,
+                    ..lib()
+                },
+                CODE_REMOTE_FS,
+            ),
+            (
+                CodeFacts {
+                    magic: 0x6969,
+                    ..lib()
+                },
+                CODE_REMOTE_FS,
+            ),
+            (
+                CodeFacts {
+                    magic: 0xfe53_4d42,
+                    ..lib()
+                },
+                CODE_REMOTE_FS,
+            ),
+            (
+                CodeFacts {
+                    magic: 0x2003_0528,
+                    ..lib()
+                },
+                CODE_REMOTE_FS,
+            ),
+            (
+                CodeFacts {
+                    magic: 0x6969,
+                    virtiofs: true,
+                    ..lib()
+                },
+                CODE_REMOTE_FS,
+            ),
+            (
+                CodeFacts {
+                    foreign_sb: true,
+                    ..lib()
+                },
+                CODE_FOREIGN_SB,
+            ),
+            (
+                CodeFacts {
+                    idmapped: true,
+                    ..lib()
+                },
+                CODE_IDMAPPED,
+            ),
             // a memfd: root's, 0777, no name — its first reason
-            (CodeFacts { mode: S_IFREG | 0o777, nlink: Some(0), magic: 0x0102_1994, ..lib() }, CODE_WRITABLE),
+            (
+                CodeFacts {
+                    mode: S_IFREG | 0o777,
+                    nlink: Some(0),
+                    magic: 0x0102_1994,
+                    ..lib()
+                },
+                CODE_WRITABLE,
+            ),
         ];
         for (facts, want) in cases {
             assert_eq!(code_verdict(&facts), want, "{facts:?}");
@@ -398,7 +535,10 @@ mod tests {
                 CODE_MAIN_UNMARKED
             );
         }
-        assert_eq!(role_mapping_verdict(Some(MARK_ROLE), None, None), CODE_ANONYMOUS);
+        assert_eq!(
+            role_mapping_verdict(Some(MARK_ROLE), None, None),
+            CODE_ANONYMOUS
+        );
         assert_eq!(
             role_mapping_verdict(Some(MARK_ROLE), Some(1 << 8), None),
             CODE_ANONYMOUS

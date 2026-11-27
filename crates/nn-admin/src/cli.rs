@@ -6768,10 +6768,16 @@ mod flow_sock_line_tests {
         });
         o.kernel_read_refused = Some(vec!["physical-memory".into(), "perf".into()]);
         let l = super::role_marks_line(&o).unwrap();
-        assert!(l.starts_with("role marks        : 2 main images marked, 0 role"), "{l}");
+        assert!(
+            l.starts_with("role marks        : 2 main images marked, 0 role"),
+            "{l}"
+        );
         assert!(l.contains("1 preloaded librar(ies)"), "{l}");
         assert!(l.contains("cgroups: 3;"), "{l}");
-        assert!(l.ends_with("kernel-read refused: physical-memory, perf"), "{l}");
+        assert!(
+            l.ends_with("kernel-read refused: physical-memory, perf"),
+            "{l}"
+        );
         o.role_marks = o.role_marks.map(|m| nn_proto::admin_protocol::RoleMarks {
             cgroup_bpf_foreign: None,
             ..m

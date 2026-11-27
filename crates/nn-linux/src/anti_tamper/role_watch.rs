@@ -350,7 +350,11 @@ impl Signed {
     /// lists an advisory until its `cleared` row); the set kept to `now`'s.
     /// `kept` names the kinds whose findings could not be looked for this
     /// round (a census that failed): theirs are neither fresh nor gone.
-    pub fn fresh<'a>(&mut self, now: &'a [Finding], kept: &[&str]) -> (Vec<&'a Finding>, Vec<Finding>) {
+    pub fn fresh<'a>(
+        &mut self,
+        now: &'a [Finding],
+        kept: &[&str],
+    ) -> (Vec<&'a Finding>, Vec<Finding>) {
         let mut lines: BTreeSet<(String, String)> = now.iter().map(key).collect();
         let fresh = now.iter().filter(|f| !self.0.contains(&key(f))).collect();
         let mut gone = Vec::new();
@@ -358,7 +362,10 @@ impl Signed {
             if lines.contains(&(kind.clone(), detail.clone())) {
                 continue;
             }
-            match [PRELOAD_KIND, CGROUP_FOREIGN_KIND].into_iter().find(|k| k == kind) {
+            match [PRELOAD_KIND, CGROUP_FOREIGN_KIND]
+                .into_iter()
+                .find(|k| k == kind)
+            {
                 Some(k) if kept.contains(&k) => {
                     lines.insert((kind.clone(), detail.clone()));
                 }
@@ -425,10 +432,7 @@ mod tests {
         );
         assert_eq!(
             preloaded_mappings(MAPS, "libapm.so:/nope/libc.so.6", stat),
-            [
-                "/usr/lib/x86_64-linux-gnu/libc.so.6",
-                "/opt/apm/libapm.so"
-            ]
+            ["/usr/lib/x86_64-linux-gnu/libc.so.6", "/opt/apm/libapm.so"]
         );
         assert_eq!(
             preloaded_mappings(MAPS, "/opt/$LIB/libapm.so", |_| None),
@@ -447,10 +451,17 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[1],
-            ("/usr/lib/x86_64-linux-gnu/libc.so.6", libc::makedev(8, 1), 2222)
+            (
+                "/usr/lib/x86_64-linux-gnu/libc.so.6",
+                libc::makedev(8, 1),
+                2222
+            )
         );
-        assert!(exec_file_mapping("7f00-7f10 r-xp 0 fe:0a 5 /a b/with space.so")
-            .is_some_and(|(p, d, _)| p == "/a b/with space.so" && d == libc::makedev(0xfe, 0x0a)));
+        assert!(
+            exec_file_mapping("7f00-7f10 r-xp 0 fe:0a 5 /a b/with space.so").is_some_and(
+                |(p, d, _)| p == "/a b/with space.so" && d == libc::makedev(0xfe, 0x0a)
+            )
+        );
         assert!(exec_file_mapping("7f00-7f10 r-xp 0 08:01 0 /x").is_none());
         assert!(exec_file_mapping("7f00-7f10 r--p 0 08:01 5 /x").is_none());
         assert!(exec_file_mapping("7f00-7f10 r-xp 0 08:01 5 [vdso]").is_none());
@@ -490,7 +501,10 @@ mod tests {
         );
         assert!(census_with(&targets, |_, _| Ok(vec![5]), &own).is_empty());
         let d = census_detail(&hits[2], Some("drop_all"));
-        assert!(d.contains("id 77 `drop_all`") && d.contains("/northnarrow.slice"), "{d}");
+        assert!(
+            d.contains("id 77 `drop_all`") && d.contains("/northnarrow.slice"),
+            "{d}"
+        );
         assert!(d.contains("not detached"), "{d}");
     }
 
@@ -500,7 +514,10 @@ mod tests {
         use common::bpf_cmd::{BPF_LINK_CREATE, BPF_PROG_ATTACH};
         assert!(is_cgroup_attach_row(BPF_PROG_ATTACH, 1));
         assert!(is_cgroup_attach_row(BPF_LINK_CREATE, 6));
-        assert!(!is_cgroup_attach_row(BPF_PROG_ATTACH, 5), "not a cgroup type");
+        assert!(
+            !is_cgroup_attach_row(BPF_PROG_ATTACH, 5),
+            "not a cgroup type"
+        );
         assert!(!is_cgroup_attach_row(0, 1), "not an attach");
     }
 
@@ -525,7 +542,10 @@ mod tests {
         let (fresh, gone) = s.fresh(&only_b, &[]);
         assert!(fresh.is_empty());
         assert_eq!(gone.len(), 1);
-        assert_eq!((gone[0].kind, gone[0].detail.as_str()), (CGROUP_FOREIGN_KIND, "a"));
+        assert_eq!(
+            (gone[0].kind, gone[0].detail.as_str()),
+            (CGROUP_FOREIGN_KIND, "a")
+        );
         let back = [f("a"), f("b")];
         let (fresh, gone) = s.fresh(&back, &[]);
         assert_eq!(fresh.len(), 1);
@@ -535,7 +555,12 @@ mod tests {
             kind: PRELOAD_KIND,
             detail: "p".into(),
         };
-        assert_eq!(s.fresh(std::slice::from_ref(&p), &[CGROUP_FOREIGN_KIND]).0.len(), 1);
+        assert_eq!(
+            s.fresh(std::slice::from_ref(&p), &[CGROUP_FOREIGN_KIND])
+                .0
+                .len(),
+            1
+        );
         let (_, gone) = s.fresh(&[], &[CGROUP_FOREIGN_KIND]);
         assert_eq!(gone.len(), 1, "the preload ended; the census's kept");
         assert_eq!(gone[0].kind, PRELOAD_KIND);

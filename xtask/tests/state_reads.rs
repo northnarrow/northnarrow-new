@@ -159,13 +159,14 @@ const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed
 /// read, why)` — none reads a file a process or a user names into an empty
 /// answer that a protection then publishes. The readers that keep the last
 /// good state (`LastGood`, a `Condition` in the error's arm) are not sites.
-/// Lot 2.2: the role images' sources.
-const ROLEMARK: &str = "lot 2.2: a source of the role images (a role process's maps, \
-                        /etc/nsswitch.conf, /etc/ld.so.preload, the uprobe PMU's type): an \
-                        unreadable one adds nothing — fewer marks or no perf PMU to refuse, never a \
-                        wider role (a role process mapping an unmarked image loses its role, \
-                        signed); a preload list that cannot be read excludes nothing, and the \
-                        library it would name is in the maps only if the loader read it";
+/// Lot 2.2: the kernel-read option's source, and (the review of #644) what
+/// the role watch reads.
+const ROLEMARK: &str = "lot 2.2: the uprobe PMU's type: an unreadable one leaves no perf PMU to \
+                        refuse, signed by the option's status, never a wider role";
+const ROLEWATCH: &str = "lot 2.2 (the review of #644, F3): /etc/ld.so.preload and a role \
+                         process's maps: an unreadable one signs no advisory this round — the \
+                         advisory only tells; the kernel judged each preloaded library at its \
+                         mapping, and one that is not trusted code took the role away, signed";
 
 const KNOWN: &[(&str, &str, &str)] = &[
     // lot 2.2: the role marks' and the kernel-read option's sources
@@ -175,19 +176,9 @@ const KNOWN: &[(&str, &str, &str)] = &[
         ROLEMARK,
     ),
     (
-        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "crates/nn-linux/src/anti_tamper/role_watch.rs",
         "read_to_string(p)",
-        ROLEMARK,
-    ),
-    (
-        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
-        "read_to_string(\"/proc/self/maps\")",
-        ROLEMARK,
-    ),
-    (
-        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
-        "read_to_string(format!(\"/proc/{pid}/maps\"))",
-        ROLEMARK,
+        ROLEWATCH,
     ),
     // lot 373: the exec's and its parent's start before the package
     // manager's walk; a package's dpkg list and an account's uid under the

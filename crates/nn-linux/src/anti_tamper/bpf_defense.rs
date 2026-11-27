@@ -2409,7 +2409,9 @@ pub(crate) fn arm_role_marks(
     pin_root: Option<&Path>,
     own: &crate::anti_tamper::OwnExes,
 ) -> std::result::Result<usize, String> {
-    use common::exec_marks::{EXEC_MARKS_ARMED_MAP_NAME, EXEC_MARKS_MAP_NAME, ROLE_UNMARKED_MAP_NAME};
+    use common::exec_marks::{
+        EXEC_MARKS_ARMED_MAP_NAME, EXEC_MARKS_MAP_NAME, ROLE_UNMARKED_MAP_NAME,
+    };
     freeze_named(ebpf, ROLE_UNMARKED_MAP_NAME)?;
     let watchdog = pin_root.and_then(|r| antitamper_bpf::role_slot(r, 0).ok());
     let written = {
@@ -2488,15 +2490,14 @@ pub fn refresh_role_marks(
             Ok(n)
         }
         Err(e) => {
-            let cleared = MapData::from_pin(
-                pin_root.join(common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME),
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|md| {
-                let mut a: Array<MapData, u32> =
-                    Array::try_from(Map::Array(md)).map_err(|e| e.to_string())?;
-                set_marks_armed(&mut a, false)
-            });
+            let cleared =
+                MapData::from_pin(pin_root.join(common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+                    .map_err(|e| e.to_string())
+                    .and_then(|md| {
+                        let mut a: Array<MapData, u32> =
+                            Array::try_from(Map::Array(md)).map_err(|e| e.to_string())?;
+                        set_marks_armed(&mut a, false)
+                    });
             ROLE_MARKS_WRITTEN.store(0, std::sync::atomic::Ordering::SeqCst);
             Err(match cleared {
                 Ok(()) => format!("{e} — the marks are disarmed (no role is judged)"),
@@ -2741,7 +2742,11 @@ impl BpfGuard {
                                 kind: super::role_watch::CGROUP_FOREIGN_KIND,
                                 detail: super::role_watch::census_detail(
                                     h,
-                                    guard.census_program(h.prog_id).ok().map(|p| p.name).as_deref(),
+                                    guard
+                                        .census_program(h.prog_id)
+                                        .ok()
+                                        .map(|p| p.name)
+                                        .as_deref(),
                                 ),
                             })
                             .collect::<Vec<_>>(),
@@ -2873,8 +2878,14 @@ mod tests {
     #[test]
     fn the_role_marks_name_the_main_images_only() {
         use crate::anti_tamper::{ExeIdentity, OwnExes};
-        let agent = ExeIdentity { dev: 0x801, ino: 1311 };
-        let watchdog = ExeIdentity { dev: 0x801, ino: 1312 };
+        let agent = ExeIdentity {
+            dev: 0x801,
+            ino: 1311,
+        };
+        let watchdog = ExeIdentity {
+            dev: 0x801,
+            ino: 1312,
+        };
         let own = OwnExes {
             agent: Some(agent),
             watchdog: Some(watchdog),
@@ -2883,12 +2894,24 @@ mod tests {
             dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
             ino: id.ino,
         };
-        let got: Vec<_> = role_images(&own, None).into_iter().map(|(k, _)| k).collect();
+        let got: Vec<_> = role_images(&own, None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(got, [k(agent), k(watchdog)]);
-        let old = common::wire::InodeKey { dev: k(agent).dev, ino: 999 };
-        let got: Vec<_> = role_images(&own, Some(old)).into_iter().map(|(k, _)| k).collect();
+        let old = common::wire::InodeKey {
+            dev: k(agent).dev,
+            ino: 999,
+        };
+        let got: Vec<_> = role_images(&own, Some(old))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(got, [k(agent), k(watchdog), old], "the upgrade's watchdog");
-        let got: Vec<_> = role_images(&own, Some(k(watchdog))).into_iter().map(|(k, _)| k).collect();
+        let got: Vec<_> = role_images(&own, Some(k(watchdog)))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(got, [k(agent), k(watchdog)], "each once");
         let one = OwnExes {
             agent: Some(agent),
