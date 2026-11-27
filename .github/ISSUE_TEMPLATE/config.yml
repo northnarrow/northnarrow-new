@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Tried it? Tell us how it went
+    url: https://github.com/northnarrow/northnarrow-new/discussions/645
+    about: Even one line helps ("it works", "it won't start", "this step was unclear"). Questions in any language.
   - name: Security vulnerability (private)
     url: https://github.com/northnarrow/northnarrow-new/security/advisories/new
     about: A way to stop, blind or get around the agent's self-protection, to make it sign something false, or a crash caused by an unprivileged user. Report it privately, never in a public issue.
