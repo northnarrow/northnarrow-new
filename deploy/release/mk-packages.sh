@@ -3,8 +3,8 @@
 # `cargo xtask build --release` (the same inputs as mk-tarball.sh):
 #   <out>/northnarrow_<ver>-<rel>_amd64.deb     (dpkg-deb)
 #   <out>/northnarrow-<ver>-<rel>.x86_64.rpm    (rpmbuild)
-# <ver> is the workspace version (0.1.0-alpha); the packages' own version is
-# <ver> with its pre-release's `-` as `~` (0.1.0~alpha), lot 383 below.
+# <ver> is the workspace version (0.1.1-alpha); the packages' own version is
+# <ver> with its pre-release's `-` as `~` (0.1.1~alpha), lot 383 below.
 #
 # Layout (review 26):
 #   /usr/bin/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}
@@ -59,13 +59,14 @@ SUMMARY="NorthNarrow — endpoint detection and response for Linux"
 cd "$REPO_ROOT"
 ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 # Lot 383 (the alpha's version): the workspace version is SemVer, with at
-# most one pre-release part (`0.1.0-alpha`). The file names carry it as it
+# most one pre-release part (`0.1.1-alpha`). The file names carry it as it
 # is (the tarball's too, mk-tarball.sh): no `~` in a release asset's name.
 # The packages carry it as their managers order it: the pre-release's `-`
-# becomes `~` (`0.1.0~alpha`), which dpkg and rpm sort before the release
-# (`0.1.0`) and after every earlier version (`0.0.1`). rpm refuses `-` in a
-# Version and takes `~` since 4.10 (AlmaLinux/RHEL 9 ship 4.16), so the one
-# form serves both: the alpha is `0.1.0~alpha-1` in `dpkg -l` and `rpm -q`.
+# becomes `~` (`0.1.1~alpha`), which dpkg and rpm sort before the release
+# (`0.1.1`) and after every earlier version (`0.1.0~alpha`, `0.0.1`). rpm
+# refuses `-` in a Version and takes `~` since 4.10 (AlmaLinux/RHEL 9 ship
+# 4.16), so the one form serves both: the alpha is `0.1.1~alpha-1` in
+# `dpkg -l` and `rpm -q`.
 if [[ ! $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
     echo "mk-packages: the workspace version '$ver' is not X.Y.Z or X.Y.Z-<pre-release> (letters, digits, dots)" >&2
     exit 1

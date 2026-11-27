@@ -38,13 +38,13 @@ name: release
 # rather than replace an asset already published (no --clobber).
 #
 # Lot 383 (the alpha's version): verify-tag also requires the tag to be `v`
-# and the workspace version of Cargo.toml (`v0.1.0-alpha` for
-# "0.1.0-alpha"), and CHANGELOG.md to open with that version's section,
+# and the workspace version of Cargo.toml (`v0.1.1-alpha` for
+# "0.1.1-alpha"), and CHANGELOG.md to open with that version's section,
 # dated (`verify-release-tag.sh version`). Before, nothing tied the two: a
 # `v0.1.0-alpha` tag would have published 0.0.1 artefacts. The package job
 # checks on every run that the artefacts carry that version: the tarball's
 # and the packages' file names, the packages' own version (`-` as `~`:
-# 0.1.0~alpha) and every binary's `--version`.
+# 0.1.1~alpha) and every binary's `--version`.
 #
 # External audit SUP-002: every action is pinned by commit SHA (the
 # version in the comment); Dependabot (github-actions) proposes updates.
@@ -258,8 +258,8 @@ jobs:
           "$tmp/usr/bin/northnarrow-agent" --version
 
       # Lot 383: every artefact carries the workspace version — the file
-      # names (`0.1.0-alpha`), the packages' own version (the pre-release's
-      # `-` as `~`, `0.1.0~alpha`, sorted before the release by dpkg and by
+      # names (`0.1.1-alpha`), the packages' own version (the pre-release's
+      # `-` as `~`, `0.1.1~alpha`, sorted before the release by dpkg and by
       # rpm) and the `--version` of every binary of the tarball and the .deb.
       - name: The artefacts carry the workspace version
         run: |

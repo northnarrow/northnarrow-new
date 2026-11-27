@@ -6,7 +6,7 @@
 > since 20 October 2026 (Wave 4) the work is tracked capability by
 > capability in
 > `docs/roadmap/CAPABILITY_PROGRAM.md`, and what each release contains is in
-> `CHANGELOG.md` (the first alpha is `0.1.0-alpha`). Where the two disagree
+> `CHANGELOG.md` (the first alpha is `0.1.0-alpha`, the second `0.1.1-alpha`). Where the two disagree
 > with this file, they are the current source.
 >
 > A *Tappa* (Italian for "stage"; plural *Tappe*) is one step of this
@@ -35,7 +35,7 @@ enforcement (everything before that step is built and runs in "would have denied
 
 | Stage | Goal | What you will see | Status |
 |---|---|---|---|
-| <a id="s1"></a>**S1 Foundations** | Margin on every supported kernel, a modern toolchain, current dependencies | Sensors on every CPU on 7.0; the mount guard at about half of the verifier budget on 5.15; lighter sensors; AST-based ratchets; a cleaner supply chain; the `.rpm` and AlmaLinux 9 in the lab and the nightly run. Done: the stage's lab round on six kernels, 26 November 2026 ([results](docs/validation/results/stage-s1-2026-11-26.md)) | ✅ |
+| <a id="s1"></a>**S1 Foundations** | Margin on every supported kernel, a modern toolchain, current dependencies | Sensors on every CPU on 7.0; the mount guard at about half of the verifier budget on 5.15; lighter sensors; AST-based ratchets; a cleaner supply chain; the `.rpm` and AlmaLinux 9 in the lab and the nightly run. Done: the stage's lab round on six kernels, 26 November 2026 ([results](docs/validation/results/stage-s1-2026-11-26.md)); released in `v0.1.1-alpha`, 27 November 2026 | ✅ |
 | <a id="s2"></a>**S2 Self-protection after the alpha** | A trusted-installer window that holds only for the process tree that opened it; upgrades with no gap | An upgrade never leaves the host without its kernel protections; the residual items accepted for the alpha are closed | ⏭️ |
 | **S3 Seeing failed attempts** | Every failed exploit attempt becomes signed evidence, attributed to the service and the peer | A record of first uses, process fork/exit/credential events, an "exposed" mark on network-facing services | ⏭️ |
 | **S4 Kernel helpers** | The kernel's own helper paths are protected and checked | Core-dump, module-loader and binary-format helpers cannot be repointed; boot-chain files are watched | ⏭️ |

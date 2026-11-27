@@ -94,7 +94,7 @@ $ nn-admin --version
 stderr: a pipe closed before the start
 exit: 0
 --- stdout
-| nn-admin 0.1.0-alpha
+| nn-admin 0.1.1-alpha
 
 ### pipe.stdout.host-check
 $ nn-admin host-check

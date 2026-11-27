@@ -488,7 +488,7 @@ the end.
 **The release `.rpm`** (lot 1.10, #604), on an RPM guest (`alma9`):
 
 ```
-gh release download v0.1.0-alpha -D /tmp/rel-from -p '*.rpm' -p 'RPM-GPG-KEY-northnarrow.asc' -p 'SHA256SUMS*'
+gh release download v<from> -D /tmp/rel-from -p '*.rpm' -p 'RPM-GPG-KEY-northnarrow.asc' -p 'SHA256SUMS*'   # the published release upgraded from
 gh run download <release.yml run of the build> -D /tmp/rel-new       # its .rpm and SHA256SUMS
 NN_LAB_DISTRO=alma9 deploy/lab/nn-lab.sh rpm-release-check /tmp/rel-from /tmp/rel-new
 ```
