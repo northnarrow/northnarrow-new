@@ -799,7 +799,7 @@ not cause as an incident.
   degraded. *For you:* identify the program
   (`bpftool cgroup tree`) and detach it if it is not your own. *Evidence:*
   `the_census_names_every_program_not_the_agent_s`;
-  `the_cgroup_census_runs_after_each_attach_and_never_detaches`; lot 2.2.
+  `the_cgroup_census_runs_after_each_attach_and_never_detaches`.
 - **A preloaded library the kernel trusts keeps the role.** The agent and
   the watchdog hold their roles only with their own binary as their main
   image and trusted code in every other executable mapping, judged when
@@ -810,7 +810,7 @@ not cause as an incident.
   mapped; one that fails it takes the role away, signed. A write of
   `/etc/ld.so.preload` outside a window is not refused yet (a later lot of
   stage S2). *Evidence:* `a_preloaded_library_is_found_among_the_role_s_mappings`;
-  `an_untrusted_mapping_takes_the_role_away_by_its_first_reason`; lot 2.2.
+  `an_untrusted_mapping_takes_the_role_away_by_its_first_reason`.
 
 ## Detection coverage
 
