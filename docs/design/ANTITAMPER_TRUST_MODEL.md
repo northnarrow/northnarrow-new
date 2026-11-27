@@ -3487,9 +3487,9 @@ each link, a member asks the agent for a lease:
 - a small number per window (the flows need one per link);
 - each use signed (PID-1-lease class), with the member that armed it.
 
-Any other action of PID 1 on our units' files stays refused, in a window
-too: `mask`, `revert`, `preset`, a link to another target, a drop-in,
-`set-default`.
+Any other action of PID 1 on our units' names gets no lease, and is
+refused from 2.3, in a window too: `mask`, `revert`, `preset`, a link to
+another target, a drop-in.
 
 | PID 1 action in the flows | Needed by | Per-tree window |
 |---|---|---|
@@ -3712,7 +3712,8 @@ file. So a script is judged on its interpreter and on itself, and a
 `binfmt_misc` handler on itself. `ld.so <file>` is judged on the file
 the loader then maps. What stays a member is the release's staged files
 and the system's tools: root-owned, not writable by others, on a local
-filesystem, in a root-owned directory, with a clean environment.
+filesystem, in a directory that is neither world-writable nor sticky,
+with a clean environment.
 
 The rule binds what is executed and mapped. An interpreter that reads a
 script or a module as data (`sh file`, `python file`, an `import`) is
