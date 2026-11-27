@@ -1122,7 +1122,7 @@ pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
 /// `(dev, ino)` of `task`'s executable (`mm->exe_file`); `None` for a
 /// kernel thread (no `mm`).
 #[inline(always)]
-unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
+pub(crate) unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
         if task.is_null() {

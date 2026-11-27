@@ -637,10 +637,12 @@ impl Rule for NnLAt001AntiTamperDenial {
             // option, the shared mappings.
             FsProtectOperation::RoleUnmarked => format!(
                 "to map executable code into a process that runs the agent's or the watchdog's \
-                 binary from an image the agent did not mark as its own (inode \
-                 {target_dev}:{target_ino}; 0:0 is anonymous memory) — the process has no role \
-                 from then on: it is protected as a target, exempt from nothing, and never takes \
-                 a vacant role"
+                 binary that is not trusted code when it is mapped (inode \
+                 {target_dev}:{target_ino}; 0:0 is anonymous memory): a main image without the \
+                 role mark, or a file that is not a regular file owned by root and writable by \
+                 nobody else, with a name, on a local filesystem of the host's user namespace \
+                 through a mount that is not idmapped — the process has no role from then on: it \
+                 is protected as a target, exempt from nothing, and never takes a vacant role"
             ),
             FsProtectOperation::BpfCgroupAttach => format!(
                 "to attach a cgroup BPF program (attach type {target_ino}, class {target_dev}) \

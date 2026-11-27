@@ -1085,6 +1085,10 @@ fn high_kind(kind: &str) -> bool {
             | crate::witness::ROLES_VACATED_GAP
             // the review of #597 (P2-1)
             | crate::shutdown_remount::NO_SHUTDOWN_KIND
+            // lot 2.2 (the review of #644): a preloaded library in a role
+            // process, a foreign cgroup program on the agent's cgroups
+            | crate::anti_tamper::role_watch::PRELOAD_KIND
+            | crate::anti_tamper::role_watch::CGROUP_FOREIGN_KIND
             // lot 2.0: a role stopped by a signal it did not request
             | UNREQUESTED_STOP
     )
@@ -3167,6 +3171,19 @@ pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
         extra["severity"] = "high".into();
     }
     append_entry(audit_log, AUDIT_OP, extra, "detected");
+}
+
+/// Lot 2.2 (the review of #644): the end of a finding another task of the
+/// agent signed with [`report_event`] (`integrity_drift_cleared`, the same
+/// kind and detail): the status no longer lists it.
+pub fn report_cleared(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    warn!(
+        kind = f.kind,
+        detail = %f.detail,
+        "integrity drift cleared — the state reported earlier is gone"
+    );
+    let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false });
+    append_entry(audit_log, CLEARED_OP, extra, "cleared");
 }
 
 /// Start the check (from `main`, once the audit log exists). R09c (lab PR

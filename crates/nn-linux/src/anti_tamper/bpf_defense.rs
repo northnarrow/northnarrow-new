@@ -2263,213 +2263,105 @@ fn write_kernel_read_conf_pin(pin: &Path) -> std::result::Result<u32, String> {
     write_kernel_read_conf(&mut a)
 }
 
-/// Lot 2.2: an executable file mapping of a `/proc/<pid>/maps` line — its
-/// path and inode number (`None`: not executable, anonymous, a pseudo file,
-/// a deleted file).
-pub fn exec_mapping(line: &str) -> Option<(&str, u64)> {
-    let mut f = line.split_ascii_whitespace();
-    let _range = f.next()?;
-    let perms = f.next()?;
-    let _off = f.next()?;
-    let _dev = f.next()?;
-    let ino: u64 = f.next()?.parse().ok()?;
-    let path = f.next()?;
-    if perms.as_bytes().get(2) != Some(&b'x')
-        || ino == 0
-        || !path.starts_with('/')
-        || f.next().is_some()
-    {
-        return None;
-    }
-    Some((path, ino))
-}
-
-/// Lot 2.2: the NSS modules `nsswitch` (the text of `/etc/nsswitch.conf`)
-/// names for the databases a role process may look up, as the file names
-/// glibc's loader opens (`libnss_<service>.so.2`), each once.
-pub fn nss_modules(nsswitch: &str) -> Vec<String> {
-    const DATABASES: [&str; 6] = [
-        "passwd",
-        "group",
-        "shadow",
-        "hosts",
-        "initgroups",
-        "services",
-    ];
-    let mut out: Vec<String> = Vec::new();
-    for line in nsswitch.lines() {
-        let line = line.split('#').next().unwrap_or("");
-        let Some((db, services)) = line.split_once(':') else {
-            continue;
-        };
-        if !DATABASES.contains(&db.trim()) {
-            continue;
-        }
-        let mut in_action = false;
-        for w in services.split_ascii_whitespace() {
-            if w.starts_with('[') {
-                in_action = !w.ends_with(']');
-                continue;
-            }
-            if in_action {
-                in_action = !w.ends_with(']');
-                continue;
-            }
-            if !w
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                continue;
-            }
-            let name = format!("libnss_{w}.so.2");
-            if !out.contains(&name) {
-                out.push(name);
-            }
-        }
-    }
-    out
-}
-
-/// Lot 2.2: a file the role marks may name — a regular file owned by root,
-/// writable by neither its group nor others.
-pub fn markable(mode: u32, uid: u32) -> bool {
-    mode & libc::S_IFMT == libc::S_IFREG && uid == 0 && mode & 0o022 == 0
-}
-
-/// Lot 2.2: the role images now, by kernel key, each with its path: every
-/// executable file mapping of the agent (`/proc/self/maps`) and of the
-/// live watchdog (`watchdog_pid`), the two binaries (`own`), and the NSS
-/// modules `/etc/nsswitch.conf` names found beside the C library the agent
-/// maps (glibc opens them at a lookup). Only [`markable`] files, and never
-/// one `/etc/ld.so.preload` names (a library preloaded into every process
-/// is no role image). A mapping whose path now names another file (a
-/// library replaced by an upgrade) is marked by the path's new file: the
-/// next start of a role maps that one.
+/// Lot 2.2 (the review of #644, decision D10): the role images, by kernel
+/// key, each with what names it — the two binaries (`own`: the agent's and
+/// the watchdog's, as the install or the upgrade put them in place, inside
+/// a window) and the main image of the live watchdog (`watchdog_main`: an
+/// upgrade's watchdog still runs the binary it replaced until its own
+/// restart). Only the MAIN image of a role process is marked: every other
+/// executable mapping is judged by the kernel when it is made, on its own
+/// file (`common::exec_marks::code_verdict`), so a library an upgrade
+/// replaced, an NSS module opened later or a preloaded library needs no
+/// mark.
 pub fn role_images(
     own: &crate::anti_tamper::OwnExes,
-    watchdog_pid: Option<u32>,
-) -> Vec<(common::wire::InodeKey, PathBuf)> {
-    use std::os::unix::fs::MetadataExt;
-    let read = |p: &str| antitamper_bpf::kernel_roots::read_to_string(p).ok();
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let mut libc_dir: Option<PathBuf> = None;
-    let mut maps = vec![read("/proc/self/maps")];
-    if let Some(pid) = watchdog_pid.filter(|p| *p != 0 && *p != common::wire::ROLE_VACATED) {
-        maps.push(read(&format!("/proc/{pid}/maps")));
-    }
-    for text in maps.into_iter().flatten() {
-        for (path, _) in text.lines().filter_map(exec_mapping) {
-            let p = PathBuf::from(path);
-            if libc_dir.is_none()
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("libc.so"))
-            {
-                libc_dir = p.parent().map(Path::to_path_buf);
-            }
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-    }
-    if let (Some(dir), Some(conf)) = (&libc_dir, read("/etc/nsswitch.conf")) {
-        for m in nss_modules(&conf) {
-            let p = dir.join(m);
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-    }
-    let preloaded: Vec<(u64, u64)> = read("/etc/ld.so.preload")
-        .unwrap_or_default()
-        .split_ascii_whitespace()
-        .filter_map(|p| antitamper_bpf::kernel_roots::metadata(p).ok())
-        .map(|m| (m.dev(), m.ino()))
-        .collect();
-    let mut out: Vec<(common::wire::InodeKey, PathBuf)> = Vec::new();
-    let mut push = |dev: u64, ino: u64, path: PathBuf| {
-        if preloaded.contains(&(dev, ino)) {
-            warn!(path = %path.display(), "role marks: a library /etc/ld.so.preload names is mapped into the agent's processes — NOT marked");
-            return;
-        }
+    watchdog_main: Option<common::wire::InodeKey>,
+) -> Vec<(common::wire::InodeKey, &'static str)> {
+    let mut out: Vec<(common::wire::InodeKey, &'static str)> = Vec::new();
+    for id in own.keep() {
         let key = common::wire::InodeKey {
-            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(dev),
-            ino,
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+            ino: id.ino,
         };
         if !out.iter().any(|(k, _)| *k == key) {
-            out.push((key, path));
-        }
-    };
-    for p in paths {
-        if let Ok(m) = antitamper_bpf::kernel_roots::metadata(&p) {
-            if markable(m.mode(), m.uid()) {
-                push(m.dev(), m.ino(), p);
-            }
+            out.push((key, "a role binary"));
         }
     }
-    for id in own.keep() {
-        push(id.dev, id.ino, PathBuf::from("(a role binary)"));
+    if let Some(key) = watchdog_main {
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, "the live watchdog's main image"));
+        }
     }
     out
 }
 
 /// Lot 2.2: the role marks written over `map`'s entries: `want` marked
 /// (`MARK_ROLE`, the bits S12 owns kept), and an entry no longer wanted
-/// removed unless `still_mapped` names its inode (an image a live role
-/// process maps: a library upgraded under it). The marks written.
+/// removed. The marks written.
 fn write_role_marks<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
     map: &mut HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
-    want: &[(common::wire::InodeKey, PathBuf)],
-    still_mapped: &HashSet<u64>,
+    want: &[(common::wire::InodeKey, &'static str)],
 ) -> std::result::Result<usize, String> {
     use crate::anti_tamper::filesystem::AyaInodeKey;
     use common::exec_marks::MARK_ROLE;
     let stale: Vec<AyaInodeKey> = map
         .keys()
         .filter_map(std::result::Result::ok)
-        .filter(|k| !want.iter().any(|(w, _)| *w == k.0) && !still_mapped.contains(&k.0.ino))
+        .filter(|k| !want.iter().any(|(w, _)| *w == k.0))
         .collect();
     for k in &stale {
         map.remove(k)
             .map_err(|e| format!("removing a stale role mark: {e}"))?;
     }
     let mut n = 0;
-    for (key, path) in want {
+    for (key, what) in want {
         let old = map.get(&AyaInodeKey(*key), 0).unwrap_or(0);
         if old & MARK_ROLE == 0 {
             map.insert(&AyaInodeKey(*key), &(old | MARK_ROLE), 0)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+                .map_err(|e| format!("{what} ({}:{}): {e}", key.dev, key.ino))?;
         }
         n += 1;
     }
     Ok(n)
 }
 
-/// The inodes the agent and the live watchdog map executable now.
-fn mapped_inodes(watchdog_pid: Option<u32>) -> HashSet<u64> {
-    let mut set = HashSet::new();
-    let mut texts = vec![antitamper_bpf::kernel_roots::read_to_string("/proc/self/maps").ok()];
-    if let Some(pid) = watchdog_pid {
-        texts.push(antitamper_bpf::kernel_roots::read_to_string(format!("/proc/{pid}/maps")).ok());
-    }
-    for t in texts.into_iter().flatten() {
-        for line in t.lines() {
-            let mut f = line.split_ascii_whitespace();
-            let (Some(_), Some(perms), Some(_), Some(_), Some(ino)) =
-                (f.next(), f.next(), f.next(), f.next(), f.next())
-            else {
-                continue;
-            };
-            if perms.as_bytes().get(2) == Some(&b'x') {
-                if let Ok(i) = ino.parse::<u64>() {
-                    if i != 0 {
-                        set.insert(i);
-                    }
-                }
-            }
-        }
-    }
-    set
+/// The main image of the live watchdog (`/proc/<pid>/exe`), by kernel key,
+/// when it is one of the role binaries this agent knows or was marked
+/// before (an upgrade's watchdog before its restart).
+fn watchdog_main(
+    watchdog_pid: Option<u32>,
+    marked: impl Fn(common::wire::InodeKey) -> bool,
+) -> Option<common::wire::InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let pid = watchdog_pid.filter(|p| *p != 0 && *p != common::wire::ROLE_VACATED)?;
+    let m = antitamper_bpf::kernel_roots::metadata(format!("/proc/{pid}/exe")).ok()?;
+    let key = common::wire::InodeKey {
+        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+        ino: m.ino(),
+    };
+    marked(key).then_some(key)
 }
+
+/// Lot 2.2 (the review of #644, F5): the arm flag set or cleared — cleared
+/// when the marks could not be written whole, so that no role is judged
+/// against marks the write left partial (fail open for the role, signed by
+/// the caller).
+fn set_marks_armed<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    a: &mut Array<M, u32>,
+    on: bool,
+) -> std::result::Result<(), String> {
+    let v = if on {
+        common::exec_marks::EXEC_MARKS_ARMED_ON
+    } else {
+        0
+    };
+    a.set(0, &v, 0)
+        .map_err(|e| format!("{}: {e}", common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+}
+
+/// Lot 2.2 (the review of #644, F5): the degradation a failed refresh of
+/// the role marks reports (the marks then disarmed).
+pub const ROLE_MARKS_REFRESH_DEGRADATION: &str = "role_marks";
 
 /// Lot 2.2: the agent's own executables, for the refresh of the marks.
 static ROLE_MARK_EXES: OnceLock<crate::anti_tamper::OwnExes> = OnceLock::new();
@@ -2478,11 +2370,14 @@ static ROLE_MARK_EXES: OnceLock<crate::anti_tamper::OwnExes> = OnceLock::new();
 /// (`nn-admin status`'s `role_marks.marked`).
 static ROLE_MARKS_WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Lot 2.2: the role marks for `nn-admin status`: the images marked, and
-/// the processes alive now that lost their role (read through the pin).
+/// Lot 2.2: the role marks for `nn-admin status`: the images marked, the
+/// processes alive now that lost their role (read through the pin), and
+/// what [`super::role_watch`] found (the preloaded libraries, the foreign
+/// cgroup programs).
 pub fn role_marks_status(pin_root: Option<&Path>) -> Option<nn_proto::admin_protocol::RoleMarks> {
     let marked = ROLE_MARKS_WRITTEN.load(std::sync::atomic::Ordering::SeqCst);
-    if marked == 0 {
+    let foreign = super::role_watch::foreign_now();
+    if marked == 0 && foreign.is_none() {
         return None;
     }
     let unmarked = pin_root
@@ -2494,6 +2389,8 @@ pub fn role_marks_status(pin_root: Option<&Path>) -> Option<nn_proto::admin_prot
     Some(nn_proto::admin_protocol::RoleMarks {
         marked,
         unmarked_refused: unmarked,
+        preloaded: super::role_watch::preloaded_now(),
+        cgroup_bpf_foreign: foreign,
     })
 }
 
@@ -2503,26 +2400,26 @@ pub fn role_marks_status(pin_root: Option<&Path>) -> Option<nn_proto::admin_prot
 /// then the two programs attached (pinned where the guard enforces: a
 /// restarted role is judged by its predecessor's hooks). Run after the
 /// agent's own executables are registered. The marks written, or why the
-/// marks are not armed (then no role is judged: a signed degradation).
+/// marks are not armed (then no role is judged: a signed degradation). A
+/// write that fails clears the flag (the review of #644, F5: the flag is
+/// pinned, and an earlier start set it).
 pub(crate) fn arm_role_marks(
     ebpf: &mut Ebpf,
     btf: &Btf,
     pin_root: Option<&Path>,
     own: &crate::anti_tamper::OwnExes,
 ) -> std::result::Result<usize, String> {
-    use common::exec_marks::{
-        EXEC_MARKS_ARMED_MAP_NAME, EXEC_MARKS_ARMED_ON, EXEC_MARKS_MAP_NAME, ROLE_UNMARKED_MAP_NAME,
-    };
+    use common::exec_marks::{EXEC_MARKS_ARMED_MAP_NAME, EXEC_MARKS_MAP_NAME, ROLE_UNMARKED_MAP_NAME};
     freeze_named(ebpf, ROLE_UNMARKED_MAP_NAME)?;
     let watchdog = pin_root.and_then(|r| antitamper_bpf::role_slot(r, 0).ok());
-    let want = role_images(own, watchdog);
-    let n = {
+    let written = {
         let m = ebpf
             .map_mut(EXEC_MARKS_MAP_NAME)
             .ok_or_else(|| format!("{EXEC_MARKS_MAP_NAME} missing from the eBPF object"))?;
         let mut map: HashMap<&mut MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
             HashMap::try_from(m).map_err(|e| format!("{EXEC_MARKS_MAP_NAME}: {e}"))?;
-        write_role_marks(&mut map, &want, &mapped_inodes(watchdog))?
+        let want = role_images(own, watchdog_main(watchdog, |k| marked_now(&map, own, k)));
+        write_role_marks(&mut map, &want)
     };
     {
         let m = ebpf
@@ -2530,9 +2427,9 @@ pub(crate) fn arm_role_marks(
             .ok_or_else(|| format!("{EXEC_MARKS_ARMED_MAP_NAME} missing from the eBPF object"))?;
         let mut a: Array<&mut MapData, u32> =
             Array::try_from(m).map_err(|e| format!("{EXEC_MARKS_ARMED_MAP_NAME}: {e}"))?;
-        a.set(0, &EXEC_MARKS_ARMED_ON, 0)
-            .map_err(|e| format!("{EXEC_MARKS_ARMED_MAP_NAME}: {e}"))?;
+        set_marks_armed(&mut a, written.is_ok())?;
     }
+    let n = written?;
     ROLE_MARKS_WRITTEN.store(n as u32, std::sync::atomic::Ordering::SeqCst);
     let _ = ROLE_MARK_EXES.set(*own);
     let enforce = enforce_mode();
@@ -2549,7 +2446,8 @@ pub(crate) fn arm_role_marks(
     if missing.is_empty() {
         info!(
             marked = n,
-            "role marks armed (an unmarked executable mapping takes a role away)"
+            "role marks armed (a role's main image must be marked; any other executable mapping \
+             must be trusted code when it is made)"
         );
         Ok(n)
     } else {
@@ -2557,23 +2455,55 @@ pub(crate) fn arm_role_marks(
     }
 }
 
+/// Whether `key` is one of `own`'s binaries or carries the role mark in
+/// `map` now.
+fn marked_now<M: std::borrow::Borrow<MapData>>(
+    map: &HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
+    own: &crate::anti_tamper::OwnExes,
+    key: common::wire::InodeKey,
+) -> bool {
+    role_images(own, None).iter().any(|(k, _)| *k == key)
+        || map
+            .get(&crate::anti_tamper::filesystem::AyaInodeKey(key), 0)
+            .is_ok_and(|m| m & common::exec_marks::MARK_ROLE != 0)
+}
+
 /// Lot 2.2: the role marks rewritten through the pin (the integrity
-/// round): a library an upgrade replaced at its path is marked by its new
-/// file, an image no longer wanted nor mapped is dropped. The marks
-/// written.
+/// round): the two binaries and the live watchdog's main image marked, any
+/// other mark dropped. A write that fails clears the arm flag (F5). The
+/// marks written.
 pub fn refresh_role_marks(
     pin_root: &Path,
     own: &crate::anti_tamper::OwnExes,
 ) -> std::result::Result<usize, String> {
     let watchdog = antitamper_bpf::role_slot(pin_root, 0).ok();
-    let want = role_images(own, watchdog);
     let md = MapData::from_pin(pin_root.join(common::exec_marks::EXEC_MARKS_MAP_NAME))
         .map_err(|e| e.to_string())?;
     let mut map: HashMap<MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
         HashMap::try_from(Map::HashMap(md)).map_err(|e| e.to_string())?;
-    let n = write_role_marks(&mut map, &want, &mapped_inodes(watchdog))?;
-    ROLE_MARKS_WRITTEN.store(n as u32, std::sync::atomic::Ordering::SeqCst);
-    Ok(n)
+    let want = role_images(own, watchdog_main(watchdog, |k| marked_now(&map, own, k)));
+    match write_role_marks(&mut map, &want) {
+        Ok(n) => {
+            ROLE_MARKS_WRITTEN.store(n as u32, std::sync::atomic::Ordering::SeqCst);
+            Ok(n)
+        }
+        Err(e) => {
+            let cleared = MapData::from_pin(
+                pin_root.join(common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|md| {
+                let mut a: Array<MapData, u32> =
+                    Array::try_from(Map::Array(md)).map_err(|e| e.to_string())?;
+                set_marks_armed(&mut a, false)
+            });
+            ROLE_MARKS_WRITTEN.store(0, std::sync::atomic::Ordering::SeqCst);
+            Err(match cleared {
+                Ok(()) => format!("{e} — the marks are disarmed (no role is judged)"),
+                Err(c) => format!("{e} — and the arm flag NOT cleared ({c})"),
+            })
+        }
+    }
 }
 
 /// Lot 2.2 (the design's section 5, boot-zero): the window's maps emptied
@@ -2756,22 +2686,90 @@ impl BpfGuard {
         );
         tokio::spawn(async move {
             let mut reported: HashSet<u32> = HashSet::new();
+            let mut signed = super::role_watch::Signed::default();
+            let mut first = true;
             loop {
-                tokio::time::sleep(crate::self_integrity::jittered(Duration::from_secs(
-                    LINK_CHECK_SECS,
-                )))
-                .await;
+                // lot 2.2 (the review of #644, F4): the first round at once
+                // (the census at the start), then each period or right after
+                // a cgroup attach the kernel let through
+                if !first {
+                    super::role_watch::wait_round(crate::self_integrity::jittered(
+                        Duration::from_secs(LINK_CHECK_SECS),
+                    ))
+                    .await;
+                }
+                first = false;
                 if guard.stopping() {
                     return;
                 }
-                // lot 2.2: the role marks follow a library an upgrade
-                // replaced at its path (a restarted role maps the new file)
+                // lot 2.2: the role marks follow the live watchdog's main
+                // image (an upgrade's, before its restart)
                 if let (Some(root), Some(exes)) = (own.pin_root.clone(), ROLE_MARK_EXES.get()) {
                     if let Err(e) =
                         crate::runtime::off_the_runtime(|| refresh_role_marks(&root, exes))
                     {
                         warn!(error = %e, "role marks NOT refreshed");
+                        crate::boot::degradation::report(
+                            ROLE_MARKS_REFRESH_DEGRADATION,
+                            &format!("the role marks could not be written ({e})"),
+                        );
                     }
+                }
+                // lot 2.2 (the review of #644, F3 and F4): a preloaded
+                // library in a role process, a foreign cgroup program on the
+                // agent's cgroups — each signed High once while it holds,
+                // listed by the status
+                let own_ids = {
+                    let mut ids = guard.own_prog_ids();
+                    ids.extend(crate::sysctl_cgroup::own_prog_id());
+                    ids
+                };
+                let watchdog = own
+                    .pin_root
+                    .as_deref()
+                    .and_then(|r| antitamper_bpf::role_slot(r, 0).ok());
+                let (preloaded, census) = crate::runtime::off_the_runtime(|| {
+                    (
+                        super::role_watch::preload_findings(watchdog),
+                        super::role_watch::census(&own_ids),
+                    )
+                });
+                let foreign = match census {
+                    Ok(hits) => Some(
+                        hits.iter()
+                            .map(|h| crate::self_integrity::Finding {
+                                kind: super::role_watch::CGROUP_FOREIGN_KIND,
+                                detail: super::role_watch::census_detail(
+                                    h,
+                                    guard.census_program(h.prog_id).ok().map(|p| p.name).as_deref(),
+                                ),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "cgroup BPF census NOT made this round");
+                        None
+                    }
+                };
+                super::role_watch::set_counts(
+                    foreign.as_ref().map(|f| f.len() as u32),
+                    preloaded.len() as u32,
+                );
+                // signed rows of advisory kinds: the status lists each
+                // until its end is signed (a census that failed ends none)
+                let kept: &[&str] = if foreign.is_some() {
+                    &[]
+                } else {
+                    &[super::role_watch::CGROUP_FOREIGN_KIND]
+                };
+                let mut now = preloaded;
+                now.extend(foreign.unwrap_or_default());
+                let (fresh, gone) = signed.fresh(&now, kept);
+                for f in fresh {
+                    crate::self_integrity::report_event(audit_log.as_ref(), f);
+                }
+                for f in &gone {
+                    crate::self_integrity::report_cleared(audit_log.as_ref(), f);
                 }
                 // lot 353 (re-check 1 of #563): the pins walked by path
                 // (`/sys/fs/bpf`) — off the runtime's worker
@@ -2864,72 +2862,40 @@ pub(crate) fn map_data(m: &Map) -> &MapData {
 mod tests {
     use super::*;
 
-    /// Lot 2.2 (named): the executable FILE mappings of a maps listing —
-    /// not a data mapping, an anonymous one, a pseudo file or a deleted
-    /// file (its path no longer names it).
+    /// The review of #644 (D10, F1, F2): the marks name the MAIN images only
+    /// — the two binaries, each once, and the live watchdog's main image (an
+    /// upgrade's watchdog before its restart). No library is marked: the
+    /// kernel judges every other executable mapping on its own file when it
+    /// is made, so a C library upgraded under a running agent, an NSS module
+    /// opened later or a preloaded library needs no mark (the lot's first
+    /// version marked the mapped libraries and dropped a replaced one: the
+    /// role was lost at the next restart after a library upgrade).
     #[test]
-    fn only_executable_file_mappings_are_role_images() {
-        let maps = "\
-55d0c0a00000-55d0c0a20000 r--p 00000000 08:01 1311 /usr/bin/northnarrow-agent
-55d0c0a20000-55d0c0b00000 r-xp 00020000 08:01 1311 /usr/bin/northnarrow-agent
-7f0000000000-7f0000020000 r-xp 00000000 08:01 2222 /usr/lib/x86_64-linux-gnu/libc.so.6
-7f0000100000-7f0000120000 r-xp 00000000 08:01 3333 /usr/lib/x86_64-linux-gnu/libold.so (deleted)
-7f0000200000-7f0000201000 rwxp 00000000 00:00 0
-7ffd00000000-7ffd00002000 r-xp 00000000 00:00 0 [vdso]
-7f0000300000-7f0000301000 rw-p 00000000 08:01 4444 /var/lib/northnarrow/state";
-        let got: Vec<(&str, u64)> = maps.lines().filter_map(exec_mapping).collect();
-        assert_eq!(
-            got,
-            vec![
-                ("/usr/bin/northnarrow-agent", 1311),
-                ("/usr/lib/x86_64-linux-gnu/libc.so.6", 2222),
-            ]
-        );
-    }
-
-    /// Lot 2.2 (named): the NSS modules of the databases a role looks up,
-    /// once each, the action brackets and other databases skipped.
-    #[test]
-    fn the_nss_modules_are_read_from_nsswitch() {
-        let conf = "\
-# comment: files ldap
-passwd:         files systemd
-group:          files systemd sss
-shadow:         files
-hosts:          files mdns4_minimal [NOTFOUND=return] dns myhostname
-networks:       files evil
-initgroups:     files [SUCCESS=continue] sss
-services:       files [ UNAVAIL = return ] nis
-bad:line
-";
-        assert_eq!(
-            nss_modules(conf),
-            vec![
-                "libnss_files.so.2",
-                "libnss_systemd.so.2",
-                "libnss_sss.so.2",
-                "libnss_mdns4_minimal.so.2",
-                "libnss_dns.so.2",
-                "libnss_myhostname.so.2",
-                "libnss_nis.so.2",
-            ]
-        );
-        assert!(
-            nss_modules("passwd: ../../tmp/x").is_empty(),
-            "a path is no service"
-        );
-    }
-
-    /// Lot 2.2 (named): only a root-owned regular file nobody else can
-    /// write is a role image.
-    #[test]
-    fn a_role_image_is_root_s_and_not_writable_by_others() {
-        assert!(markable(libc::S_IFREG | 0o755, 0));
-        assert!(markable(libc::S_IFREG | 0o644, 0));
-        assert!(!markable(libc::S_IFREG | 0o775, 0), "group-writable");
-        assert!(!markable(libc::S_IFREG | 0o757, 0), "world-writable");
-        assert!(!markable(libc::S_IFREG | 0o755, 1000), "a user's");
-        assert!(!markable(libc::S_IFDIR | 0o755, 0), "a directory");
+    fn the_role_marks_name_the_main_images_only() {
+        use crate::anti_tamper::{ExeIdentity, OwnExes};
+        let agent = ExeIdentity { dev: 0x801, ino: 1311 };
+        let watchdog = ExeIdentity { dev: 0x801, ino: 1312 };
+        let own = OwnExes {
+            agent: Some(agent),
+            watchdog: Some(watchdog),
+        };
+        let k = |id: ExeIdentity| common::wire::InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+            ino: id.ino,
+        };
+        let got: Vec<_> = role_images(&own, None).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(got, [k(agent), k(watchdog)]);
+        let old = common::wire::InodeKey { dev: k(agent).dev, ino: 999 };
+        let got: Vec<_> = role_images(&own, Some(old)).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(got, [k(agent), k(watchdog), old], "the upgrade's watchdog");
+        let got: Vec<_> = role_images(&own, Some(k(watchdog))).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(got, [k(agent), k(watchdog)], "each once");
+        let one = OwnExes {
+            agent: Some(agent),
+            watchdog: Some(agent),
+        };
+        assert_eq!(role_images(&one, None).len(), 1);
+        assert!(role_images(&OwnExes::default(), None).is_empty());
     }
 
     /// Lot 2.2 (named): the kernel-read configuration — the classes, each

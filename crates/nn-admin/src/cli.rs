@@ -3416,6 +3416,29 @@ fn advisory_lines(out: &StatusOutcome) -> Vec<String> {
     }
 }
 
+/// Lot 2.2 (the review of #644, F3, F4, F8): the role marks — the main
+/// images marked, the role processes that lost their role, the preloaded
+/// libraries mapped into one, the foreign cgroup programs on the agent's
+/// cgroups at the last census (each signed High, listed with the
+/// advisories) — and the kernel-read option's classes. Nothing from an
+/// agent that predates them.
+fn role_marks_line(out: &StatusOutcome) -> Option<String> {
+    let m = out.role_marks?;
+    let census = m
+        .cgroup_bpf_foreign
+        .map_or("no census yet".to_string(), |n| n.to_string());
+    let classes = match out.kernel_read_refused.as_deref() {
+        Some([]) | None => "off".to_string(),
+        Some(c) => c.join(", "),
+    };
+    Some(format!(
+        "role marks        : {} main images marked, {} role process(es) without their role, {} \
+         preloaded librar(ies) in a role process; foreign cgroup BPF programs on the agent's \
+         cgroups: {census}; kernel-read refused: {classes}",
+        m.marked, m.unmarked_refused, m.preloaded
+    ))
+}
+
 /// The prefix of the lines of the held integrity findings
 /// (`nn_evidence::held::SOURCE`, as the degradation registry shows it).
 const HELD_PREFIX: &str = "integrity: ";
@@ -4103,7 +4126,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{},\"runtime_clones\":{},\"advisories\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{},\"runtime_clones\":{},\"advisories\":{},\"role_marks\":{},\"kernel_read_refused\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -4173,6 +4196,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
             runtime_clones_json(out),
             // lot 379
             serde_json::to_string(&out.advisories).unwrap_or_else(|_| "null".to_string()),
+            // lot 2.2 (the review of #644, F8)
+            serde_json::to_string(&out.role_marks).unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&out.kernel_read_refused).unwrap_or_else(|_| "null".to_string()),
         );
         return;
     }
@@ -4227,6 +4253,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
             println!("{line}");
         }
         for line in advisory_lines(out) {
+            println!("{line}");
+        }
+        // Lot 2.2 (the review of #644, F8)
+        if let Some(line) = role_marks_line(out) {
             println!("{line}");
         }
         // R13 (lab PR 271): the signed capability manifest's newest revision.
@@ -6622,6 +6652,8 @@ mod flow_sock_line_tests {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -6719,6 +6751,35 @@ mod flow_sock_line_tests {
             serde_json::from_str(&super::kernel_state_held_back_json(&o)).unwrap();
         assert_eq!(j["bpf_unseen"], 12_000);
         assert_eq!(j["bpf_baseline"], 3);
+    }
+
+    /// Lot 2.2 (the review of #644, F3, F4, F8): the role marks' line —
+    /// the preloaded libraries and the census's foreign programs counted,
+    /// the kernel-read classes named; nothing from an older agent.
+    #[test]
+    fn status_shows_the_role_marks_the_preloads_and_the_census() {
+        let mut o = outcome(None, None, None);
+        assert_eq!(super::role_marks_line(&o), None);
+        o.role_marks = Some(nn_proto::admin_protocol::RoleMarks {
+            marked: 2,
+            unmarked_refused: 0,
+            preloaded: 1,
+            cgroup_bpf_foreign: Some(3),
+        });
+        o.kernel_read_refused = Some(vec!["physical-memory".into(), "perf".into()]);
+        let l = super::role_marks_line(&o).unwrap();
+        assert!(l.starts_with("role marks        : 2 main images marked, 0 role"), "{l}");
+        assert!(l.contains("1 preloaded librar(ies)"), "{l}");
+        assert!(l.contains("cgroups: 3;"), "{l}");
+        assert!(l.ends_with("kernel-read refused: physical-memory, perf"), "{l}");
+        o.role_marks = o.role_marks.map(|m| nn_proto::admin_protocol::RoleMarks {
+            cgroup_bpf_foreign: None,
+            ..m
+        });
+        o.kernel_read_refused = Some(vec![]);
+        let l = super::role_marks_line(&o).unwrap();
+        assert!(l.contains("cgroups: no census yet;"), "{l}");
+        assert!(l.ends_with("kernel-read refused: off"), "{l}");
     }
 
     /// Lot 379 (the review of #586, P2-1): the advisories — signed findings
