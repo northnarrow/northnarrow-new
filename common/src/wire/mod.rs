@@ -3198,6 +3198,13 @@ mod tests {
     /// number, in a slot of its own size. Lot 2.2: the layout the design
     /// hands it — a 64-bit number, a boot-time deadline, the agent's
     /// heartbeat.
+    /// Lot 2.2: a session nonce no literal names (CodeQL
+    /// `rust/hard-coded-cryptographic-value`, as lot 379's `test_nonce`).
+    fn test_nonce() -> u32 {
+        let pid = std::process::id();
+        pid.rotate_left(7) ^ pid
+    }
+
     fn grant(nonce: u32, generation: u64, expires: u64, beat: u64) -> FsGrantV2 {
         FsGrantV2 {
             nonce,
@@ -3212,17 +3219,18 @@ mod tests {
 
     #[test]
     fn fs_grant_v2_is_bound_to_its_session_deadline_and_number() {
-        let g = grant(0xABCD, 3, 1_000, 0);
-        assert!(g.active(999, 0xABCD));
-        assert!(!g.active(1_000, 0xABCD), "expired");
-        assert!(!g.active(0, 0x1234), "another boot's session");
+        let n = test_nonce();
+        let g = grant(n, 3, 1_000, 0);
+        assert!(g.active(999, n));
+        assert!(!g.active(1_000, n), "expired");
+        assert!(!g.active(0, n.wrapping_add(1)), "another boot's session");
         assert!(
-            !FsGrantV2 { generation: 0, ..g }.active(0, 0xABCD),
+            !FsGrantV2 { generation: 0, ..g }.active(0, n),
             "no grant number"
         );
         assert!(!FsGrantV2::default().active(0, 0));
         // lot 2.2: a number past 32 bits is a number
-        assert!(grant(0xABCD, 1 << 40, 1_000, 0).active(10, 0xABCD));
+        assert!(grant(n, 1 << 40, 1_000, 0).active(10, n));
         assert_eq!(core::mem::size_of::<FsGrantV2>(), 48);
         assert_eq!(core::mem::align_of::<FsGrantV2>(), 8);
         assert_eq!(core::mem::size_of::<TreeMember>(), 24);
@@ -3234,12 +3242,13 @@ mod tests {
     /// hand), whatever its deadline.
     #[test]
     fn a_v2_window_closes_itself_without_its_agent() {
+        let n = test_nonce();
         let far = 10 * WINDOW_MAX_NS;
-        let g = grant(7, 1, far, 5_000);
-        assert!(g.active(5_000, 7));
-        assert!(g.active(5_000 + WINDOW_AGENT_GRACE_NS - 1, 7));
-        assert!(!g.active(5_000 + WINDOW_AGENT_GRACE_NS, 7), "headless");
-        assert!(!g.active(4_999, 7), "a heartbeat from the future");
+        let g = grant(n, 1, far, 5_000);
+        assert!(g.active(5_000, n));
+        assert!(g.active(5_000 + WINDOW_AGENT_GRACE_NS - 1, n));
+        assert!(!g.active(5_000 + WINDOW_AGENT_GRACE_NS, n), "headless");
+        assert!(!g.active(4_999, n), "a heartbeat from the future");
         assert_eq!(WINDOW_AGENT_GRACE_NS, 60_000_000_000);
     }
 
@@ -3247,9 +3256,10 @@ mod tests {
     /// 600 s from the first grant.
     #[test]
     fn a_renewal_never_passes_the_maximum_window() {
+        let n = test_nonce();
         let g = FsGrantV2 {
             first_grant_boot_ns: 1_000,
-            ..grant(7, 1, 1_000 + 100, 0)
+            ..grant(n, 1, 1_000 + 100, 0)
         };
         assert_eq!(g.renewed_deadline(2_000), 2_000);
         assert_eq!(g.renewed_deadline(u64::MAX), 1_000 + WINDOW_MAX_NS);
@@ -3261,23 +3271,24 @@ mod tests {
     /// process, no io_uring worker, while it is open — and for no one else.
     #[test]
     fn a_v2_window_lifts_only_for_its_members() {
-        let g = grant(7, 2, 1_000, 0);
+        let n = test_nonce();
+        let g = grant(n, 2, 1_000, 0);
         let m = TreeMember {
             start_ticks: 600,
             generation: 2,
             flags: 0,
             _pad: 0,
         };
-        assert!(g.lifts_for(Some(&m), 600, false, 10, 7));
-        assert!(!g.lifts_for(None, 600, false, 10, 7), "no entry");
-        assert!(!g.lifts_for(Some(&m), 601, false, 10, 7), "a reused tgid");
+        assert!(g.lifts_for(Some(&m), 600, false, 10, n));
+        assert!(!g.lifts_for(None, 600, false, 10, n), "no entry");
+        assert!(!g.lifts_for(Some(&m), 601, false, 10, n), "a reused tgid");
         assert!(
-            !g.lifts_for(Some(&m), 600, true, 10, 7),
+            !g.lifts_for(Some(&m), 600, true, 10, n),
             "an io_uring worker"
         );
         let old = TreeMember { generation: 1, ..m };
         assert!(
-            !g.lifts_for(Some(&old), 600, false, 10, 7),
+            !g.lifts_for(Some(&old), 600, false, 10, n),
             "an earlier window's"
         );
         // lot 2.2: the generation compares all 64 bits
@@ -3286,18 +3297,22 @@ mod tests {
             ..m
         };
         assert!(
-            !g.lifts_for(Some(&wrapped), 600, false, 10, 7),
+            !g.lifts_for(Some(&wrapped), 600, false, 10, n),
             "a generation equal in its low half only"
         );
-        assert!(!g.lifts_for(Some(&m), 600, false, 1_000, 7), "expired");
-        assert!(!g.lifts_for(Some(&m), 600, false, 10, 8), "another session");
+        assert!(!g.lifts_for(Some(&m), 600, false, 1_000, n), "expired");
+        assert!(
+            !g.lifts_for(Some(&m), 600, false, 10, n.wrapping_add(1)),
+            "another session"
+        );
     }
 
     /// Lot 2.2: a lease lets through one action on one link, once, in its
     /// window's generation, before its deadline, while the window is open.
     #[test]
     fn a_lease_is_single_use_and_bound() {
-        let g = grant(7, 4, 1_000_000, 0);
+        let n = test_nonce();
+        let g = grant(n, 4, 1_000_000, 0);
         let dir = InodeKey { dev: 8, ino: 99 };
         let l = WindowLease {
             generation: 4,
@@ -3310,27 +3325,27 @@ mod tests {
             _pad: 0,
         };
         let h = l.name_hash;
-        assert!(l.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7));
+        assert!(l.usable_for(&g, dir, h, LEASE_REMOVE, 10, n));
         assert!(
-            !WindowLease { used: 1, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7),
+            !WindowLease { used: 1, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, n),
             "used"
         );
         assert!(
-            !l.usable_for(&g, dir, h, LEASE_CREATE, 10, 7),
+            !l.usable_for(&g, dir, h, LEASE_CREATE, 10, n),
             "another action"
         );
         assert!(
-            !l.usable_for(&g, dir, h ^ 1, LEASE_REMOVE, 10, 7),
+            !l.usable_for(&g, dir, h ^ 1, LEASE_REMOVE, 10, n),
             "another link"
         );
         let other = InodeKey { dev: 8, ino: 100 };
         assert!(
-            !l.usable_for(&g, other, h, LEASE_REMOVE, 10, 7),
+            !l.usable_for(&g, other, h, LEASE_REMOVE, 10, n),
             "another directory"
         );
-        assert!(!l.usable_for(&g, dir, h, LEASE_REMOVE, 500, 7), "expired");
+        assert!(!l.usable_for(&g, dir, h, LEASE_REMOVE, 500, n), "expired");
         assert!(
-            !WindowLease { generation: 3, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, 7),
+            !WindowLease { generation: 3, ..l }.usable_for(&g, dir, h, LEASE_REMOVE, 10, n),
             "an earlier window's"
         );
         assert!(
@@ -3340,16 +3355,16 @@ mod tests {
                 h,
                 LEASE_REMOVE,
                 10,
-                7
+                n
             ),
             "no window"
         );
         assert!(
-            !WindowLease { action: 3, ..l }.usable_for(&g, dir, h, 3, 10, 7),
+            !WindowLease { action: 3, ..l }.usable_for(&g, dir, h, 3, 10, n),
             "no such action"
         );
         assert!(
-            !l.usable_for(&g, dir, h, LEASE_REMOVE, 10, 8),
+            !l.usable_for(&g, dir, h, LEASE_REMOVE, 10, n.wrapping_add(1)),
             "another session"
         );
         assert_eq!(core::mem::size_of::<WindowLease>(), 56);
