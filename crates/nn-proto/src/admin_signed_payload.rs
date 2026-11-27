@@ -1905,9 +1905,11 @@ mod tests {
         verify(&original, &sig, &verifying).expect("baseline verify");
         let tampered = |f: fn(&mut TrustedInstallerTreeGrantExtra)| {
             let mut p = original.clone();
+            // a fixed message: the payload is never printed (CodeQL
+            // `rust/cleartext-logging` reads a grant as a secret)
             match &mut p.extra {
                 OperationExtra::TrustedInstallerTreeGrant(e) => f(e),
-                other => panic!("the tree grant's extra, got {other:?}"),
+                _ => panic!("not the tree grant's extra"),
             }
             p
         };

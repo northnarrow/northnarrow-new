@@ -3276,95 +3276,157 @@ where it starts.
 ## Trusted-installer window per process tree (design, stage S2)
 
 **Status.** Design of the per-tree window, written in lot 2.1 before the code of lot
-2.3, which implements it (2.2 and 2.4 take the parts named below). Lot 2.1
-declares the types only (listed at the end of this section); no hook reads
-them yet. It is reviewed by an adversarial brainstorm and a cross-model
-check before 2.3 starts.
+2.3, which implements it. Lots 2.2, 2.4, 2.5, 2.6 and 2.7 take the parts named below.
+Lot 2.1 declares the types only (listed at the end of this section); no hook reads
+them yet. This revision takes in an independent review, an adversarial brainstorm
+and a cross-model check. Each of their points is handled below, given to a named
+lot, or declared at the end.
 
 **What changes.** Today the window is host-wide: while `FS_GRANT[0]` holds
 this boot's session and an unexpired deadline, `override_active()` is true
 for every caller, so every refusal it guards is lifted for every process
 of the host ([KNOWN_LIMITATIONS.md](../operator/KNOWN_LIMITATIONS.md), "A
 trusted-installer window opens the whole host"). The window becomes a
-grant to one process tree. Its shape is this document's carve-out shape:
+grant to one process tree, and the host-wide grant is retired (section 5).
+Its shape is this document's carve-out shape:
 
-- **Principal:** the tree. Its root is one process, an ancestor of the
-  process that asked for the window. The members are the root, the
-  processes on the requester's line of descent from it, and every
-  process a member forks while the window is open.
+- **Principal:** the tree. Its root is one process that the admission
+  policy accepts (section 1): an `nn-admin window-run`, our `install.sh`,
+  or a package manager that runs our package's scriptlet. The members are
+  the root, the processes on the requester's line of descent from it, and
+  every process a member forks while the window is open.
 - **Authentication:** the signed grant (`trusted-installer` role, the
   challenge's nonce, the agent id, the clock skew, unchanged). It now
   names its root inside the signed scope (pid and start).
-- **Scope:** the operations the window lifts today, for the members only.
-  On top of that, PID 1 gets a closed list of actions on the agent's own
-  units, armed by a member (section 2). Everything else stays refused
-  for everyone else, signed.
+- **Scope:** the operations the window lifts today, for the members only,
+  minus what no flow needs (section 3). PID 1 gets no lift. A member asks
+  the agent for a controlled stop, and the one file action PID 1 must
+  perform, on our units' enablement links, goes through single-use leases
+  (section 2). Everything else stays
+  refused for everyone else, signed. While the window is open, the
+  system's code is also frozen against everyone outside the tree
+  (section 3).
 
 `override_active()` keeps its signature. It answers "may the *calling*
 process use the window" (2.3), so its callers (`ptrace_check.rs`,
 `sysctl_guard.rs`, `cgroup_guard.rs`, `cgroup_files.rs`,
 `module_load.rs`, `mount_guard.rs`, `task_limits.rs`, `bpf_defense.rs`) do
-not change for the scope. The few callers that ask "is a window open on
-this host" (section 3, "context uses") switch to a host-wide
-`window_open()`.
+not change for the scope. Nothing asks "is a window open on this host" to
+soften a record any more: the uses that did are listed in section 5, and
+they now ask who acted (section 7).
 
-### 1. Identity
+### 1. Identity and admission
 
-**The root.** A process is named by its tgid and its start:
+**A process.** A process is named by its tgid and its start:
 `task->start_boottime` in `USER_HZ` ticks. This is exactly the
 `starttime` that `/proc/<pid>/stat` gives a reader in the initial time
 namespace (`wire::start_ticks`), so the kernel and the agent compute
 the same pair. A pid reused within the same 10 ms tick would need the
-whole pid space to wrap in that time.
+whole pid space to wrap in that time. The kernel compares the start of
+the caller's thread-group leader (`group_leader`). Each thread has a start
+of its own, and an exec by a thread that is not the leader takes the
+leader's start along with its pid (`de_thread`), so the pair stays the
+process's.
 
-- **The request.** `nn-admin` reads the root's start from `/proc` and
-  signs both values (`OperationCode::TrustedInstallerTreeGrant`,
-  `TrustedInstallerTreeGrantExtra`). The default root is the requester's
-  parent: the script that runs `nn-admin`, as lot 278's `--for-installer`
-  already names it. An operator opening a window by hand names their own
-  shell (`--tree-root $$`): through `sudo` the parent would be `sudo`
-  itself, whose exit closes the window at once (below).
-- **The checks at the grant.** The agent arms nothing it cannot pin
-  down:
-  - it reads the requester from the admin socket (`SO_PEERCRED`);
-  - it walks its parents in `/proc`, start by start, up to the signed
-    root, and refuses a root that is not on that line;
-  - it refuses PID 1, a kernel thread, the agent's family, and a root
-    whose line holds a traced process (`TracerPid`);
-  - it opens a pidfd of the root, reads the start again, and compares it
-    with the signed one.
-- **Arming.** The kernel half is written in one order: the members of
-  the line (root to requester, with their starts), then the grant
-  (`FS_GRANT_V2`: session, the grant's number, deadline, root). A
+**The request.**
+
+- **`install.sh` and the scriptlets.** `nn-admin` reads its parent's
+  start from `/proc` and signs both values
+  (`OperationCode::TrustedInstallerTreeGrant`,
+  `TrustedInstallerTreeGrantExtra`). The root is the requester's parent:
+  the script that runs `nn-admin`, as lot 278's `--for-installer`
+  already names it.
+- **A manual window: only `nn-admin window-run -- <command>`.** The root
+  is that `nn-admin` process. It forks the command, waits for it, and the
+  window ends when it exits. No form roots a window at an interactive
+  shell.
+  - The command's stdin is `/dev/null`, unless `--interactive` is given.
+    The signed grant record says which.
+  - An interactive window is marked degraded. Its input comes from a
+    terminal, and the terminal's other end is outside the tree: a pty
+    master that sshd, tmux or screen holds, and root's `TIOCSTI`.
+  - `--interactive` is refused where `dev.tty.legacy_tiocsti` is 1, or
+    is absent (kernels before 6.2). Where it is 0, the degraded mark
+    stays, because the sysctl does not bind a `CAP_SYS_ADMIN` caller.
+  - Inside the window, an outsider's `TIOCSTI` or `TIOCLINUX` on a
+    member's terminal is refused (`file_ioctl`), signed.
+- **The admission policy.** The agent admits only these roots:
+  - an `nn-admin` in `window-run`: the installed `nn-admin`, by its
+    image's `(dev, ino)`;
+  - our `install.sh`: a shell started with that script, whose digest
+    the signed request names, compared with the file the root has open;
+  - a package manager (`dpkg`, `rpm`, `dnf`, `apt`) running a scriptlet
+    of our package: the root runs the packaged binary of that manager,
+    and the requester is our package's scriptlet.
+- **Refused roots**, each signed with its reason:
+  - PID 1, a kernel thread, the agent's family;
+  - a line that holds a traced process;
+  - a session daemon or a subreaper (sshd, cron, a terminal multiplexer,
+    `systemd --user`, any `PR_SET_CHILD_SUBREAPER` process): anything
+    that forks for others. The allowlist above refuses them, not a
+    denylist;
+  - a root or requester outside the initial pid, user or mount
+    namespace;
+  - a line with a seccomp mode other than 0. A filter, a user-notify
+    supervisor in particular, can change what the members' calls do.
+- **The checks run against pidfds.**
+  - The requester comes from the socket: `SO_PEERPIDFD` from 6.5. Before
+    6.5, the `SO_PEERCRED` pid is opened as a pidfd, and its start is
+    compared.
+  - The agent opens a pidfd for each process on the line, from the
+    requester up to the signed root. Through it, it reads each one's
+    parent, start, tracer, seccomp mode and namespaces.
+  - It then checks that every pidfd still names a live process.
+  - It refuses a root that is not on that line, or whose start differs
+    from the signed one.
+- **Arming, and the kernel's own test.** The kernel half is written in
+  this order:
+  1. the members of the line (root to requester, with their starts);
+  2. a second read of the tracer and the seccomp mode of every process on
+     the line. A tracer found now clears those members, and the grant is
+     refused;
+  3. the grant (`FS_GRANT_V2`: session, generation, deadline, root).
+
+  The kernel does not trust the walk alone. Every lift test also reads
+  the caller's own ptrace state, seccomp mode and namespaces. A member
+  that is traced, filtered or in another namespace gets no lift, and it
+  leaves the tree, signed. So a tracer that attaches between the walk and
+  the grant gets nothing, and neither do the children it follows. A
   process forked by a member between the walk and the arming is outside
   the tree, which is the fail-closed side.
 
 **The members.** `TREE_MEMBERS` is a pinned hash keyed by tgid
-(`wire::TreeMember`: start, the grant's number, flags). A pinned
-`sched_process_fork` program does the inheritance. When the parent's
-entry matches the grant in force (`wire::FsGrantV2::lifts_for`: the
-same grant number, the same start, the window open), it writes the
-child's entry. A pinned exit program removes the entry of a thread
-group's leader. Pinned, because an upgrade stops the old agent while
-the window must go on (lot 2.4 keeps the old pins until the new
-programs are attached).
+(`wire::TreeMember`: start, generation, flags).
+
+- **Inheritance.** A pinned `sched_process_fork` program writes the
+  child's entry when the parent's entry matches the grant in force
+  (`wire::FsGrantV2::lifts_for`: the same generation, the same start,
+  the window open).
+  - The parent is the forking process, `bpf_get_current_pid_tgid() >> 32`.
+    The tracepoint's `parent_pid` is a thread id.
+  - A new thread (`CLONE_THREAD`) gets nothing written: it shares its
+    process's entry, and an entry written for it would overwrite the
+    leader's.
+  - The tracepoint runs before the child is first woken, so the child
+    never runs without its entry. An entry is written only for a fork
+    that succeeded.
+- **Removal.** The entry leaves when its thread group dies (the last
+  thread's exit), and again at the leader's `task_free`. So an entry never
+  outlives its process.
+- **Pinned**, because the window must go on while an upgrade stops the
+  old agent (lot 2.4 keeps the old pins until the new programs are
+  attached).
 
 | Event | Membership |
 |---|---|
 | `fork`, `vfork`, `clone` of a member | the child is a member (if the map has room) |
-| `clone(CLONE_THREAD)`, an io_uring worker | same tgid, so the same entry, but an io_uring worker (`PF_IO_WORKER`) never gets the lift (section 4) |
-| `execve` of a root-owned image, not writable by group or others | kept: the installer runs the release's files and the system's tools |
-| `execve` of any other image (not root's, group or other writable, no name: memfd, deleted, `O_TMPFILE`) | the process leaves the tree, signed |
+| `clone(CLONE_THREAD)`, an io_uring worker | the same process, the same entry; an io_uring worker (`PF_IO_WORKER`) never gets the lift (section 4) |
+| `execve`, or a mapping with `PROT_EXEC` | judged by the exec and mapping rule (section 4): kept, or out of the tree, signed |
+| the member becomes traced, gets a seccomp filter, or enters another namespace | it leaves the tree, signed |
 | `setsid`, `setpgid`, a new session or process group | no effect: membership follows the fork, not the session |
 | double fork, reparenting to a subreaper or to PID 1 | no effect: a daemon a member forked stays a member until the window ends |
 | a process PID 1 starts (`systemctl start`, a unit the scriptlet restarts) | not a member: its parent is PID 1 |
-| the root's exit | the window ends for every member (in the kernel: the exit program closes the grant; in the agent: the pidfd) |
-
-The window ends at the earliest of four events: its deadline, its
-root's exit, its explicit close, and the next start of the agent (which
-zeroes the grant and rolls a new session, as today). An installer that
-finishes leaves no window behind. A daemon it double-forked loses the
-lift with it.
+| the root's exit, or the root leaving the tree | the window ends for every member (section 5) |
 
 **Task-local storage (aya 0.16).** This is not used now. aya-ebpf 0.3
 defines no task-storage map: its BTF maps are inode, socket and cgroup
@@ -3378,36 +3440,77 @@ pinned maps use. Its capacity and its full-map behaviour are explicit
 at this again when aya grows a task-storage map: a root keyed by its
 pidfd is the attractive part.
 
-### 2. Work done by PID 1 on the tree's behalf
+### 2. PID 1 is no deputy
 
 `systemctl` asks PID 1, and PID 1 acts. The kernel cannot see whose
-D-Bus or private-socket request PID 1 is serving: systemd does not tag
-its writes or its signals with the requester. So a window cannot bind
-PID 1's actions to the tree by the caller. It binds them by the object,
-by a lease a member arms, and by the window's span. Nothing else that
-PID 1 got from the host-wide window is lifted for it.
+request PID 1 serves: a D-Bus call, a connection to its private socket,
+a dependency of another unit (`Conflicts=`, `PartOf=`), an `isolate`.
+systemd does not tag its writes or its signals with the requester. So a
+window can give PID 1 nothing per caller, and the per-tree window gives
+PID 1 nothing at all. Two rules stay as they are outside any window: the
+SIGTERM of the final shutdown (`systemd-shutdown`, lot 2.0), and the
+unit cgroup housekeeping of lots 273 and 273b.
+
+**The controlled stop.** PID 1's stop signals to the agent and the
+watchdog are refused inside a window as outside it, signed (outsider
+class, section 7). No lease is armed for a signal, and a tree window
+never arms `KILL_GRANT`. A stop that PID 1 queues for any reason (a
+conflicting unit, an isolate) therefore ends in refused signals, as
+outside a window today.
+
+A member stops or restarts the agent through the agent itself:
+
+1. It asks over the admin socket for a controlled stop or a controlled
+   restart (a new admin verb, lot 2.3).
+2. The agent authenticates the request by three facts: the peer's pidfd
+   (as at the grant), its member entry, and the window's generation. A
+   process outside the tree cannot ask.
+3. The agent signs a record that names the member, in the window ring
+   (section 7). It drains and signs its pending records.
+4. For a stop, it writes the watchdog's stand-down, and exits. The
+   stand-down names the window's grant and generation, and the watchdog
+   verifies it against `admin.pub`, as it verifies the shutdown marker
+   today (lot 2.5). In an uninstall both roles stand down. In an upgrade
+   the watchdog stays up (section 5, the agent-absent grace).
+5. For a restart, it exits with the controlled-restart reason, and the
+   watchdog starts the unit again at once.
+
+**Single-use leases for PID 1's file actions.** The one protected act
+PID 1 must perform for the flows is on our units' enablement links
+(`*.wants/northnarrow-*.service`, protected from 2.3). It happens at
+uninstall, and after a layout migration or a rollback. For
+each link, a member asks the agent for a lease:
+
+- bound to one exact link (its directory's inode and its name), to one
+  action (create or remove), and to the window's generation;
+- consumed by its first use, and void after a few seconds at most;
+- a small number per window (the flows need one per link);
+- each use signed (PID-1-lease class), with the member that armed it.
+
+Any other action of PID 1 on our units' names gets no lease, and is
+refused from 2.3, in a window too: `mask`, `revert`, `preset`, a link to
+another target, a drop-in.
 
 | PID 1 action in the flows | Needed by | Per-tree window |
 |---|---|---|
-| stop signals to the agent and the watchdog (`KillGrant::STOP_SIGNALS`) | `install.sh --upgrade`, `--package-stop`, `uninstall.sh`, `systemctl restart` | delegated: `KILL_GRANT`, layout unchanged, armed by a member's request for a short lease (below); a stop let through is "requested" for lot 2.0's stop judgement |
-| removal or creation of the units' enablement links (`.wants`, `.requires`; refused from 2.3) | `systemctl disable` in `prerm` and `uninstall.sh`; `enable` after a layout migration | delegated: the same lease, for those links only |
+| stop signals to the agent and the watchdog | stopping the units in an upgrade, an uninstall, `--package-stop` | not lifted: the controlled stop replaces it. The final shutdown's SIGTERM is clean (lot 2.0) |
+| creation or removal of the units' enablement links (`.wants`, `.requires`) | `systemctl disable` in `uninstall.sh`; `enable` after a layout migration or a rollback | one single-use lease per link |
 | `rmdir` of a unit's cgroup, its `trusted.*` xattrs, the thaw (`0`) of `cgroup.freeze`, a limit put back to its registered value | every start and stop | unchanged: allowed outside any window (lots 273, 273b) |
-| `set-property` of a running unit (a limit to a new value, its `system.control` drop-in) | the operator's maintenance (INSTALL_UPGRADE_UNINSTALL.md, the units' limits) | not delegated. The way inside a window: a member writes the drop-in, then `daemon-reload` and a restart. The restarted unit's fresh cgroup takes the new values before the agent registers them |
+| `set-property`, or a `daemon-reload` that applies a changed limit to a running unit | the operator's maintenance (INSTALL_UPGRADE_UNINSTALL.md, the units' limits) | not lifted. The way: a controlled stop, the drop-in written by a member, `daemon-reload`, then the start. The fresh cgroup takes the new values before the agent registers them |
 | freeze, a move of the agent's processes, `cgroup.kill` | no flow (lab case C76) | refused for PID 1 too |
 | a module or BPF load, a sysctl, a mount over the agent's paths in the host's namespace, made by a unit PID 1 starts | not the installer's work | refused as outside a window, except what lot 304's loaders and the mount guard's own rules let through today |
+| PID 1's manager configuration; its global environment | no flow | the configuration is frozen against outsiders during the window, the environment is watched (section 3) |
 
-**The member-armed lease.** A member asks the agent, over the admin
-socket, for a PID-1 action class on the agent's units. The agent
-authenticates the request by membership, read from the kernel's map for
-the peer's `SO_PEERCRED` pid and start. Nobody outside the tree can ask.
-The agent then arms the class for a few seconds, and each action PID 1
-performs under it is signed (Low), with the lease it went through. 2.3
-arms `KILL_GRANT` for the window's span, as today, until the scripts
-ask for the lease; the scripts take it in 2.4 (`install.sh`) and 2.3/2.4
-(`uninstall.sh`, the scriptlets). The residual: a root process outside
-the tree that asks systemd for the same action, on the same unit, inside
-a lease a member just armed, gets it. The outcome is the one the
-installer was about to cause, and the act is signed.
+**The call sites that change** (2.3 for `uninstall.sh`, 2.4 for
+`install.sh` and the package scriptlets):
+
+| Site | Today | From 2.3/2.4 |
+|---|---|---|
+| `install.sh` `stop_nn_unit`, `uninstall.sh` `stop_nn_unit` | `systemctl kill` (SIGTERM, then SIGKILL) inside the window | the controlled stop |
+| `uninstall.sh`: the disable after the stop, and `finish_at_boot` | `systemctl disable` | one lease per link while the hooks are live; plain when they are not |
+| `install.sh` `nn_rollback_resume`; the layout migration's re-enable in `configure` | `systemctl enable` | one lease per link while the hooks are live |
+| `prerm.sh` | `systemctl disable`, after `--package-stop` | unchanged: `--package-stop` has dropped the pins and exited, so no hook is left to lift. 2.4 revisits it if the pins stay across the unpack |
+| `postinst.sh`, `postrm.sh`, `install.sh`'s `enable --now` | `systemctl start`, `enable --now` | unchanged: a start is no protected act, and a fresh install meets no hook |
 
 **The flows.**
 
@@ -3416,71 +3519,164 @@ installer was about to cause, and the act is signed.
 - **`install.sh --upgrade`:**
   - the window is rooted at the script, as `--for-installer` does
     today;
-  - stopping the units uses the lease;
+  - the controlled stop stops the units;
   - the pin root is removed by the script (a member);
   - staging and switching the files is the script's own work;
   - the new agent is started by PID 1 (not a member). Its start ends the
     window (boot-zero);
   - a rollback opens a window with the new agent's socket, as today.
   - With lot 2.4 the old pins stay until the new programs are attached.
-    The file switch then happens under live hooks, by the script, and
-    the window that the old agent armed goes on in the kernel after its
-    stop, until the new agent's start.
+    The script then switches the files under live hooks, and the window
+    goes on in the kernel after the old agent's stop, until the new
+    agent's start or the agent-absent grace (section 5).
+  - The release's binaries that a member runs must pass the exec rule
+    (section 4). The script therefore runs them from the root-owned copy
+    it stages, never from a directory a user unpacked; 2.4 checks each
+    exec of the flows against the rule.
 - **Stale pin root** (`start_agent_for_window`): the installed agent is
   started for the window, the window is rooted at the script, and the
   rest is as above.
-- **`uninstall.sh`:** the window is rooted at the script. Stopping the
-  units and `systemctl disable` use the lease. The pin root and then the
-  files are the script's.
+- **`uninstall.sh`:**
+  - the window is rooted at the script;
+  - the controlled stop stands both roles down;
+  - `systemctl disable` uses one lease per link;
+  - the pin root and then the files are the script's.
+  - `finish_at_boot` covers a wedged agent, whose window cannot open: it
+    disables the units for the next boot. With the hooks live and no
+    window, PID 1's removal of the links is refused, so its way out is
+    the kernel command line's `systemd.mask=` for both units, or a
+    recovery boot. Its message says so.
 - **`.deb`:**
   - `preinst` (install or upgrade) and `prerm` (remove) run `install.sh
     --package-stop`. With `NN_GRANT_KEY` the script opens the window for
     its own tree, which holds every protected act while the pins are
-    dropped before the unpack, as today. `prerm` then runs `systemctl
-    disable` (the lease).
+    dropped before the unpack, as today. `prerm`'s `systemctl disable`
+    then meets no hook.
   - `postinst configure` starts the units. No protected act is left:
     the pins went in `preinst`.
   - `postrm` runs `uninstall.sh --package` after the hooks are gone.
   - With lot 2.4 keeping the pins across the unpack, dpkg itself writes
     the protected files. The root must then be the package manager's
-    process: the scriptlet's parent, `$PPID` of `preinst`. And a
+    process: the scriptlet's parent, `$PPID` of `preinst`. A
     `configure` that apt runs from a second dpkg process is outside that
-    tree: 2.4 keeps the package flow's protected acts inside the unpack's
-    dpkg, or drops the pins for it, as today.
+    tree, so 2.4 keeps the package flow's protected acts inside the
+    unpack's dpkg, or drops the pins for it, as today.
 - **`.rpm`:** `%pre` and `%preun` call the same `--package-stop`.
   `%post`, `%postun` and `%posttrans` act after it. dnf runs the
   scriptlets of a whole transaction as its own children, so a window
   rooted at the package manager covers every package of that
-  transaction: declared.
-- **A window the operator opened before the package command:** it is
-  rooted at the operator's shell (`--tree-root $$`). The package
-  command run from that shell (`sudo apt …`, `dnf …`) is a descendant,
-  forked after the grant: a member. A package command run from another
-  terminal is not.
+  transaction: declared, and the grant record lists the transaction's
+  packages.
+- **A package command inside a manual window:** `nn-admin window-run --
+  apt upgrade` (or `dnf upgrade`). The package command is the root's
+  child, so it is a member. A package command run from another terminal
+  is not.
 
 ### 3. What a process outside the tree gets during a window
 
 The same refusal it gets outside a window: `EPERM`, and the record of
-that refusal, now marking the window (`FsProtectDenialRaw::window =
-DENIAL_WINDOW_OUTSIDER`, lot 2.3). These are the classes the window
-lifts today, each refused to non-members:
+that refusal, now in the outsider class (`FsProtectDenialRaw::window`,
+section 7). These are the classes the window lifts today:
 
-| Class (hook) | Refused to a non-member inside a window |
+| Class (hook) | Inside a window |
 |---|---|
-| the protected files: unlink, rmdir, rename, setattr, flag ioctls, xattrs, write-open and write, the key's read-open, new entries in the agent's directories (`inode_protect`) | yes |
-| ptrace and the memory views of the agent's processes; attach to PID 1 (`ptrace_check`) | yes; the attach to PID 1 inside a window (lab case C95b) and the signal through a file's owner (C112w) are dropped by 2.3 |
-| the guarded sysctls (`sysctl_guard`), the switch files and the SysRq trigger (`cgroup_files`) | yes |
-| the units' cgroups: limits, `cgroup.kill`, freeze, moves (`cgroup_files`, `cgroup_guard`) | yes (C76) |
-| another process's limits and priorities (`task_limits`) | yes |
-| module loads, kexec (`module_load`) | yes |
-| mounts on, over or below the agent's paths, the pin directory's lock (`mount_guard`) | yes |
-| BPF: the refused program types, the agent's maps and programs, attach targets, the content judge, held loads (`bpf_defense`) | yes; a load by a member is still held after the window |
+| the protected files: unlink, rmdir, rename, setattr, flag ioctls, xattrs, write-open and write, the key's read-open, new entries in the agent's directories (`inode_protect`) | lifted for members; refused to outsiders. The key files and their directories stay refused to members too (section 6) |
+| ptrace and the memory views of the agent's processes; attach to PID 1 (`ptrace_check`) | refused to everyone, members included: no flow uses them. The attach to PID 1 (lab case C95b) and the signal through a file's owner (C112w) are dropped by 2.3 |
+| the guarded sysctls (`sysctl_guard`), the switch files and the SysRq trigger (`cgroup_files`) | lifted for members; refused to outsiders |
+| the units' cgroups: limits, `cgroup.kill`, freeze, moves (`cgroup_files`, `cgroup_guard`) | lifted for members; refused to outsiders (C76) |
+| another process's limits and priorities (`task_limits`) | lifted for members; refused to outsiders |
+| module loads, kexec (`module_load`) | lifted for members; refused to outsiders |
+| mounts on, over or below the agent's paths, the pin directory's lock (`mount_guard`) | lifted for members, except the key files' directories and their ancestors (section 6); refused to outsiders |
+| BPF: the refused program types, attach targets, the content judge, held loads (`bpf_defense`) | lifted for members (a member's load is still held after the window); refused to outsiders |
+| BPF: a handle on the agent's maps or programs (`bpf_defense`) | refused to everyone, members included: the flows only unlink the pins |
 
-**Context uses.** A few callers do not lift anything. They describe the
-host's state: a role's exit inside a window (`ROLE_MARK_IN_WINDOW`), a
-fresh instance's record at Low, the `*_WINDOW` records of what a window
-let through. They read the host-wide `window_open()`. The records of
-what a window lets through name the member they let through.
+**Judged at each operation, or once at acquisition.** A lift that is
+judged at each operation ends with the window. A lift that is judged
+once, when the process acquires something, would outlive it. So the
+window does not lift the second kind, or the agent sweeps its effects at
+the close.
+
+| What is lifted | Judged | Inside a window |
+|---|---|---|
+| a write, setattr, xattr, unlink, rename or link of a protected file (`file_permission`, `inode_*`) | at each operation | lifted for members. A descriptor kept past the window, or passed out of the tree, is refused at its next use |
+| a shared writable mapping of a write-protected file | once, at `mmap` | refused inside a window too (lot 2.2): a store into a page is no system call |
+| a ptrace attach, `/proc/<pid>/mem`, `pidfd_getfd`, `process_vm_*` on the agent | once, at acquisition | never lifted |
+| a handle on the agent's BPF maps or programs | once, at acquisition | never lifted |
+| a mount, a loaded module, a sysctl value, a held load, a drop-in of our units | the effect persists | lifted for members. At the close the agent sweeps them against the window's record (mounts on our paths, modules, guarded sysctls, our units' drop-ins, held loads) and signs what remains (2.3) |
+
+**The system's code is frozen.** While a window is open, a process
+outside the tree cannot:
+
+- write-open, truncate, rename over, unlink, link, or change the mode,
+  owner or xattrs of these objects, nor create them where they do not
+  exist yet:
+  - root-owned executables, shared libraries and interpreter scripts in
+    the system paths: the default `PATH` directories (`/usr/local`
+    included), the loader's search directories, the interpreters'
+    library directories;
+  - the loader's configuration: `/etc/ld.so.preload`, `ld.so.cache`,
+    `ld.so.conf`, `ld.so.conf.d`;
+  - the package managers' hook, plugin and maintainer-script directories
+    (`apt.conf.d`, `dpkg.cfg.d`, `/var/lib/dpkg/info`, the dnf plugin
+    directories and their configuration, rpm's macro directories);
+  - PID 1's manager configuration: `system.conf` and `system.conf.d`, in
+    `/etc`, `/run` and `/usr/lib`;
+- mount on or over any of them;
+- register or change a `binfmt_misc` handler.
+
+Each attempt is `EPERM` and a signed record (outsider class). So nothing
+outside the tree can replace what the tree will execute, load or be
+configured by, while the window lasts. The agent marks those directories
+at the grant. The hooks test an outsider's mutation with a bounded walk
+up its parent directories, and only while a window is open. Members, and
+every process outside a window, pay one lookup: the window test.
+
+**PID 1's global environment.** The kernel cannot attribute a
+`SetEnvironment` call. PID 1 receives it over the system bus or its
+private socket and keeps it in memory, with no file to refuse. So this
+one item is detected rather than refused:
+
+- the agent reads PID 1's environment at the grant, at each controlled
+  stop and lease, and at the close;
+- a change closes the window, signed High;
+- our units already unset the loader and allocator variables
+  (`UnsetEnvironment=` in both units), so a variable set that way does
+  not reach the agent.
+
+**Code planted before the window.** The freeze binds what changes during
+the window. Before it arms the grant, the agent also checks what was
+planted before: it compares the package managers' hook and plugin
+directories and the loader's configuration with the package database
+(dpkg's `md5sums`, rpm's file digests). A file there that differs, or
+that no package owns, is named in the signed grant record, High, before
+any member runs, and `nn-admin window-run` prints it.
+
+- **The cost:** reading and hashing those files at each grant, typically
+  a few hundred small files. 2.3 measures it on the lab guests.
+- **The limit:** the check is only as strong as the database, which root
+  can also edit. A file planted with a matching database entry passes.
+  This stays declared until S12 (code origin).
+
+**Members are protected too.** During a window, a process outside the
+tree cannot:
+
+- signal a member (`task_kill`: `kill`, `pidfd_send_signal`, and a
+  signal through a file's owner, `file_send_sigiotask`);
+- ptrace a member in either mode, READ or ATTACH. This covers
+  `/proc/<pid>/mem`, `fd`, `environ` and `maps`, `process_vm_*`,
+  `pidfd_getfd` and `kcmp`, which all ask the ptrace check;
+- open a perf event on a member: `perf_event_open` on its pid asks the
+  ptrace check too, and lot 2.2's `perf_event_open` hook covers the
+  rest;
+- pass an io_uring ring or a descriptor of a protected file into the
+  tree. The tree cannot pass one out either (`file_receive`).
+
+Each refusal is signed (outsider class). READ refusals blind the tools
+that read every process (`lsof`, `needrestart`, `systemd-coredump`,
+journald's `_EXE`) for the members, during the window. journald's
+packaged identity stays quiet, as it does today for the agent's own
+processes (`PTRACE_READ_QUIET`): it reads every process that logs. Its
+reads are still refused.
 
 **The agent's own half.** NN-L-FIM-009's downgrade for the agent's
 units, and R009's Low for the installer's execs, follow the same tree:
@@ -3488,70 +3684,164 @@ the writer or the executing process must be a member. R009 already
 judges by lineage from the grantee (lot 278); FIM-009's downgrade, which
 today is scoped by path, is scoped by writer too.
 
-### 4. Races and reuse
+### 4. Exec, mapping, descriptors and races
 
-- **Pid reuse.** Every entry carries the start, and the kernel compares
-  the caller's own start at each check, never the pid alone. A reused
-  tgid is a different process: its fork overwrites the stale entry and
-  takes the lift only if its parent is a member. The agent keeps the
-  root's pidfd for the window's life.
-- **A member executes a foreign binary.** An image that is not
-  root-owned, or is writable by group or others, or has no name, takes
-  the process out of the tree (the table in section 1). A root-owned
-  image that root planted before the window runs as a member: declared
-  residual. Three limits bound it:
-  - no window lifts the key files (section 6);
-  - the role guard and its marks: a planted binary cannot become the
-    agent (lot 2.2);
-  - R009 still records the tree's execs from a home or `/tmp`.
-- **Descriptors.** The window is checked at each operation, by the
-  process performing it.
-  - A write goes through `file_permission`, already a deny hook for
-    `FS_PROTECT_WRITE` inodes. So a descriptor a member opened and then
-    passed (SCM_RIGHTS) is refused at the receiver's write, and one kept
-    past the window is refused after it.
-  - A shared writable mapping of a WRITE-protected inode is refused at
-    its mmap, inside a window too (lot 2.2): a store into a page is
-    no system call.
-  - `pidfd_getfd`, `/proc/<pid>/fd`, `process_vm_*` and
-    `/proc/<pid>/mem` on a member go through the ptrace access check.
-    2.3 refuses that check to a non-member while the target is a member
-    of an open window, signed.
-- **ptrace of a member.** It is refused from outside the tree (above).
-  A line that is already traced is refused a grant. A member may trace
-  another member (`strace` inside the tree).
-- **io_uring.** The lift is never given to an io_uring worker or SQPOLL
-  thread (`PF_IO_WORKER`): they run requests that any process sharing
-  the ring queued. A request completed inline runs in the submitter's
-  own context and is judged as that process. An installer does not
-  write the agent's files through io_uring.
+**The exec and mapping rule.** A member leaves the tree, signed
+(exec-evicted class), when it executes a file, or maps one with
+`PROT_EXEC` (`mmap_file`, and `file_mprotect` when a mapping gains
+`PROT_EXEC`), and that file is:
 
-### 5. Fail-closed behaviour
+- not owned by root of the initial user namespace (through an idmapped
+  mount, the owner the mount gives);
+- writable by its group or by others;
+- a memfd, deleted, or an `O_TMPFILE` (it has no name);
+- on FUSE, on a network filesystem, on an idmapped mount, or on a
+  superblock whose user namespace is not the initial one;
+- in a world-writable or sticky directory (`/tmp`, `/var/tmp`,
+  `/dev/shm`, any other).
 
-- **A full member map** (`TREE_MEMBERS_MAX`): the new child is outside
-  the tree. Its lifted operations are refused, the refusal says why,
-  and the count is in `nn-admin status` (`left_outside_full`). The
-  install fails visibly and can be retried; it never runs with a wider
-  window.
-- **A missing hook.**
-  - If the fork or exit program is not attached, no child would join
-    and no entry would leave. The agent then refuses tree grants, signed
-    (`window_tree_unavailable`), with the reason. It never falls back to
-    the host-wide window. The way out is the documented offline path:
-    disable the units, reboot (bpffs does not survive it), install.
+A member also leaves when it executes with a dangerous loader or
+interpreter variable in its environment: `LD_*`, `BASH_ENV`, `ENV`,
+`PYTHONPATH`, `PYTHONSTARTUP`, `PERL5LIB`, `PERL5OPT`, `GCONV_PATH`, and
+the others our units unset. The kernel reads the environment up to a
+bound, and an environment longer than the bound counts as dangerous.
+
+The exec rule is judged at `bprm_committed_creds`, on the final file
+after `binfmt_misc` and the `#!` line, and also on a `#!` script's own
+file. So a script is judged on its interpreter and on itself, and a
+`binfmt_misc` handler on itself. `ld.so <file>` is judged on the file
+the loader then maps. What stays a member is the release's staged files
+and the system's tools: root-owned, not writable by others, on a local
+filesystem, in a directory that is neither world-writable nor sticky,
+with a clean environment.
+
+The rule binds what is executed and mapped. An interpreter that reads a
+script or a module as data (`sh file`, `python file`, an `import`) is
+not judged on that file. Inside the frozen paths, no outsider changes it
+during the window. Outside them, it is declared.
+
+**Pid reuse.** Every entry carries the start, and the kernel compares
+the caller's own start at each check, never the pid alone. A reused
+tgid is a different process: its fork overwrites the stale entry and
+takes the lift only if its parent is a member. An entry leaves with its
+process (section 1), so a reuse also needs a removal that failed. The
+agent keeps the root's pidfd for the window's life.
+
+**Descriptors.** The window is checked at each operation, by the
+process performing it.
+
+- A write goes through `file_permission`, already a deny hook for
+  `FS_PROTECT_WRITE` inodes. So do `fallocate`, a clone or dedupe of a
+  range, and `copy_file_range`. A truncate goes through `inode_setattr`
+  on every supported kernel. So a descriptor that a member opened and
+  then passed is refused at the receiver's write, and one kept past the
+  window is refused after it.
+- A shared writable mapping of a write-protected inode is refused at its
+  `mmap`, inside a window too (lot 2.2).
+- `pidfd_getfd`, `/proc/<pid>/fd`, `process_vm_*` and `/proc/<pid>/mem`
+  on a member go through the ptrace check, refused to an outsider
+  (section 3).
+- `file_receive` keeps io_uring rings and protected files from crossing
+  the tree's boundary, in either direction (section 3).
+
+**ptrace.** An outsider is refused in either mode (section 3). A line
+that is already traced is refused a grant (section 1). A member that
+becomes traced, even by another member, gets no lift and leaves the tree.
+PID 1's attach is refused inside a window too.
+
+**io_uring.** The lift is never given to an io_uring worker or SQPOLL
+thread (`PF_IO_WORKER`): they run requests that any process sharing
+the ring queued. A request completed inline runs in the submitter's
+own context and is judged as that process, whatever personality it
+registered. The lift test fails closed when the running kernel's
+`PF_IO_WORKER` bit cannot be resolved (section 8). A ring cannot cross
+the tree's boundary (`file_receive`). An installer does not write the
+agent's files through io_uring.
+
+### 5. Lifecycle and fail-closed behaviour
+
+- **One window at a time.** A grant while a window is open is refused,
+  signed, whoever signed it. The operator closes the first window, or
+  waits for it to end.
+- **The generation.** A 64-bit number that the agent raises by one at
+  each grant, never reused within a boot (the session nonce separates
+  boots). Every member entry, lease and slot carries it, and a hook
+  lifts only when the entry's generation is the grant's.
+- **One close voids everything.** A window closes at its explicit close,
+  its deadline, its root's exit (or the root leaving the tree), the next
+  start of the agent, a suspend, or the agent-absent grace. Whichever
+  comes first marks the grant closed, and with it every entry, lease and
+  slot of that generation, at once. The agent clears them afterwards, to
+  free the room.
+- **Who may close.** The root, a member, or the signer (a signed close).
+  An outsider's request to close is refused, signed.
+- **Deadlines on `CLOCK_BOOTTIME`.** The hooks read the deadline with
+  `bpf_ktime_get_boot_ns`, and the agent with `CLOCK_BOOTTIME`, so time
+  spent in suspend counts. A suspend also closes the window: the agent
+  sees the suspend begin (section 8), and the close is signed.
+- **The agent-absent grace.** The agent writes a heartbeat into the
+  grant slot every few seconds. Every lift test also requires the
+  heartbeat to be younger than N = 60 s. So a window whose agent is gone
+  (stopped for an upgrade, crashed, stalled) closes itself in the kernel
+  60 s after the last heartbeat.
+  - The no-gap upgrade of 2.4 finishes its file switch within that time.
+    The new agent's start ends the window anyway (boot-zero).
+  - In an upgrade the watchdog stays up. If no agent has come back when
+    the grace ends, it starts the agent again from the last binary that
+    passed its health check (2.4 keeps that copy; 2.5 the watchdog's
+    side), signed.
+- **Renewal.** A renewal is a signed request that names the same root
+  and the window's generation. It moves the deadline only. It never goes
+  past the maximum window (600 s), counted from the window's first grant,
+  never re-roots the window, and never lengthens a lease. A new
+  generation means a new window.
+- **The members' map.** The fork program writes entries only while the
+  window is open. An entry is removed at its thread group's death and at
+  the leader's `task_free`, and the agent empties the map at each close.
+  - An occupancy above three quarters of `TREE_MEMBERS_MAX` is a signed
+    alarm.
+  - A full map leaves the new child outside the tree. Its lifted
+    operations are refused, the refusal says why, and the count is in
+    `nn-admin status` (`left_outside_full`). The install fails visibly
+    and can be retried; it never runs with a wider window.
+- **A missing hook.** If a hook or facility of section 8's manifest is
+  missing on the running kernel, the agent refuses tree grants, signed
+  (`window_tree_unavailable`, naming it). It never falls back to a
+  host-wide window. The way out is a reboot with both units masked on
+  the kernel command line (`systemd.mask=`), or a recovery boot.
+  bpffs does not survive the reboot, so the hooks are gone, and the
+  install or the removal runs with nothing left to lift.
   - A deny hook that is not attached is the existing degradation: its
     protection is absent with or without a window.
   - A members-map or grant lookup that fails in a hook gives no lift.
 - **The agent restarts or stops during a window.** Its next start zeroes
-  `FS_GRANT_V2`, rolls a new session and empties `TREE_MEMBERS`. The old
-  entries also fail the session and grant-number test on their own. A
-  member then meets refusals, and the installer rolls back or stops
-  (the scripts already handle a refused write). An agent stopped by the
-  upgrade itself leaves the kernel window running until its deadline or
-  its root's exit, enforced by the pinned programs, which is what the
-  no-gap upgrade of 2.4 needs.
-- **Records.** A refusal whose record the ring cannot take is still a
-  refusal (the existing rule).
+  `FS_GRANT_V2`, rolls a new session, and empties `TREE_MEMBERS` and the
+  leases. The old entries also fail the session and generation test on
+  their own. A member then meets refusals, and the installer rolls back
+  or stops (the scripts already handle a refused write).
+
+**The host-wide grant is retired.** From 2.3, each of its uses becomes
+this:
+
+| Use of the host-wide window today | From 2.3 |
+|---|---|
+| the plain grant, an operator's manual window | `nn-admin window-run -- <command>`. The agent refuses the plain grant's operation, signed |
+| `--for-installer` (`install.sh`, `uninstall.sh`, `--package-stop`) | the tree grant, rooted at the script (the requester's parent) |
+| a rollback's window; the stale pin root's start (`start_agent_for_window`) | the tree grant, rooted at the script |
+| `KILL_GRANT`, armed for the window's span; the signal through a file's owner (`sigio_guard`) | the controlled stop. Nothing is armed, and the file-owner exception is dropped (C112w) |
+| PID 1's enablement links | single-use leases |
+| the ptrace attach to PID 1 | dropped (C95b) |
+| `override_active()`, for every caller | the same function, for the members only |
+| the "a window is open" judgements: a role's exit mark (`ROLE_MARK_IN_WINDOW`), a fresh instance at Low, a worker's or the watchdog's exit, the stop-signal judgement, FIM-009's downgrade and R009's Low, the pause of the agent's own drop-in round | judged by who acted. A member's act, the controlled stop's record or a lease's use is judged as a window's act, as today. Anything else is judged as outside a window (section 7) |
+| the deny self-test's and the BPF cross-view's window checks | unchanged in meaning. They describe the agent's own work, and soften no record of another process |
+
+- **`nn-admin` never falls back.** When an agent that knows the tree grant
+  refuses it, the refusal is final: `nn-admin` reports it and exits
+  non-zero. The one other path is an agent that predates the tree grant,
+  told by the protocol version it announces: an upgrade from a release
+  that has only the host-wide window. That old agent's window is
+  host-wide, which is its own behaviour, until the new agent starts.
+  Declared.
 
 ### 6. The key files and lab case C76
 
@@ -3560,6 +3850,12 @@ today is scoped by path, is scoped by writer too.
   - No window lifts their write, rename or removal, nor the key's read,
     for anyone but the agent's family, members included
     (`DENIAL_WINDOW_KEPT`). The key rotation is the family's own path.
+  - **Their directory, and its ancestors** (`/etc/northnarrow`, `/etc`).
+    The agent loads `admin.pub` by path at its start, so keeping the
+    inodes is not enough. Inside a window too, the rename, exchange and
+    removal of those directories, and a mount on or over any of them,
+    are refused to everyone but the agent's family, members included.
+    The flows never rename or mount them.
   - The flows need no such lift: `install.sh` never rewrites an existing
     `admin.pub`, and `uninstall.sh --purge` removes both after the hooks
     are gone.
@@ -3571,6 +3867,76 @@ today is scoped by path, is scoped by writer too.
   the units from outside the tree, inside a window too. PID 1 gets none
   of them (section 2). The lab expectation becomes "denied" for such a
   caller (lot 2.8).
+
+### 7. Records
+
+- **A context class on every window-related record**, with the actor's
+  generation, tgid and start:
+
+  | Class | Meaning | Severity |
+  |---|---|---|
+  | in-tree | a member's act that the window let through | Low |
+  | outsider-during-window | an outsider refused while a window is open | High, never lower |
+  | PID-1-lease | a PID 1 action through a lease, with the member that armed it | Low |
+  | exec-evicted | a member that left the tree, with the file or the variable | High, never lower |
+  | no-window | as today | as today |
+
+- **Never coalesced across classes or processes.** A member's write and
+  an outsider's write to the same object in the same second are two
+  records. The window never softens an outsider's record or an eviction.
+  The host-wide `window_open()` softening is removed (section 5's
+  table).
+- **The window ring.** Window lifecycle records (grant, renewal, close
+  and its cause, the controlled stop, each lease and its use, each
+  eviction, the grace's close) and outsider refusals go to a pinned ring
+  of their own. It is separate from telemetry and from the denial ring
+  (`FS_PROTECT_EVENTS`), and has its own budget.
+  - Each record carries a sequence number, so a gap is visible.
+  - Per-CPU drop counters are signed as a record of their own.
+  - The ring is pinned, so the records written while no agent runs (the
+    upgrade's gap, a controlled stop) are drained and signed by the
+    next start.
+  - This is a new map, `WINDOW_EVENTS`, with its drop counters: a lot
+    2.2 item.
+- **The controlled stop's record** is signed by the agent before it
+  exits, and the watchdog's stand-down names it (section 2).
+- A refusal whose record the ring cannot take is still a refusal (the
+  existing rule).
+
+### 8. Kernel manifest
+
+The tree window depends on the hooks and facilities below. At its start
+the agent checks each one in the running kernel's BTF. If one is
+missing, tree windows are refused (section 5). The window never falls
+back to host-wide. The columns give what the kernels' history leads us
+to expect. 2.3's lab round on each guest confirms them.
+
+| Hook or facility | For | 5.14 (el9) | 5.15 | 6.1 | 6.8 | 6.12 | 7.0 |
+|---|---|---|---|---|---|---|---|
+| `sched_process_fork`, `sched_process_exit` (BTF tracepoints) | inheritance, removal | yes | yes | yes | yes | yes | yes |
+| LSM `task_free` | removal | yes | yes | yes | yes | yes | yes |
+| LSM `bprm_committed_creds`, `bprm_check_security` | the exec rule, a script's own file | yes | yes | yes | yes | yes | yes |
+| LSM `mmap_file`, `file_mprotect` | the mapping rule | yes | yes | yes | yes | yes | yes |
+| LSM `file_receive` | descriptors across the boundary | yes | yes | yes | yes | yes | yes |
+| LSM `task_kill`, `file_send_sigiotask` | members' signals | yes | yes | yes | yes | yes | yes |
+| LSM `ptrace_access_check`, `ptrace_traceme` | members' ptrace, kcmp, `pidfd_getfd` | yes | yes | yes | yes | yes | yes |
+| LSM `perf_event_open` (from 5.5) | members' perf events | yes | yes | yes | yes | yes | yes |
+| LSM `file_ioctl` | `TIOCSTI`, `TIOCLINUX` | yes | yes | yes | yes | yes | yes |
+| LSM `file_open`, `file_permission`, `inode_*`, `sb_mount`, `move_mount` (from 5.2) | the freeze, the key directories | yes | yes | yes | yes | yes | yes |
+| `task_struct.start_boottime` (from 5.5), `group_leader`, `signal` (the thread group's death) | identity | yes | yes | yes | yes | yes | yes |
+| `PF_IO_WORKER` (from 5.12) | io_uring workers | yes | yes | yes | yes | yes | yes |
+| `bpf_ktime_get_boot_ns` (from 5.8) | deadlines | yes | yes | yes | yes | yes | yes |
+| ptrace state, `seccomp.mode`, the task's namespaces and user namespace (BTF fields) | the per-lift test | yes | yes | yes | yes | yes | yes |
+| `super_block.s_user_ns`, `s_magic` | the filesystem test | yes | yes | yes | yes | yes | yes |
+| the idmapped mount's mapping: `mnt_userns` (5.12 to 6.2), `mnt_idmap` (from 6.3) | the filesystem test | per build | `mnt_userns` | `mnt_userns` | `mnt_idmap` | `mnt_idmap` | `mnt_idmap` |
+| the suspend's start (`power` tracepoint) | the close on suspend | yes | yes | yes | yes | yes | yes |
+| `SO_PEERPIDFD` (from 6.5) | the requester's pidfd | no: pidfd of the `SO_PEERCRED` pid | no: same | no: same | yes | yes | yes |
+| `dev.tty.legacy_tiocsti` (from 6.2) | `--interactive` | no: refused | no: refused | no: refused | yes | yes | yes |
+| LSM `file_truncate` (from 6.2), the io_uring hooks (from 5.16) | not required: `inode_setattr` judges a truncate, and the lift keys on the task | — | — | — | — | — | — |
+
+The suspend facility is required only where the kernel can suspend (a
+non-empty `/sys/power/state`). A missing BTF field of the per-lift test
+is a missing hook: no lift, and no tree window.
 
 ### Declared by lot 2.1
 
@@ -3604,15 +3970,48 @@ today is scoped by path, is scoped by writer too.
   - `PROTOCOL_VERSION` 6.
 - The signed rule policy's `kernel-read-refuse`, off by default.
 
+**Changed by lot 2.2, before any hook reads them.** No hook reads the
+2.1 layout yet, so these changes cost nothing:
+
+- `FsGrantV2` and `TreeMember`: a 64-bit generation, a `CLOCK_BOOTTIME`
+  deadline, and the agent's heartbeat in the grant slot (section 5);
+- the denial record's `window` byte carries the context class
+  (section 7);
+- new maps: `WINDOW_EVENTS` with its drop counters (section 7), and the
+  slots of the single-use leases (section 2).
+
 ### Residual (declared)
 
-- PID 1 cannot be bound to the requesting tree by its caller. A process
-  outside the tree can ask systemd, inside a lease a member armed, for
-  the same action on the same unit (section 2).
-- A root-owned image that root planted before the window, and that the
-  installer runs, runs as a member (section 4).
-- A window rooted at a package manager covers every package of that
-  transaction.
-- The signer chooses the root. A broad root (an operator's login shell
-  that lives on) is signed and recorded with its executable, and the
-  window still ends at its deadline.
+- **PID 1 cannot be bound to its caller.** A process outside the tree
+  can ask PID 1, within a lease's few seconds, for that lease's one link
+  action. The outcome is the one the installer was about to cause, and
+  the use is signed. No signal is ever leased.
+- **Code planted before the window.** A root-owned file on a local
+  filesystem, in a root-owned directory, that the installer runs, runs
+  as a member, if root also made the package database match it. The
+  pre-grant check narrows this (section 3), and S12 closes it.
+- **An interpreter's inputs.** A script or a module read as data from
+  outside the frozen paths, changed by root, runs as a member
+  (section 4).
+- **A window rooted at a package manager** covers every package of that
+  transaction. The grant record lists them.
+- **An interactive window.** The other end of the terminal is outside the
+  tree. Such a window is refused where `TIOCSTI` is open to everyone, and
+  marked degraded elsewhere (section 1).
+- **The signer chooses the root**, within the admission policy. The root
+  is signed and recorded with its executable, and the window still ends
+  at its deadline.
+- **PID 1's global environment** is detected, not refused (section 3).
+- **A member's availability.** A process outside the tree can still make
+  an install fail: it can freeze the member's own cgroup, change its OOM
+  score, or exhaust its limits. The install fails and rolls back, and
+  nothing is lifted more widely. The agent-absent grace bounds a window
+  whose agent is gone (section 5).
+- **Inspectors of members.** During a window, READ refusals blind other
+  tools' view of the members (section 3).
+- **A shutdown during a window.** PID 1's signals to the members are
+  refused until the final shutdown (`systemd-shutdown`). A shutdown that
+  overlaps a window waits out the units' stop timeouts.
+- **An upgrade from a release with only the host-wide window** opens that
+  old agent's host-wide window once, until the new agent starts
+  (section 5).

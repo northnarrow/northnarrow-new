@@ -1062,9 +1062,9 @@ pub const FS_GRANT_V2_MAP_NAME: &str = "FS_GRANT_V2";
 /// Lot 2.1 (FsGrant v2): the trusted-installer window bound to the
 /// process tree that asked for it. Its root is a process — its tgid and its
 /// start ([`start_ticks`]) — and the window lifts its refusals only for the
-/// root and the processes the root forked after the grant, transitively
-/// ([`TreeMember`]), until the deadline or the root's exit, whichever comes
-/// first. `generation` numbers the grants of this boot (never 0): a member
+/// members ([`TreeMember`]): the root, the processes on the line from the
+/// root down to the requester (forked before the grant), and every process
+/// a member forks while the window is open, until the window closes. `generation` numbers the grants of this boot (never 0): a member
 /// entry of an earlier window is no member of this one.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]

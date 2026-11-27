@@ -4492,7 +4492,7 @@ mod tests {
         // lot 2.1 (the S2 scaffold): the grant for one tree, its root inside
         // the signed scope
         let payload = SignedPayload::new_trusted_installer_tree_grant(
-            [0x46; 32],
+            test_nonce(),
             1_700_000_002,
             [0x55; 16],
             300,
