@@ -50,6 +50,7 @@ use nn_proto::admin_protocol::{
     RemediateRansomwareRequest, ResponseReleaseRequest, ResponseRestoreRequest,
     ResponseStatusRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
     SignedUnlockRequest, TelemetryStatusRequest, TrustedInstallerGrantRequest,
+    TrustedInstallerTreeGrantRequest,
 };
 use nn_proto::admin_quorum::{AdminKey, role_keyword};
 use nn_proto::admin_signed_payload::{
@@ -59,7 +60,7 @@ use nn_proto::admin_signed_payload::{
     NetListenersExtra, NetResolveExtra, OperationCode, OperationExtra, RemediateRansomwareExtra,
     ResponseReleaseExtra, ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra,
     RotateKeysRevokeExtra, ShutdownExtra, SignedPayload, TelemetryStatusExtra,
-    TrustedInstallerGrantExtra, UnlockExtra,
+    TrustedInstallerGrantExtra, TrustedInstallerTreeGrantExtra, UnlockExtra,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 use tracing::warn;
@@ -218,6 +219,10 @@ signed_verbs! {
     // quorum here to require co-signers.
     TrustedInstallerGrantRequest: TrustedInstallerGrant(TrustedInstallerGrantExtra),
         Quorum::Of(1), Roles::Each(&[Role::TrustedInstaller]), "trusted-installer-grant";
+    // Lot 2.1 (S2 scaffold): the grant for one process tree, the plain
+    // grant's quorum and role (lot 2.3 arms it).
+    TrustedInstallerTreeGrantRequest: TrustedInstallerTreeGrant(TrustedInstallerTreeGrantExtra),
+        Quorum::Of(1), Roles::Each(&[Role::TrustedInstaller]), "trusted-installer-tree-grant";
     // Tappa 9.0.b: read != control; `triage` and `all` imply the role.
     DetectionsRequest: Detections(DetectionsExtra),
         Quorum::Of(1), Roles::Each(&[Role::TelemetryRead]), "detections";
@@ -614,6 +619,12 @@ mod tests {
             (
                 "TrustedInstallerGrantRequest",
                 OperationCode::TrustedInstallerGrant,
+                Quorum::Of(1),
+                Roles::Each(&[TrustedInstaller]),
+            ),
+            (
+                "TrustedInstallerTreeGrantRequest",
+                OperationCode::TrustedInstallerTreeGrant,
                 Quorum::Of(1),
                 Roles::Each(&[TrustedInstaller]),
             ),

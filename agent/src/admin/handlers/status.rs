@@ -154,6 +154,11 @@ fn telemetry_status(
         // lot 379 (the review of #586, P2-1): the signed findings that
         // degrade no sensor, listed apart from the degradations
         advisories: Some(crate::boot::degradation::advisories()),
+        // lot 2.1 (S2 scaffold): filled by lots 2.3 (the window's tree) and
+        // 2.2 (the role marks, the kernel-read option)
+        installer_window_tree: None,
+        role_marks: None,
+        kernel_read_refused: None,
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

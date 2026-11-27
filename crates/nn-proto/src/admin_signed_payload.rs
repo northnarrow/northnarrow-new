@@ -214,6 +214,16 @@ pub enum OperationCode {
     /// `Role::ConfigManage` (the control role the install's key carries),
     /// 1-of-N.
     IntegrityAcknowledge = 27,
+    /// Lot 2.1 (S2 scaffold, the per-tree window) — [`Self::TrustedInstallerGrant`]
+    /// for one process tree: the signed scope names the window's root, an
+    /// ancestor of the requester by its pid and start
+    /// ([`TrustedInstallerTreeGrantExtra`]), and the window lifts its
+    /// refusals for that tree alone. Authorised by
+    /// [`Role::TrustedInstaller`], 1-of-N, as the plain grant. Declared by
+    /// the scaffold; the agent arms it from lot 2.3 (design:
+    /// `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Trusted-installer window
+    /// per process tree").
+    TrustedInstallerTreeGrant = 28,
 }
 
 impl From<OperationCode> for u8 {
@@ -253,6 +263,7 @@ impl TryFrom<u8> for OperationCode {
             25 => Ok(Self::TelemetryStatus),
             26 => Ok(Self::RemediateRansomware),
             27 => Ok(Self::IntegrityAcknowledge),
+            28 => Ok(Self::TrustedInstallerTreeGrant),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -562,6 +573,23 @@ pub struct NetFingerprintExtra {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedInstallerGrantExtra {
     pub window_secs: u32,
+}
+
+/// Lot 2.1 (S2 scaffold): the signed scope of
+/// [`OperationCode::TrustedInstallerTreeGrant`] — the window's span, as
+/// [`TrustedInstallerGrantExtra`]'s, and its root: the process whose tree
+/// the window is for, named by its pid and its start (`starttime` of
+/// `/proc/<pid>/stat`, clock ticks since boot: a pid reused since is
+/// another process). The root is an ancestor of the requester (the
+/// requester's parent by default, the package manager's process for a
+/// package scriptlet, an operator's shell given by its pid); the agent
+/// checks that it still is when it arms the window, and refuses PID 1, a
+/// kernel thread and its own processes as roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedInstallerTreeGrantExtra {
+    pub window_secs: u32,
+    pub root_pid: u32,
+    pub root_start_ticks: u64,
 }
 
 /// Op-specific signed-scope fields for [`OperationCode::Detections`]
@@ -994,6 +1022,9 @@ pub enum OperationExtra {
     RemediateRansomware(RemediateRansomwareExtra),
     /// Lot 379. Pairs with [`OperationCode::IntegrityAcknowledge`].
     IntegrityAcknowledge(IntegrityAcknowledgeExtra),
+    /// Lot 2.1 (S2 scaffold). Pairs with
+    /// [`OperationCode::TrustedInstallerTreeGrant`].
+    TrustedInstallerTreeGrant(TrustedInstallerTreeGrantExtra),
 }
 
 impl OperationExtra {
@@ -1029,6 +1060,9 @@ impl OperationExtra {
             OperationExtra::TelemetryStatus(_) => OperationCode::TelemetryStatus,
             OperationExtra::RemediateRansomware(_) => OperationCode::RemediateRansomware,
             OperationExtra::IntegrityAcknowledge(_) => OperationCode::IntegrityAcknowledge,
+            OperationExtra::TrustedInstallerTreeGrant(_) => {
+                OperationCode::TrustedInstallerTreeGrant
+            }
         }
     }
 }
@@ -1505,6 +1539,31 @@ impl SignedPayload {
         }
     }
 
+    /// Lot 2.1 (S2 scaffold) — build a trusted-installer grant payload for
+    /// the tree of `root_pid` started at `root_start_ticks` (see
+    /// [`TrustedInstallerTreeGrantExtra`]). Signed via [`sign`]; verified
+    /// 1-of-N carrying [`Role::TrustedInstaller`].
+    pub fn new_trusted_installer_tree_grant(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        window_secs: u32,
+        root_pid: u32,
+        root_start_ticks: u64,
+    ) -> Self {
+        Self {
+            op: OperationCode::TrustedInstallerTreeGrant,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::TrustedInstallerTreeGrant(TrustedInstallerTreeGrantExtra {
+                window_secs,
+                root_pid,
+                root_start_ticks,
+            }),
+        }
+    }
+
     /// Tappa 10.8 — `config overlay` signed payload: binds the overlay
     /// kind to the SHA-256 and length of its content. The nonce is the
     /// server challenge for the online `set`, or random for an offline
@@ -1722,7 +1781,7 @@ mod tests {
     /// `Detections`, bringing it to 19. Tappa 9.0.c added
     /// `DetectionSetStatus`, bringing it to 20. External audit CMB-016
     /// added the three response ops (ConfigOverlaySet has its own test).
-    fn one_payload_per_op() -> [SignedPayload; 25] {
+    fn one_payload_per_op() -> [SignedPayload; 26] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1806,6 +1865,15 @@ mod tests {
                 Some(TS - 3600),
                 true,
             ),
+            // lot 2.1 (S2 scaffold)
+            SignedPayload::new_trusted_installer_tree_grant(
+                nonce(),
+                TS,
+                agent_id(),
+                300,
+                4242,
+                123_456,
+            ),
         ]
     }
 
@@ -1822,6 +1890,43 @@ mod tests {
             let sig = sign(&payload, &signing).expect("sign");
             verify(&payload, &sig, &verifying).expect("verify");
         }
+    }
+
+    /// Lot 2.1 (S2 scaffold): the tree grant's root is inside the signed
+    /// scope — a signature over one root does not open the window of
+    /// another process, nor of the same pid started later, nor for longer —
+    /// and the tree grant is no plain grant.
+    #[test]
+    fn the_tree_grant_s_root_is_signed() {
+        let (signing, verifying) = fixed_keypair();
+        let original =
+            SignedPayload::new_trusted_installer_tree_grant(nonce(), TS, agent_id(), 300, 4242, 99);
+        let sig = sign(&original, &signing).expect("sign");
+        verify(&original, &sig, &verifying).expect("baseline verify");
+        let tampered = |f: fn(&mut TrustedInstallerTreeGrantExtra)| {
+            let mut p = original.clone();
+            match &mut p.extra {
+                OperationExtra::TrustedInstallerTreeGrant(e) => f(e),
+                other => panic!("the tree grant's extra, got {other:?}"),
+            }
+            p
+        };
+        for p in [
+            tampered(|e| e.root_pid = 1),
+            tampered(|e| e.root_start_ticks += 1),
+            tampered(|e| e.window_secs = 600),
+        ] {
+            assert!(matches!(
+                verify(&p, &sig, &verifying),
+                Err(SignedPayloadError::InvalidSignature)
+            ));
+        }
+        let mut plain = original.clone();
+        plain.op = OperationCode::TrustedInstallerGrant;
+        assert!(matches!(
+            verify(&plain, &sig, &verifying),
+            Err(SignedPayloadError::OperationExtraMismatch { .. })
+        ));
     }
 
     /// Required A2 test 2 (covers "tamper-detection"): mutating ANY
@@ -2008,6 +2113,8 @@ mod tests {
             (OperationCode::RemediateRansomware, 26),
             // Lot 379 — APPENDED, never renumber.
             (OperationCode::IntegrityAcknowledge, 27),
+            // Lot 2.1 (S2 scaffold) — APPENDED, never renumber.
+            (OperationCode::TrustedInstallerTreeGrant, 28),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");

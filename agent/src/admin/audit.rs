@@ -380,6 +380,29 @@ pub(super) fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // Lot 2.1 (S2 scaffold): the grant for one process tree — its row
+        // names the root the signed scope gives, whatever the outcome (the
+        // window is armed from lot 2.3; until then a verified request is
+        // `unknown_operation`).
+        (
+            AdminMessage::TrustedInstallerTreeGrantRequest(req),
+            AdminMessage::TrustedInstallerGrantResult(r),
+        ) => {
+            let extra = match &req.payload.extra {
+                OperationExtra::TrustedInstallerTreeGrant(e) => serde_json::json!({
+                    "window_secs": e.window_secs,
+                    "root_pid": e.root_pid,
+                    "root_start_ticks": e.root_start_ticks,
+                }),
+                _ => serde_json::json!({ "window_secs": 0 }),
+            };
+            (
+                "trusted_installer_tree_grant",
+                extra,
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Lot 278 (review of #493, note a): the grant asked for by an
         // installer for its own tree — the row says so, and names the
         // installer (the requester's parent) when the window was opened.

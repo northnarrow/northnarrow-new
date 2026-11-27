@@ -7,7 +7,9 @@
 //! does (`pids.max` also stops the actuators' execs); `cgroup.max.*` on a
 //! slice keeps the next start from making its cgroup; `memory.oom.group`
 //! on a slice turns one OOM into the kill of every unit in it; `io.max`
-//! throttles the agent's writes to nothing. The deny hooks refuse a write
+//! throttles the agent's writes to nothing (lot 2.1: a low `memory.swap.max`,
+//! `memory.swap.high` or `memory.zswap.max` presses it towards the OOM
+//! killer, a low `cpu.uclamp.max` caps its CPU). The deny hooks refuse a write
 //! of these files in a protected cgroup from anyone but the agent's family
 //! and PID 1 outside a trusted-installer window. systemd writes them as
 //! PID 1 whenever it realises a unit (a start, a `set-property`, a
@@ -59,9 +61,14 @@ pub const LIMIT_IO_WEIGHT: u8 = 10;
 /// `no-change` by default): `idle` starves the agent's writes — its audit
 /// log, its chains — under contention.
 pub const LIMIT_IO_PRIO_CLASS: u8 = 11;
+/// Lot 2.1 (S2 scaffold+): `cpu.uclamp.max` / `cpu.uclamp.min` (`max` or a
+/// percentage with two decimals): a low maximum caps the agent's CPU
+/// frequency and placement. systemd has no property for them and never
+/// writes them, so PID 1 has no value to put back either.
+pub const LIMIT_UCLAMP: u8 = 12;
 
 /// The protected resource files and their kinds.
-pub const LIMIT_FILES: [(&str, u8); 18] = [
+pub const LIMIT_FILES: [(&str, u8); 23] = [
     ("memory.max", LIMIT_UNSIGNED_MAX),
     ("memory.high", LIMIT_UNSIGNED_MAX),
     ("pids.max", LIMIT_UNSIGNED_MAX),
@@ -82,6 +89,16 @@ pub const LIMIT_FILES: [(&str, u8); 18] = [
     ("io.bfq.weight", LIMIT_IO_WEIGHT),
     // Lot 273d (the review of #492)
     ("io.prio.class", LIMIT_IO_PRIO_CLASS),
+    // Lot 2.1 (S2 scaffold+): a low swap or zswap limit pushes the agent
+    // into the OOM killer under memory pressure (systemd writes `max` at
+    // every realisation of a unit that sets neither, which goes through as
+    // the default), and the utilization clamps
+    ("memory.swap.max", LIMIT_UNSIGNED_MAX),
+    ("memory.zswap.max", LIMIT_UNSIGNED_MAX),
+    ("cpu.uclamp.max", LIMIT_UCLAMP),
+    ("cpu.uclamp.min", LIMIT_UCLAMP),
+    // its mini-hunt: the swap's throttle, `memory.high`'s sibling
+    ("memory.swap.high", LIMIT_UNSIGNED_MAX),
 ];
 
 /// The longest name the eBPF programs read (`cgroup.max.descendants`, 22
@@ -685,10 +702,21 @@ mod tests {
             ("io.weight", LIMIT_IO_WEIGHT),
             ("io.bfq.weight", LIMIT_IO_WEIGHT),
             ("io.prio.class", LIMIT_IO_PRIO_CLASS),
+            // lot 2.1 (S2 scaffold+)
+            ("memory.swap.max", LIMIT_UNSIGNED_MAX),
+            ("memory.zswap.max", LIMIT_UNSIGNED_MAX),
+            ("cpu.uclamp.max", LIMIT_UCLAMP),
+            ("cpu.uclamp.min", LIMIT_UCLAMP),
+            ("memory.swap.high", LIMIT_UNSIGNED_MAX),
         ] {
             assert_eq!(limit_kind_of(name), kind, "{name}");
         }
-        assert_eq!(LIMIT_FILES.len(), 18);
+        assert_eq!(LIMIT_FILES.len(), 23);
+        // Lot 2.1: systemd writes `max` to the swap limits of a unit that
+        // sets none (the unsigned default); it never writes a clamp, which
+        // has no value PID 1 may put back
+        assert_eq!(default_value(LIMIT_UNSIGNED_MAX), limit_value(b"max"));
+        assert_eq!(default_value(LIMIT_UCLAMP), None);
         // Lot 273c: the defaults systemd writes for a unit that sets none,
         // and none for memory.reclaim (no value to put back)
         assert_eq!(default_value(LIMIT_CPU_LIST), limit_value(b""));
@@ -727,6 +755,13 @@ mod tests {
             "memory.reclaimX",
             "cgroup.max.descendantsX",
             "cgroup.max.descendants.and.more.bytes",
+            // lot 2.1: the read-only and other neighbours of the new files
+            "memory.swap.current",
+            "memory.swap.events",
+            "memory.swap.peak",
+            "memory.zswap.current",
+            "cpu.uclamp",
+            "cpu.uclamp.maxx",
         ] {
             assert_eq!(limit_kind_of(not), LIMIT_NONE, "{not}");
         }

@@ -108,6 +108,80 @@ pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
     attach_target_offset(cmd).is_some() && attach_type == ATTACH_CGROUP_SYSCTL
 }
 
+/// Lot 2.1 (S2 scaffold): the cgroup program attach types of
+/// `enum bpf_attach_type` — every type whose `BPF_PROG_ATTACH` /
+/// `BPF_LINK_CREATE` target is a cgroup's descriptor
+/// ([`attach_target_offset`]), with the class lot 2.2 judges it by. A
+/// packet program on the agent's unit cgroup or on `northnarrow.slice`
+/// can cut its heartbeat and its export; a device program its `/dev`
+/// opens; a socket, sockopt or address program its sockets; a
+/// `BPF_LSM_CGROUP` program any hook of its processes. Declarations only:
+/// [`judges_attach_target`] still judges `BPF_CGROUP_SYSCTL` alone until
+/// lot 2.2 widens it.
+pub const CGROUP_ATTACH_TYPES: [(&str, u32, u8); 29] = [
+    ("BPF_CGROUP_INET_INGRESS", 0, CGROUP_ATTACH_PACKET),
+    ("BPF_CGROUP_INET_EGRESS", 1, CGROUP_ATTACH_PACKET),
+    ("BPF_CGROUP_INET_SOCK_CREATE", 2, CGROUP_ATTACH_SOCK),
+    ("BPF_CGROUP_SOCK_OPS", 3, CGROUP_ATTACH_SOCK),
+    ("BPF_CGROUP_DEVICE", 6, CGROUP_ATTACH_DEVICE),
+    ("BPF_CGROUP_INET4_BIND", 8, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET6_BIND", 9, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET4_CONNECT", 10, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET6_CONNECT", 11, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET4_POST_BIND", 12, CGROUP_ATTACH_SOCK),
+    ("BPF_CGROUP_INET6_POST_BIND", 13, CGROUP_ATTACH_SOCK),
+    ("BPF_CGROUP_UDP4_SENDMSG", 14, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UDP6_SENDMSG", 15, CGROUP_ATTACH_SOCK_ADDR),
+    (
+        "BPF_CGROUP_SYSCTL",
+        ATTACH_CGROUP_SYSCTL,
+        CGROUP_ATTACH_SYSCTL,
+    ),
+    ("BPF_CGROUP_UDP4_RECVMSG", 19, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UDP6_RECVMSG", 20, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_GETSOCKOPT", 21, CGROUP_ATTACH_SOCKOPT),
+    ("BPF_CGROUP_SETSOCKOPT", 22, CGROUP_ATTACH_SOCKOPT),
+    ("BPF_CGROUP_INET4_GETPEERNAME", 29, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET6_GETPEERNAME", 30, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET4_GETSOCKNAME", 31, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET6_GETSOCKNAME", 32, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_INET_SOCK_RELEASE", 34, CGROUP_ATTACH_SOCK),
+    // 6.0 and later
+    ("BPF_LSM_CGROUP", 43, CGROUP_ATTACH_LSM),
+    // 6.7 and later
+    ("BPF_CGROUP_UNIX_CONNECT", 49, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UNIX_SENDMSG", 50, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UNIX_RECVMSG", 51, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UNIX_GETPEERNAME", 52, CGROUP_ATTACH_SOCK_ADDR),
+    ("BPF_CGROUP_UNIX_GETSOCKNAME", 53, CGROUP_ATTACH_SOCK_ADDR),
+];
+
+/// Lot 2.1: the classes of [`CGROUP_ATTACH_TYPES`]. 0 is no cgroup type.
+pub const CGROUP_ATTACH_PACKET: u8 = 1;
+pub const CGROUP_ATTACH_SOCK: u8 = 2;
+pub const CGROUP_ATTACH_SOCK_ADDR: u8 = 3;
+pub const CGROUP_ATTACH_DEVICE: u8 = 4;
+pub const CGROUP_ATTACH_SYSCTL: u8 = 5;
+pub const CGROUP_ATTACH_SOCKOPT: u8 = 6;
+pub const CGROUP_ATTACH_LSM: u8 = 7;
+
+/// Lot 2.1: the class of `attach_type` among [`CGROUP_ATTACH_TYPES`], 0
+/// when it is not a cgroup type. No loop over a table in the programs: a
+/// match the verifier walks as a handful of compares.
+#[inline(always)]
+pub const fn cgroup_attach_class(attach_type: u32) -> u8 {
+    match attach_type {
+        0 | 1 => CGROUP_ATTACH_PACKET,
+        2 | 3 | 12 | 13 | 34 => CGROUP_ATTACH_SOCK,
+        8..=11 | 14 | 15 | 19 | 20 | 29..=32 | 49..=53 => CGROUP_ATTACH_SOCK_ADDR,
+        6 => CGROUP_ATTACH_DEVICE,
+        ATTACH_CGROUP_SYSCTL => CGROUP_ATTACH_SYSCTL,
+        21 | 22 => CGROUP_ATTACH_SOCKOPT,
+        43 => CGROUP_ATTACH_LSM,
+        _ => 0,
+    }
+}
+
 /// Lot 349 (the review of #558, F1): where a command that RUNS or ATTACHES
 /// a program carries that program's descriptor in `union bpf_attr` —
 /// `BPF_PROG_RUN`'s `test.prog_fd` (0), `BPF_PROG_ATTACH`'s
@@ -344,6 +418,46 @@ mod tests {
             assert!(!judges_attach_target(BPF_LINK_CREATE, t), "{t}");
             assert!(!judges_attach_target(BPF_PROG_ATTACH, t), "{t}");
         }
+    }
+
+    /// Lot 2.1: every cgroup attach type is the header's number (a type
+    /// newer than the build host's header is past its last enumerator), the
+    /// table's class is [`cgroup_attach_class`]'s, and every other
+    /// enumerator of the header named `BPF_CGROUP_*` or `BPF_LSM_CGROUP` is
+    /// in the table: a cgroup type the header adds fails here until it is
+    /// classed.
+    #[test]
+    fn the_cgroup_attach_types_are_the_headers() {
+        let header = std::fs::read_to_string(UAPI_HEADER).expect("the uapi header");
+        let types = c_enum(&header, "bpf_attach_type").expect("enum bpf_attach_type");
+        let max = types["__MAX_BPF_ATTACH_TYPE"];
+        for (name, value, class) in CGROUP_ATTACH_TYPES {
+            match types.get(name) {
+                Some(v) => assert_eq!(*v, i64::from(value), "{name}"),
+                None => assert!(
+                    i64::from(value) >= max,
+                    "{name} absent below the header's end"
+                ),
+            }
+            assert_ne!(class, 0, "{name}");
+            assert_eq!(cgroup_attach_class(value), class, "{name}");
+        }
+        for (name, value) in &types {
+            let cgroup = (name.starts_with("BPF_CGROUP_") || name == "BPF_LSM_CGROUP")
+                && !name.starts_with("__");
+            let listed = CGROUP_ATTACH_TYPES.iter().any(|(n, _, _)| n == name);
+            assert_eq!(cgroup, listed, "{name}");
+            if !cgroup {
+                let v = u32::try_from(*value).expect("an attach type");
+                assert_eq!(cgroup_attach_class(v), 0, "{name} is no cgroup type");
+            }
+        }
+        // the one judged today is among them
+        assert_eq!(
+            cgroup_attach_class(ATTACH_CGROUP_SYSCTL),
+            CGROUP_ATTACH_SYSCTL
+        );
+        assert_eq!(cgroup_attach_class(u32::MAX), 0);
     }
 
     /// The parser counts the way the C compiler does: an alias takes no

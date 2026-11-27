@@ -1028,6 +1028,212 @@ impl FsGrant {
     }
 }
 
+// ── Lot 2.1 (S2 scaffold): the trusted-installer window per process tree ──
+//
+// Design: `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Trusted-installer window
+// per process tree". Declarations and their pure tests only: no program and
+// no agent code reads or writes these maps yet (lot 2.3 does).
+
+/// `USER_HZ`: the unit of a process's start in `/proc/<pid>/stat`
+/// (`starttime`, field 22), 100 on every architecture the agent builds for.
+pub const USER_HZ: u64 = 100;
+
+/// Nanoseconds in one [`USER_HZ`] tick.
+pub const NS_PER_USER_TICK: u64 = 1_000_000_000 / USER_HZ;
+
+/// A process's start as `/proc/<pid>/stat` gives it to a reader in the
+/// initial time namespace: `task->start_boottime` (`CLOCK_BOOTTIME` ns) in
+/// [`USER_HZ`] ticks, divided as procfs divides it (`nsec_to_clock_t`). The
+/// eBPF programs compute it from the group leader's `start_boottime`, the
+/// agent reads it from `/proc` (lot 278's `WindowGrantee::start_ticks`):
+/// one identity on both sides. With the tgid it names one process: a pid
+/// reused within the same 10 ms tick would need the whole pid space to
+/// wrap in that time.
+pub const fn start_ticks(start_boottime_ns: u64) -> u64 {
+    start_boottime_ns / NS_PER_USER_TICK
+}
+
+/// The pinned map of [`FsGrantV2`] (one slot). A map of its own, not
+/// `FS_GRANT` grown: aya reuses a by-name pin at load, and the 16-byte pin
+/// an older agent left would fail every deny hook's verification
+/// (`FS_GRANT`'s own lesson, external audit ATP-003).
+pub const FS_GRANT_V2_MAP_NAME: &str = "FS_GRANT_V2";
+
+/// Lot 2.1 (FsGrant v2): the trusted-installer window bound to the
+/// process tree that asked for it. Its root is a process — its tgid and its
+/// start ([`start_ticks`]) — and the window lifts its refusals only for the
+/// root and the processes the root forked after the grant, transitively
+/// ([`TreeMember`]), until the deadline or the root's exit, whichever comes
+/// first. `generation` numbers the grants of this boot (never 0): a member
+/// entry of an earlier window is no member of this one.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FsGrantV2 {
+    /// This boot's session nonce (`AGENT_SESSION[0]`), as [`FsGrant`].
+    pub nonce: u32,
+    /// The grant's number this boot, from 1; 0 is no grant.
+    pub generation: u32,
+    /// `CLOCK_MONOTONIC` deadline, as [`FsGrant`].
+    pub expires_ns: u64,
+    /// The root's tgid.
+    pub root_tgid: u32,
+    pub _pad: u32,
+    /// The root's start ([`start_ticks`]).
+    pub root_start_ticks: u64,
+}
+
+impl FsGrantV2 {
+    /// Whether the window is open at monotonic `now_ns` under session
+    /// `session`: [`FsGrant::active`]'s test, and a grant number.
+    pub fn active(&self, now_ns: u64, session: u32) -> bool {
+        self.nonce != 0 && self.nonce == session && self.generation != 0 && now_ns < self.expires_ns
+    }
+
+    /// Whether the window lifts its refusals for the calling process: its
+    /// [`TreeMember`] entry (`member`, `None` when its tgid has none) was
+    /// made for this grant and for this process (`start_ticks`, the
+    /// caller's own start: a reused tgid is another process), the caller is
+    /// no io_uring worker (`io_worker`: a kernel thread that runs another
+    /// process's queued requests), and the window is open. The kernel
+    /// hooks' test (lot 2.3), kept here so that it is unit-tested once.
+    pub fn lifts_for(
+        &self,
+        member: Option<&TreeMember>,
+        start_ticks: u64,
+        io_worker: bool,
+        now_ns: u64,
+        session: u32,
+    ) -> bool {
+        match member {
+            Some(m) => {
+                !io_worker
+                    && m.generation == self.generation
+                    && m.start_ticks == start_ticks
+                    && self.active(now_ns, session)
+            }
+            None => false,
+        }
+    }
+}
+
+/// The pinned map of the window's members, keyed by tgid ([`TreeMember`]).
+pub const TREE_MEMBERS_MAP_NAME: &str = "TREE_MEMBERS";
+
+/// Its capacity. A full map takes no new member: the child of a member is
+/// then outside the tree (its lifted operations refused, fail closed) and
+/// the refusal says why (lot 2.3).
+pub const TREE_MEMBERS_MAX: u32 = 4096;
+
+/// A member of the window's tree: written for the root at the grant (by
+/// the agent), and for each child a member forks while its grant is
+/// active (by the kernel's fork program); removed at the process's exit.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct TreeMember {
+    /// The member's start ([`start_ticks`]).
+    pub start_ticks: u64,
+    /// The [`FsGrantV2::generation`] it joined.
+    pub generation: u32,
+    /// [`TREE_MEMBER_ROOT`] or 0.
+    pub flags: u32,
+}
+
+/// [`TreeMember::flags`]: the entry is the window's root.
+pub const TREE_MEMBER_ROOT: u32 = 1;
+
+// ── Lot 2.1 (S2 scaffold): the second word of a protected inode ─────────
+
+/// The pinned map of the inodes' second flag word, keyed by [`InodeKey`]:
+/// `PROTECTED_INODES`' `u8` has no bit left (bit 7 is
+/// [`FS_PROTECT_LIMIT_DIR`]), and an ancestor of the agent's paths is no
+/// member there (a member's [`FS_PROTECT_MUTATE`] would refuse every
+/// `chmod` of `/etc`). Read by the rename hook for its four dentries, and
+/// by a lifted refusal before it is lifted (lot 2.3).
+pub const INODE_EXT_MAP_NAME: &str = "INODE_EXT";
+
+/// Its capacity: the ancestors of the agent's directories, binaries, units
+/// and drop-in directories (two dozen on a merged `/usr`), and the two key
+/// files.
+pub const INODE_EXT_SLOTS: u32 = 64;
+
+/// The inode is an ancestor of the agent's paths (`/etc`,
+/// `/var/lib`, the binaries' and the units' directories): its own rename or
+/// exchange is refused outside a window, as it moves the agent's tree from
+/// under the paths it is read by.
+pub const INODE_EXT_NO_RENAME: u8 = 0b01;
+
+/// The inode is `admin.pub` or the agent's signing key: no
+/// window lifts its write, rename, removal or read (the key's) for anyone
+/// but the agent's family, whose own path the key rotation is.
+pub const INODE_EXT_WINDOW_KEPT: u8 = 0b10;
+
+/// Whether the rename or exchange of an inode whose second word is `ext`
+/// is refused for its own sake (an ancestor), outside a window.
+pub const fn ancestor_rename_refused(ext: u8) -> bool {
+    ext & INODE_EXT_NO_RENAME != 0
+}
+
+/// Whether a window keeps refusing what it would lift on an inode whose
+/// second word is `ext`, to a member of its tree.
+pub const fn window_keeps(ext: u8) -> bool {
+    ext & INODE_EXT_WINDOW_KEPT != 0
+}
+
+// ── Lot 2.1 (S2 scaffold): the kernel-read option ─────────────
+//
+// Off by default (the signed rule policy's `kernel-read-refuse`). The
+// classes of reads a foreign process is refused outside a window once the
+// operator turns them on; the lots that refuse them read the mask (2.2: the
+// lockdown questions; 2.3: a block device's read-open).
+
+/// `/dev/mem`, `/dev/port`, `/proc/kcore` (the kernel's
+/// `LOCKDOWN_DEV_MEM`, `LOCKDOWN_KCORE`).
+pub const KERNEL_READ_PHYSICAL_MEMORY: u32 = 1 << 0;
+/// A read-open of a block device that backs a protected file (lot 2.3:
+/// udev and blkid read them, hence off by default).
+pub const KERNEL_READ_BLOCK_DEVICE: u32 = 1 << 1;
+/// tracefs (`LOCKDOWN_TRACEFS`): its `uprobe_events` / `kprobe_events`
+/// fetch arguments read memory with no BPF.
+pub const KERNEL_READ_TRACEFS: u32 = 1 << 2;
+/// kprobes (`LOCKDOWN_KPROBES`).
+pub const KERNEL_READ_KPROBES: u32 = 1 << 3;
+/// perf (`LOCKDOWN_PERF`): CPU-wide sampling of user registers and stacks.
+pub const KERNEL_READ_PERF: u32 = 1 << 4;
+/// Every class.
+pub const KERNEL_READ_ALL: u32 = 0b1_1111;
+
+/// The classes by the name the policy gives them.
+pub const KERNEL_READ_CLASSES: [(&str, u32); 5] = [
+    ("physical-memory", KERNEL_READ_PHYSICAL_MEMORY),
+    ("block-device", KERNEL_READ_BLOCK_DEVICE),
+    ("tracefs", KERNEL_READ_TRACEFS),
+    ("kprobes", KERNEL_READ_KPROBES),
+    ("perf", KERNEL_READ_PERF),
+];
+
+/// The kernel's `enum lockdown_reason` enumerators the classes refuse at
+/// the `locked_down` question, each with its class (none for a block
+/// device: its open is judged at `file_open`). Their values move with the
+/// kernel: the agent resolves them from the running kernel's BTF
+/// (`btf_revalidate`), never from a constant.
+pub const KERNEL_READ_LOCKDOWN: [(&str, u32); 5] = [
+    ("LOCKDOWN_DEV_MEM", KERNEL_READ_PHYSICAL_MEMORY),
+    ("LOCKDOWN_KCORE", KERNEL_READ_PHYSICAL_MEMORY),
+    ("LOCKDOWN_TRACEFS", KERNEL_READ_TRACEFS),
+    ("LOCKDOWN_KPROBES", KERNEL_READ_KPROBES),
+    ("LOCKDOWN_PERF", KERNEL_READ_PERF),
+];
+
+/// The class named `name` in [`KERNEL_READ_CLASSES`].
+pub fn kernel_read_class(name: &str) -> Option<u32> {
+    KERNEL_READ_CLASSES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, bit)| *bit)
+}
+
 // Tappa 7 filesystem-protection denial codes. The eBPF inode hooks
 // write one of these into `FsProtectDenialRaw.operation` when they
 // return `-EPERM`. Userland inflates the byte into the typed
@@ -1548,6 +1754,50 @@ pub const FS_OP_SYSRQ_WINDOW: u8 = 54;
 /// Lot 280b: the last denial code (the tests' loops).
 pub const FS_OP_LAST: u8 = FS_OP_SYSRQ_WINDOW;
 
+// Lot 2.1 (S2 scaffold): the denial codes stage S2's lots will emit,
+// reserved here in their lots' order, so that two lots never take the same
+// number. None is emitted yet: [`FS_OP_LAST`] moves to a code with the lot
+// that emits it and names it (nn-model's operation, the posture's class),
+// and until then a record that carried one would be read as unknown.
+
+/// Lot 2.2: a process that claims a role with an executable mapping of
+/// an image without the role mark (`crate::exec_marks`), refused the role.
+pub const FS_OP_ROLE_UNMARKED: u8 = 55;
+/// Lot 2.2: a foreign cgroup BPF attach on the agent's unit cgroups
+/// or `northnarrow.slice`, refused.
+pub const FS_OP_BPF_CGROUP_ATTACH: u8 = 56;
+/// Lot 2.2: a lockdown question of a class the kernel-read
+/// option refuses, refused (`KERNEL_READ_*`).
+pub const FS_OP_KERNEL_READ: u8 = 57;
+/// Lot 2.2: a foreign `perf_event_open` of a uprobe or kprobe PMU, or
+/// of user-stack sampling, refused.
+pub const FS_OP_PERF_EVENT: u8 = 58;
+/// Lot 2.2: a shared writable mapping of a WRITE-protected inode,
+/// refused at the mapping.
+pub const FS_OP_SHARED_MAP: u8 = 59;
+/// Lot 2.3: a rename or exchange of an ancestor of the agent's paths
+/// ([`INODE_EXT_NO_RENAME`]), refused.
+pub const FS_OP_ANCESTOR_RENAME: u8 = 60;
+/// Lot 2.3: a write-open of a block device that backs a protected
+/// file, refused.
+pub const FS_OP_BDEV_WRITE: u8 = 61;
+/// Lot 2.3: a read-open of such a block device, refused under the
+/// kernel-read option ([`KERNEL_READ_BLOCK_DEVICE`]).
+pub const FS_OP_BDEV_READ: u8 = 62;
+
+/// The reserved codes, with the name their records will carry and the lot
+/// that emits them.
+pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 8] = [
+    (FS_OP_ROLE_UNMARKED, "role_unmarked", "2.2"),
+    (FS_OP_BPF_CGROUP_ATTACH, "bpf_cgroup_attach", "2.2"),
+    (FS_OP_KERNEL_READ, "kernel_read", "2.2"),
+    (FS_OP_PERF_EVENT, "perf_event", "2.2"),
+    (FS_OP_SHARED_MAP, "shared_map", "2.2"),
+    (FS_OP_ANCESTOR_RENAME, "ancestor_rename", "2.3"),
+    (FS_OP_BDEV_WRITE, "bdev_write", "2.3"),
+    (FS_OP_BDEV_READ, "bdev_read", "2.3"),
+];
+
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
 /// the posture does not take as `AntiTamperDenial`: its
@@ -1824,8 +2074,24 @@ pub struct FsProtectDenialRaw {
     pub attacker_uid: u32,
     pub attacker_comm: [u8; TASK_COMM_LEN],
     pub operation: u8,
-    pub _pad: [u8; 7],
+    /// Lot 2.1 (S2 scaffold): the trusted-installer window's part in the
+    /// refusal ([`DENIAL_WINDOW_NONE`], [`DENIAL_WINDOW_OUTSIDER`],
+    /// [`DENIAL_WINDOW_KEPT`]); the first byte of what was padding, so an
+    /// older program's record reads as `NONE`. Written by lot 2.3.
+    pub window: u8,
+    pub _pad: [u8; 6],
 }
+
+/// [`FsProtectDenialRaw::window`]: no window was open (or the program did
+/// not say).
+pub const DENIAL_WINDOW_NONE: u8 = 0;
+/// A window was open, and the caller is outside its tree: what the window
+/// lifts for its tree stays refused for this caller (lot 2.3).
+pub const DENIAL_WINDOW_OUTSIDER: u8 = 1;
+/// The caller is a member of the open window's tree, and the window keeps
+/// this refusal: a key file ([`INODE_EXT_WINDOW_KEPT`]), an io_uring
+/// worker, a member traced from outside the tree.
+pub const DENIAL_WINDOW_KEPT: u8 = 2;
 
 impl FsProtectDenialRaw {
     pub const fn zeroed() -> Self {
@@ -1837,7 +2103,8 @@ impl FsProtectDenialRaw {
             attacker_uid: 0,
             attacker_comm: [0u8; TASK_COMM_LEN],
             operation: 0,
-            _pad: [0u8; 7],
+            window: DENIAL_WINDOW_NONE,
+            _pad: [0u8; 6],
         }
     }
 }
@@ -2664,6 +2931,155 @@ mod tests {
             "the zeroed slot grants nothing"
         );
         assert_eq!(core::mem::size_of::<FsGrant>(), 16);
+    }
+
+    /// Lot 2.1 (S2 scaffold): a v2 grant is FsGrant's test plus a grant
+    /// number, in a slot of its own size.
+    #[test]
+    fn fs_grant_v2_is_bound_to_its_session_deadline_and_number() {
+        let g = FsGrantV2 {
+            nonce: 0xABCD,
+            generation: 3,
+            expires_ns: 1_000,
+            root_tgid: 4242,
+            _pad: 0,
+            root_start_ticks: 77,
+        };
+        assert!(g.active(999, 0xABCD));
+        assert!(!g.active(1_000, 0xABCD), "expired");
+        assert!(!g.active(0, 0x1234), "another boot's session");
+        assert!(
+            !FsGrantV2 { generation: 0, ..g }.active(0, 0xABCD),
+            "no grant number"
+        );
+        assert!(!FsGrantV2::default().active(0, 0));
+        assert_eq!(core::mem::size_of::<FsGrantV2>(), 32);
+        assert_eq!(core::mem::align_of::<FsGrantV2>(), 8);
+        assert_eq!(core::mem::size_of::<TreeMember>(), 16);
+        assert_ne!(FS_GRANT_V2_MAP_NAME, "FS_GRANT");
+    }
+
+    /// Lot 2.1: the window lifts for a member of this grant, the same
+    /// process, no io_uring worker, while it is open — and for no one else.
+    #[test]
+    fn a_v2_window_lifts_only_for_its_members() {
+        let g = FsGrantV2 {
+            nonce: 7,
+            generation: 2,
+            expires_ns: 1_000,
+            root_tgid: 10,
+            _pad: 0,
+            root_start_ticks: 500,
+        };
+        let m = TreeMember {
+            start_ticks: 600,
+            generation: 2,
+            flags: 0,
+        };
+        assert!(g.lifts_for(Some(&m), 600, false, 10, 7));
+        assert!(!g.lifts_for(None, 600, false, 10, 7), "no entry");
+        assert!(!g.lifts_for(Some(&m), 601, false, 10, 7), "a reused tgid");
+        assert!(
+            !g.lifts_for(Some(&m), 600, true, 10, 7),
+            "an io_uring worker"
+        );
+        let old = TreeMember { generation: 1, ..m };
+        assert!(
+            !g.lifts_for(Some(&old), 600, false, 10, 7),
+            "an earlier window's"
+        );
+        assert!(!g.lifts_for(Some(&m), 600, false, 1_000, 7), "expired");
+        assert!(!g.lifts_for(Some(&m), 600, false, 10, 8), "another session");
+    }
+
+    /// Lot 2.1: the start in ticks is procfs's division of the boot-time
+    /// start.
+    #[test]
+    fn start_ticks_divide_as_procfs() {
+        assert_eq!(NS_PER_USER_TICK, 10_000_000);
+        assert_eq!(start_ticks(0), 0);
+        assert_eq!(start_ticks(9_999_999), 0);
+        assert_eq!(start_ticks(10_000_000), 1);
+        assert_eq!(start_ticks(123_456_789_012), 12_345);
+    }
+
+    /// Lot 2.1: the inode's second word — its two bits apart, each read
+    /// alone; and room left in no `PROTECTED_INODES` bit.
+    #[test]
+    fn the_second_inode_word_reads_each_bit_alone() {
+        assert_eq!(INODE_EXT_NO_RENAME & INODE_EXT_WINDOW_KEPT, 0);
+        assert!(ancestor_rename_refused(INODE_EXT_NO_RENAME));
+        assert!(!ancestor_rename_refused(INODE_EXT_WINDOW_KEPT));
+        assert!(!ancestor_rename_refused(0));
+        assert!(window_keeps(INODE_EXT_WINDOW_KEPT));
+        assert!(window_keeps(INODE_EXT_WINDOW_KEPT | INODE_EXT_NO_RENAME));
+        assert!(!window_keeps(INODE_EXT_NO_RENAME));
+        assert_eq!(
+            FS_PROTECT_LIMIT_DIR, 0x80,
+            "PROTECTED_INODES' last bit is taken"
+        );
+    }
+
+    /// Lot 2.1: the kernel-read classes — one bit each, all of them in
+    /// `ALL`, found by name, every lockdown name a lockdown enumerator.
+    #[test]
+    fn the_kernel_read_classes_are_one_bit_each() {
+        let mut seen = 0u32;
+        for (name, bit) in KERNEL_READ_CLASSES {
+            assert_eq!(bit.count_ones(), 1, "{name}");
+            assert_eq!(seen & bit, 0, "{name}");
+            seen |= bit;
+            assert_eq!(kernel_read_class(name), Some(bit));
+        }
+        assert_eq!(seen, KERNEL_READ_ALL);
+        // every lockdown question is a class's; every class but the block
+        // device's has one
+        for (reason, bit) in KERNEL_READ_LOCKDOWN {
+            assert!(reason.starts_with("LOCKDOWN_"), "{reason}");
+            assert_eq!(bit.count_ones(), 1, "{reason}");
+            assert_ne!(bit & KERNEL_READ_ALL, 0, "{reason}");
+        }
+        for (name, bit) in KERNEL_READ_CLASSES {
+            let asked = KERNEL_READ_LOCKDOWN.iter().any(|(_, b)| *b == bit);
+            assert_eq!(asked, bit != KERNEL_READ_BLOCK_DEVICE, "{name}");
+        }
+        assert_eq!(kernel_read_class("kcore"), None);
+        assert_eq!(kernel_read_class(""), None);
+    }
+
+    /// Lot 2.1: the reserved codes follow the last one emitted, in order,
+    /// once each, under names of their own.
+    #[test]
+    fn the_s2_codes_are_reserved_after_the_last() {
+        for (i, (code, name, lot)) in S2_RESERVED_FS_OPS.iter().enumerate() {
+            assert_eq!(
+                usize::from(*code),
+                usize::from(FS_OP_LAST) + 1 + i,
+                "{name}"
+            );
+            assert!(*lot == "2.2" || *lot == "2.3", "{name}");
+            assert!(!is_minor_denial(*code) && !is_sole_trace(*code), "{name}");
+            assert_eq!(
+                S2_RESERVED_FS_OPS
+                    .iter()
+                    .filter(|(_, n, _)| n == name)
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    /// Lot 2.1: the window's byte is the first of the old padding — the
+    /// record's size and every other field's place unchanged.
+    #[test]
+    fn the_denial_window_byte_takes_the_padding() {
+        let r = FsProtectDenialRaw::zeroed();
+        assert_eq!(r.window, DENIAL_WINDOW_NONE);
+        assert_eq!(core::mem::offset_of!(FsProtectDenialRaw, operation), 48);
+        assert_eq!(core::mem::offset_of!(FsProtectDenialRaw, window), 49);
+        assert_eq!(core::mem::size_of::<FsProtectDenialRaw>(), 56);
+        assert_ne!(DENIAL_WINDOW_OUTSIDER, DENIAL_WINDOW_KEPT);
     }
     use core::mem::{align_of, size_of};
 

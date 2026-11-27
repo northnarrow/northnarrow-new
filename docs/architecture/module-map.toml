@@ -572,6 +572,9 @@ planned = false
 # Lot 290: the BPF program types refused to a foreign loader, their names,
 # the cross-view's iterator records (the eBPF programs and the agent)
 "bpf_prog_class" = "northnarrow-common"
+# Lot 2.1 (S2 scaffold): the per-inode marks of executable images (the role
+# mark, the bits reserved for S12), shared by the eBPF programs and the agent
+"exec_marks" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

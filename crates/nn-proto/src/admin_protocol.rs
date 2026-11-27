@@ -1034,6 +1034,49 @@ pub struct StatusResponse {
     /// `None` from an older agent.
     #[serde(default)]
     pub advisories: Option<Vec<String>>,
+    /// Lot 2.1 (S2 scaffold, the per-tree window): the open trusted-installer window's
+    /// process tree — its root, its members, the refusals it kept for the
+    /// processes outside it. `None` from an agent older than the field, or
+    /// with no window open; filled by lot 2.3. Appended after lot 379's
+    /// `advisories`; telemetry.
+    #[serde(default)]
+    pub installer_window_tree: Option<InstallerWindowTree>,
+    /// Lot 2.1 (S2 scaffold, the role marks): the role marks of the executable
+    /// images (`common::exec_marks`). `None` from an older agent; filled
+    /// by lot 2.2. Telemetry.
+    #[serde(default)]
+    pub role_marks: Option<RoleMarks>,
+    /// Lot 2.1 (S2 scaffold, the kernel-read option): the classes of the kernel-read
+    /// option in force (`common::wire::KERNEL_READ_CLASSES`' names), from
+    /// the signed rule policy. `None` from an older agent; filled by lot
+    /// 2.2. Telemetry.
+    #[serde(default)]
+    pub kernel_read_refused: Option<Vec<String>>,
+}
+
+/// Lot 2.1 (S2 scaffold): [`StatusResponse::installer_window_tree`] — the
+/// root (its pid, and its start in clock ticks since boot, as
+/// `/proc/<pid>/stat` gives it), how many processes the tree holds and may
+/// hold, the refusals the window kept for callers outside the tree
+/// (`outsiders_refused`), and the children of members left outside it by a
+/// full member map (`left_outside_full`, fail closed).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallerWindowTree {
+    pub root_pid: u32,
+    pub root_start_ticks: u64,
+    pub members: u32,
+    pub members_max: u32,
+    pub outsiders_refused: u64,
+    pub left_outside_full: u64,
+}
+
+/// Lot 2.1 (S2 scaffold): [`StatusResponse::role_marks`] — the images the
+/// agent marked as its roles' (`marked`), and the claims of a role refused
+/// for an executable mapping of an unmarked image (`unmarked_refused`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMarks {
+    pub marked: u32,
+    pub unmarked_refused: u64,
 }
 
 /// Lot 369: [`StatusResponse::runtime_clones`] — sealed memfd execs
@@ -1472,6 +1515,9 @@ impl StatusResponse {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            installer_window_tree: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -1619,6 +1665,20 @@ pub enum DebugForcePosture {
 /// NN-L-FIM-009 for its OWN units for the (clamped) window's duration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedInstallerGrantRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Lot 2.1 (S2 scaffold, the per-tree window) — the signed trusted-installer grant for
+/// one process tree: `payload` is an `OperationCode::TrustedInstallerTreeGrant`
+/// (its extra names the root), verified like
+/// [`TrustedInstallerGrantRequest`] (1-of-N,
+/// [`crate::admin_signed_payload::Role::TrustedInstaller`]). Replied to
+/// with [`AdminMessage::TrustedInstallerGrantResult`]. Declared by the
+/// scaffold: an agent before lot 2.3 answers `UnknownOperation`, an agent
+/// older than the variant closes the connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedInstallerTreeGrantRequest {
     pub payload: SignedPayload,
     pub signatures: Vec<KeyedSignature>,
 }
@@ -2130,6 +2190,10 @@ pub enum AdminMessage {
     IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest),
     /// Reply to [`AdminMessage::IntegrityAcknowledgeRequest`].
     IntegrityAcknowledgeResponse(IntegrityAcknowledgeResponse),
+    /// Lot 2.1 (S2 scaffold, the per-tree window) — the signed trusted-installer grant
+    /// for one process tree. Replied to with
+    /// [`AdminMessage::TrustedInstallerGrantResult`].
+    TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -2173,8 +2237,11 @@ pub const MAX_FRAME_BODY: usize = 64 * 1024;
 /// pinned frames leave `runtime_clones` empty). That is harmless, because
 /// the live socket speaks bare frames and the version has no effect on
 /// it: an older `nn-admin` reads the counters it knows, a newer one
-/// refuses an older reply with an error, never a status.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// refuses an older reply with an error, never a status. 6 (lot 2.1, the S2
+/// scaffold — its one bump for the stage): by `installer_window_tree`,
+/// `role_marks` and `kernel_read_refused`, with the tree grant's request
+/// appended to the messages.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// The oldest envelope version this build decodes. Version 1 named
 /// formats this build would misread (fields appended to the status reply
@@ -2186,8 +2253,9 @@ pub const PROTOCOL_VERSION: u16 = 5;
 /// (lot 369): a version 3 one lacks `runtime_clones`. 5 (lot 379): a
 /// version 4 one lacks `advisories`. (A version 4 reply that carries
 /// `runtime_clones` also lacks the four counters lot 381 added to it;
-/// the number does not track that nested growth.)
-pub const OLDEST_PROTOCOL_VERSION: u16 = 5;
+/// the number does not track that nested growth.) 6 (lot 2.1): a version 5
+/// one lacks the S2 scaffold's three fields.
+pub const OLDEST_PROTOCOL_VERSION: u16 = 6;
 
 /// Errors that can occur when encoding or decoding a frame.
 #[derive(Debug)]
@@ -2517,7 +2585,22 @@ mod tests {
                 still_held: 0,
                 message: String::new(),
             });
-        assert_eq!(first(&acknowledged), 60, "the last production variant");
+        assert_eq!(first(&acknowledged), 60, "IntegrityAcknowledgeResponse");
+        // Lot 2.1 (the S2 scaffold): the tree grant, appended after lot
+        // 379's pair — the last production variant
+        let tree =
+            AdminMessage::TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest {
+                payload: SignedPayload::new_trusted_installer_tree_grant(
+                    test_nonce(),
+                    0,
+                    [0; 16],
+                    1,
+                    2,
+                    3,
+                ),
+                signatures: Vec::new(),
+            });
+        assert_eq!(first(&tree), 61, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -2533,9 +2616,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                61
+                62
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 62);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 63);
         }
     }
 
@@ -2677,6 +2760,9 @@ mod tests {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            installer_window_tree: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2769,6 +2855,9 @@ mod tests {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            installer_window_tree: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2928,7 +3017,8 @@ mod tests {
                 | AdminMessage::RemediateRansomwareRequest(_)
                 | AdminMessage::RemediateRansomwareResponse(_)
                 | AdminMessage::IntegrityAcknowledgeRequest(_)
-                | AdminMessage::IntegrityAcknowledgeResponse(_) => {}
+                | AdminMessage::IntegrityAcknowledgeResponse(_)
+                | AdminMessage::TrustedInstallerTreeGrantRequest(_) => {}
             }
         }
     }
@@ -3040,6 +3130,9 @@ mod tests {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            installer_window_tree: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -3156,6 +3249,9 @@ mod tests {
             kernel_state_held_back: None,
             runtime_clones: None,
             advisories: None,
+            installer_window_tree: None,
+            role_marks: None,
+            kernel_read_refused: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -3263,14 +3359,14 @@ mod tests {
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
         // lot 322's two exec-guard counters, lot 325's four, lot 341's two,
         // lot 313's two content-check counters, the review of #565's
-        // `kernel_state_held_back`, lot 369's `runtime_clones` and lot
-        // 379's `advisories`
-        assert!(a.ends_with(&[0; 17]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 17]) && b.len() > a.len());
+        // `kernel_state_held_back`, lot 369's `runtime_clones`, lot 379's
+        // `advisories` and lot 2.1's three
+        assert!(a.ends_with(&[0; 20]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 20]) && b.len() > a.len());
         assert!(
-            b.ends_with(&[0; 16]),
+            b.ends_with(&[0; 19]),
             "R12b's, R12c's, lot 276's, lot 322's, lot 325's, lot 341's, lot 313's, the review \
-             of #565's, lot 369's and lot 379's fields, absent"
+             of #565's, lot 369's, lot 379's and lot 2.1's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
@@ -3301,7 +3397,7 @@ mod tests {
         // export, lot 322's two counters, lot 325's four, lot 341's two,
         // lot 313's two, the review of #565's one, lot 369's one, lot 379's
         // one — all absent)
-        assert!(c.starts_with(&b[..b.len() - 16]) && c.len() > b.len());
+        assert!(c.starts_with(&b[..b.len() - 19]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3364,7 +3460,7 @@ mod tests {
         // (c's last fifteen: the dispatch, lot 276's export, lot 322's two
         // counters, lot 325's four, lot 341's two, lot 313's two, the
         // review of #565's one, lot 369's one and lot 379's one, absent)
-        assert!(d.starts_with(&c[..c.len() - 15]) && d.len() > c.len());
+        assert!(d.starts_with(&c[..c.len() - 18]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3931,8 +4027,8 @@ mod tests {
         // four, lot 341's `profile` and `records_today`, lot 313's
         // `program_copy_compared_total` and `program_copy_skipped_total`,
         // the review of #565's `kernel_state_held_back`, lot 369's
-        // `runtime_clones`, lot 379's `advisories`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2 + 2 + 1 + 1 + 1;
+        // `runtime_clones`, lot 379's `advisories`, lot 2.1's three.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2 + 2 + 1 + 1 + 1 + 3;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3959,15 +4055,17 @@ mod tests {
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
         // lot 325's four fields, lot 341's two, lot 313's two, the review
-        // of #565's one, lot 369's one and lot 379's one follow them,
-        // absent here
-        let before = without.len() - 13;
+        // of #565's one, lot 369's one, lot 379's one and lot 2.1's three
+        // follow them, absent here
+        let before = without.len() - 16;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before..], &[0; 16]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
         assert_eq!(
             &with[before..],
-            &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[
+                1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
         );
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -3988,17 +4086,17 @@ mod tests {
         status.execpol_lost_open_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
         // the review of #547's field, lot 341's two, lot 313's two, the
-        // review of #565's one, lot 369's one and lot 379's one follow
-        // them, absent here
-        let before = without.len() - 11;
+        // review of #565's one, lot 369's one, lot 379's one and lot 2.1's
+        // three follow them, absent here
+        let before = without.len() - 14;
         assert_eq!(&with[..before], &without[..before]);
         assert_eq!(
             &without[before - 4..],
-            &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
             &with[before..],
-            &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -4013,11 +4111,15 @@ mod tests {
         status.open_sensor_per_call_total = Some(6);
         let with = postcard::to_allocvec(&status).unwrap();
         // lot 341's two fields, lot 313's two counters, the review of
-        // #565's field, lot 369's and lot 379's follow it, absent here
-        let before = without.len() - 8;
+        // #565's field, lot 369's, lot 379's and lot 2.1's three follow it,
+        // absent here
+        let before = without.len() - 11;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 6, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &without[before - 2..],
+            &[1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(&with[before..], &[1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -4033,13 +4135,16 @@ mod tests {
         status.program_copy_compared_total = Some(3);
         status.program_copy_skipped_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        // the review of #565's field, lot 369's and lot 379's follow them,
-        // absent
-        let before = without.len() - 5;
+        // the review of #565's field, lot 369's, lot 379's and lot 2.1's
+        // three follow them, absent
+        let before = without.len() - 8;
         assert_eq!(&with[..before], &without[..before]);
         // lot 341's two fields, absent, between them
-        assert_eq!(&without[before - 4..], &[1, 5, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02, 0, 0, 0]);
+        assert_eq!(
+            &without[before - 4..],
+            &[1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02, 0, 0, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -4053,14 +4158,14 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.kernel_state_held_back = Some(vec![("bpf_unseen".to_string(), 300)]);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 369's and lot 379's fields follow it, absent
-        let before = without.len() - 3;
+        // lot 369's, lot 379's and lot 2.1's three fields follow it, absent
+        let before = without.len() - 6;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 4, 0, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 4, 0, 0, 0, 0, 0, 0]);
         // Some, one pair: the name's length and bytes, varint 300
         let mut tail = vec![1, 1, 10];
         tail.extend_from_slice(b"bpf_unseen");
-        tail.extend_from_slice(&[0xac, 0x02, 0, 0]);
+        tail.extend_from_slice(&[0xac, 0x02, 0, 0, 0, 0, 0]);
         assert_eq!(&with[before..], tail.as_slice());
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
@@ -4083,13 +4188,17 @@ mod tests {
             ..Default::default()
         });
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 379's field follows it, absent
-        let before = without.len() - 2;
+        // lot 379's field and lot 2.1's three follow it, absent
+        let before = without.len() - 5;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 0, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 0, 0, 0, 0, 0, 0]);
         // lot 381: its three counts follow lot 369's four, inside it; the
-        // review of #588 (F4): `lost` after them; then lot 379's field, absent
-        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0, 0, 0]);
+        // review of #588 (F4): `lost` after them; then lot 379's field and
+        // lot 2.1's three, absent
+        assert_eq!(
+            &with[before..],
+            &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -4110,11 +4219,16 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.advisories = Some(vec!["integrity: admin_key_on_host".to_string()]);
         let with = postcard::to_allocvec(&status).unwrap();
-        let before = without.len() - 1;
+        // lot 2.1's three fields follow it, absent
+        let before = without.len() - 4;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(without[before], 0, "absent");
+        assert_eq!(&without[before..], &[0, 0, 0, 0], "absent");
         assert_eq!(&with[before..before + 3], &[1, 1, 28]);
-        assert_eq!(&with[before + 3..], b"integrity: admin_key_on_host");
+        assert_eq!(
+            &with[before + 3..with.len() - 3],
+            b"integrity: admin_key_on_host"
+        );
+        assert_eq!(&with[with.len() - 3..], &[0, 0, 0]);
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -4177,11 +4291,14 @@ mod tests {
             would_have: vec![],
         });
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 313's two counters, the review of #565's field, lot 369's
-        // and lot 379's follow them, absent here
-        let before = without.len() - 7;
+        // lot 313's two counters, the review of #565's field, lot 369's,
+        // lot 379's and lot 2.1's three follow them, absent here
+        let before = without.len() - 10;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &without[before - 2..],
+            &[1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(
             &with[before..before + 2],
             &[1, 24],
@@ -4372,6 +4489,59 @@ mod tests {
                 }],
             },
         ));
+        // lot 2.1 (the S2 scaffold): the grant for one tree, its root inside
+        // the signed scope
+        let payload = SignedPayload::new_trusted_installer_tree_grant(
+            [0x46; 32],
+            1_700_000_002,
+            [0x55; 16],
+            300,
+            4242,
+            987_654,
+        );
+        roundtrip(AdminMessage::TrustedInstallerTreeGrantRequest(
+            TrustedInstallerTreeGrantRequest {
+                payload,
+                signatures: vec![KeyedSignature {
+                    signature: [0x68; 64],
+                }],
+            },
+        ));
+    }
+
+    /// Lot 2.1 (the S2 scaffold): the three status fields go and come back
+    /// and are appended after lot 379's `advisories` — an absent field is
+    /// one tag byte, so a reply that has none of them is the old reply
+    /// with three zero bytes after it.
+    #[test]
+    fn the_s2_status_fields_are_appended_last() {
+        let base = StatusResponse::public(PostureKind::Observing, false, None, None, None);
+        let without = postcard::to_allocvec(&base).unwrap();
+        assert!(
+            without.ends_with(&[0, 0, 0, 0]),
+            "advisories and the three, absent"
+        );
+        let mut with = base.clone();
+        with.installer_window_tree = Some(InstallerWindowTree {
+            root_pid: 4242,
+            root_start_ticks: 77,
+            members: 3,
+            members_max: 4096,
+            outsiders_refused: 2,
+            left_outside_full: 0,
+        });
+        with.role_marks = Some(RoleMarks {
+            marked: 6,
+            unmarked_refused: 1,
+        });
+        with.kernel_read_refused = Some(vec!["physical-memory".into()]);
+        let bytes = postcard::to_allocvec(&with).unwrap();
+        assert_eq!(&bytes[..without.len() - 3], &without[..without.len() - 3]);
+        assert_eq!(
+            postcard::from_bytes::<StatusResponse>(&bytes).unwrap(),
+            with
+        );
+        roundtrip(AdminMessage::StatusResponse(with));
     }
 
     /// Tappa 9.0.b: the `Detections` request + response survive a wire
@@ -5032,10 +5202,13 @@ mod tests {
     // appended last; every byte before it is the review of #565's pin.
     // Lot 379 (the review of #586): one more (0x5c), the absent tag of
     // `advisories`, appended last; every byte before it is lot 369's pin.
+    // Lot 2.1 (the S2 scaffold): three more (0x5f), the absent tags of
+    // `installer_window_tree`, `role_marks` and `kernel_read_refused`;
+    // every byte before them is lot 379's pin.
     const STATUS_RESPONSE: &str = concat!(
-        "0000005c050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+        "0000005f050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
         "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-        "00000000000000000000000000000000",
+        "00000000000000000000000000000000000000",
     );
     const SHUTDOWN_REQUEST: &str = concat!(
         "0000007a0602abababababababababababababababababababababababababababababababab808f",
@@ -5049,8 +5222,8 @@ mod tests {
     );
     // Lot 354: the envelope at PROTOCOL_VERSION 2 (its second byte; it was
     // 01 before the version moved). The review of #565 (F2): at 3. Lot
-    // 369: at 4. Lot 379: at 5.
-    const QUORUM_NOT_MET_VERSIONED: &str = "000000050507050201";
+    // 369: at 4. Lot 379: at 5. Lot 2.1: at 6.
+    const QUORUM_NOT_MET_VERSIONED: &str = "000000050607050201";
 
     /// Wave 4 restructure, R03 (lab PR 240): whole frames pinned, byte for
     /// byte, as `main` 2e1438f encoded them before this module left
@@ -5114,13 +5287,14 @@ mod tests {
     /// 0x4b bytes long then); row 2 the frames when the version moved to
     /// mark the formats changed since; row 3 (the review of #565, F2) the
     /// status reply with `kernel_state_held_back` appended; row 4 (lot 369)
-    /// with `runtime_clones`; row 5 (lot 379) with `advisories`.
+    /// with `runtime_clones`; row 5 (lot 379) with `advisories`; row 6 (lot
+    /// 2.1, the S2 scaffold) with its three fields.
     const _: () = assert!(
         OLDEST_PROTOCOL_VERSION >= 1 && OLDEST_PROTOCOL_VERSION <= PROTOCOL_VERSION,
         "the oldest version decoded is at most the current one"
     );
 
-    const PINNED_FRAMES_AT_VERSION: [(u16, &str); 5] = [
+    const PINNED_FRAMES_AT_VERSION: [(u16, &str); 6] = [
         (
             1,
             "e9acc80ae2d89bd2a65f21b5a336c6e1ca2bd3edde7c43006a322b112e6f35f3",
@@ -5140,6 +5314,10 @@ mod tests {
         (
             5,
             "d0f4d78ca479b8719db4ea36ffb64088b2370eb8b731036b4fb0229bd02a940c",
+        ),
+        (
+            6,
+            "724055039a0b921a119bc2ed5eefa9ac0eeb4b858a8d7fc52832118b384caa9a",
         ),
     ];
 
