@@ -70,7 +70,7 @@ const NOT_VERSIONED: &[(&str, &str)] = &[(
 
 #[test]
 fn the_workspace_is_the_alpha() {
-    assert_eq!(workspace_version(), "0.1.0-alpha");
+    assert_eq!(workspace_version(), "0.1.1-alpha");
 }
 
 #[test]
@@ -184,8 +184,8 @@ fn the_changelog_check_reads_the_first_release_section() {
         top_release_section(with_unreleased),
         "## [1.0.0] - 2026-01-01"
     );
-    let plain = "# Changelog\n\n## [0.1.0-alpha] - unreleased\n\n## [0.0.1] - 2026-10-09\n";
-    assert_eq!(top_release_section(plain), "## [0.1.0-alpha] - unreleased");
+    let plain = "# Changelog\n\n## [0.1.1-alpha] - unreleased\n\n## [0.1.0-alpha] - 2026-11-23\n";
+    assert_eq!(top_release_section(plain), "## [0.1.1-alpha] - unreleased");
 }
 
 fn mk_packages_versions(release: &str) -> Vec<(String, String)> {
@@ -211,12 +211,12 @@ fn mk_packages_versions(release: &str) -> Vec<(String, String)> {
 fn the_packages_carry_the_pre_release_with_a_tilde_and_the_files_with_a_dash() {
     let got = mk_packages_versions("3");
     let want: Vec<(String, String)> = [
-        ("version", "0.1.0-alpha"),
-        ("package", "0.1.0~alpha"),
-        ("deb", "0.1.0~alpha-3"),
-        ("rpm", "0.1.0~alpha 3"),
-        ("deb_file", "northnarrow_0.1.0-alpha-3_amd64.deb"),
-        ("rpm_file", "northnarrow-0.1.0-alpha-3.x86_64.rpm"),
+        ("version", "0.1.1-alpha"),
+        ("package", "0.1.1~alpha"),
+        ("deb", "0.1.1~alpha-3"),
+        ("rpm", "0.1.1~alpha 3"),
+        ("deb_file", "northnarrow_0.1.1-alpha-3_amd64.deb"),
+        ("rpm_file", "northnarrow-0.1.1-alpha-3.x86_64.rpm"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -237,8 +237,10 @@ fn the_packages_carry_the_pre_release_with_a_tilde_and_the_files_with_a_dash() {
 }
 
 /// dpkg orders the alpha before its release and after 0.0.1 (the
-/// packages' upgrade path). Where dpkg is absent the order is the release
-/// workflow's to check (its package job checks dpkg's and rpm's).
+/// packages' upgrade path), and each alpha after the one before it (the
+/// upgrade from the published `0.1.0~alpha`). Where dpkg is absent the
+/// order is the release workflow's to check (its package job checks dpkg's
+/// and rpm's).
 #[test]
 fn dpkg_sorts_the_alpha_between_0_0_1_and_0_1_0() {
     let cmp = |a: &str, op: &str, b: &str| {
@@ -254,6 +256,11 @@ fn dpkg_sorts_the_alpha_between_0_0_1_and_0_1_0() {
     assert!(lt, "0.1.0~alpha-1 < 0.1.0-1");
     assert!(cmp("0.1.0~alpha-1", "gt", "0.0.1-9").unwrap());
     assert!(cmp("0.1.0~alpha-2", "gt", "0.1.0~alpha-1").unwrap());
+    // lot R1: the second alpha upgrades the published first one, and sorts
+    // before its own release
+    assert!(cmp("0.1.1~alpha-1", "gt", "0.1.0~alpha-1").unwrap());
+    assert!(cmp("0.1.1~alpha-1", "gt", "0.1.0-1").unwrap());
+    assert!(cmp("0.1.1~alpha-1", "lt", "0.1.1-1").unwrap());
 }
 
 #[test]
@@ -300,8 +307,19 @@ fn a_tag_is_released_only_as_the_workspace_version_with_its_dated_section() {
         "{}",
         String::from_utf8_lossy(&ok.stderr)
     );
-    for tag in ["v0.1.0", "v0.0.1", "0.1.0-alpha", "v0.1.0-alpha.1"] {
-        let r = run(tag, &dated_path);
+    // the release without its pre-release, an earlier tag (the published
+    // first alpha among them), the version without its `v`, a longer
+    // pre-release
+    let plain = ws.split('-').next().unwrap();
+    for tag in [
+        format!("v{plain}"),
+        "v0.1.0".to_string(),
+        "v0.1.0-alpha".to_string(),
+        "v0.0.1".to_string(),
+        ws.clone(),
+        format!("v{ws}.1"),
+    ] {
+        let r = run(&tag, &dated_path);
         assert_eq!(r.status.code(), Some(1), "{tag} was accepted");
     }
     std::fs::remove_dir_all(&dir).ok();

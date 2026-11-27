@@ -260,6 +260,22 @@ pub(super) fn dispatch(
             }
             AdminMessage::TrustedInstallerGrantResult(r)
         }
+        // Lot 2.1 (S2 scaffold): the grant for one process tree is declared
+        // and verified like the plain grant (the challenge's nonce, the
+        // quorum, the role); lot 2.3 arms it. Until then no window opens:
+        // the reply is `UnknownOperation`, as for a verified grant with no
+        // override wired. No client sends it yet; from 2.3 `nn-admin` will
+        // never fall back to the plain grant on a refusal (the design's
+        // "Trusted-installer window per process tree", section 5).
+        AdminMessage::TrustedInstallerTreeGrantRequest(req) => {
+            AdminMessage::TrustedInstallerGrantResult(super::verify::signed(
+                &req,
+                auth,
+                fps_out,
+                |r| r,
+                |_| nn_proto::admin_protocol::AdminResult::UnknownOperation,
+            ))
+        }
         AdminMessage::ConfigOverlaySetRequest(req) => {
             AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(
                 req,

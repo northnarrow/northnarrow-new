@@ -12,8 +12,8 @@ body:
     id: release
     attributes:
       label: Release
-      description: The output of `nn-admin --version`, and how you installed (tarball or `.deb`).
-      placeholder: "nn-admin 0.1.0-alpha (tarball)"
+      description: "The output of `nn-admin --version` (a release: `0.1.1-alpha`, `0.1.0-alpha`; or a build of `main`, with its commit), and how you installed (tarball, `.deb` or `.rpm`)."
+      placeholder: "nn-admin 0.1.1-alpha (tarball)"
     validations:
       required: true
   - type: input

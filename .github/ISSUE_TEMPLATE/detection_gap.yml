@@ -44,7 +44,8 @@ body:
     id: release
     attributes:
       label: Release, distribution and kernel
-      placeholder: "0.1.0-alpha (.deb), Ubuntu 26.04, 7.0.0-12-generic"
+      description: "The release (`0.1.1-alpha`, `0.1.0-alpha`, or a build of `main` with its commit) and how you installed it, `PRETTY_NAME` from `/etc/os-release` and `uname -r`."
+      placeholder: "0.1.1-alpha (.deb), Ubuntu 26.04, 7.0.0-12-generic"
     validations:
       required: true
   - type: checkboxes

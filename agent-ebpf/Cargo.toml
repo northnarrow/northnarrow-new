@@ -1,6 +1,6 @@
 [package]
 name = "northnarrow-agent-ebpf"
-version = "0.1.0-alpha"
+version = "0.1.1-alpha"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/northnarrow/northnarrow-new"

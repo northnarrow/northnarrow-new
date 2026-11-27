@@ -200,6 +200,14 @@ pub struct ResolvedOffsets {
     /// value moves with the kernel), what the verifier asks the
     /// `locked_down` hook when a program calls `bpf_probe_write_user`.
     pub lockdown_bpf_write_user: Option<u32>,
+    /// Lot 2.1 (S2 scaffold, the kernel-read option): this kernel's value of each `enum
+    /// lockdown_reason` enumerator the kernel-read option refuses
+    /// ([`common::wire::KERNEL_READ_LOCKDOWN`], in that table's order),
+    /// `None` where its BTF names none. Their values move with the kernel,
+    /// as `LOCKDOWN_BPF_WRITE_USER`'s do: resolved here, never compiled in.
+    /// Read by no one yet: lot 2.2 hands them to the `locked_down` guard.
+    /// Boxed, as `forbidden_kfunc_ids`.
+    pub kernel_read_lockdown: Box<[Option<u32>; common::wire::KERNEL_READ_LOCKDOWN.len()]>,
 }
 
 impl ResolvedOffsets {
@@ -723,10 +731,21 @@ fn resolve_with(
                 .resolve_enum("lockdown_reason", "LOCKDOWN_BPF_WRITE_USER")
                 .ok()
                 .and_then(|v| u32::try_from(v).ok()),
+            kernel_read_lockdown: kernel_read_lockdown(btf),
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
     }
+}
+
+/// Lot 2.1 (S2 scaffold): [`ResolvedOffsets::kernel_read_lockdown`] from
+/// `btf`'s `enum lockdown_reason`.
+fn kernel_read_lockdown(btf: &Btf) -> Box<[Option<u32>; common::wire::KERNEL_READ_LOCKDOWN.len()]> {
+    Box::new(common::wire::KERNEL_READ_LOCKDOWN.map(|(name, _)| {
+        btf.resolve_enum("lockdown_reason", name)
+            .ok()
+            .and_then(|v| u32::try_from(v).ok())
+    }))
 }
 
 /// Lot 303: [`common::module_judge::read_id_drift`] against `btf`'s
@@ -2995,6 +3014,45 @@ mod tests {
         assert!(!r.prog_load_hook);
         assert_eq!(*r.forbidden_kfunc_ids, [None; 5]);
         assert_eq!(r.lockdown_bpf_write_user, Some(16));
+    }
+
+    /// Lot 2.1 (S2 scaffold, the kernel-read option): the kernel-read option's lockdown
+    /// questions are read from the kernel's own enum, by name — a value
+    /// that moved is the kernel's, and an enumerator this kernel lacks is
+    /// `None` in its place, never a guess.
+    #[test]
+    fn the_kernel_read_lockdown_reasons_are_read_by_name() {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let prog = b.composite(Some("bpf_prog"), false, false, &[]);
+        let p = b.ptr(prog);
+        b.enumeration(
+            "lockdown_reason",
+            &[
+                ("LOCKDOWN_NONE", 0),
+                ("LOCKDOWN_DEV_MEM", 2),
+                ("LOCKDOWN_KCORE", 22),
+                ("LOCKDOWN_KPROBES", 23),
+                ("LOCKDOWN_TRACEFS", 27),
+            ],
+        );
+        b.func("bpf_lsm_bpf_prog", int, &[p]);
+        let r = hooks_only(&Btf::parse(&b.build()).expect("parses"));
+        // in the table's order: DEV_MEM, KCORE, TRACEFS, KPROBES, PERF
+        assert_eq!(
+            common::wire::KERNEL_READ_LOCKDOWN.map(|(n, _)| n),
+            [
+                "LOCKDOWN_DEV_MEM",
+                "LOCKDOWN_KCORE",
+                "LOCKDOWN_TRACEFS",
+                "LOCKDOWN_KPROBES",
+                "LOCKDOWN_PERF"
+            ]
+        );
+        assert_eq!(
+            *r.kernel_read_lockdown,
+            [Some(2), Some(22), Some(27), Some(23), None]
+        );
     }
 
     fn slot_value(r: &ResolvedOffsets, slot: u32) -> u32 {

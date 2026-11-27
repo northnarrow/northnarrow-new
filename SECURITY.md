@@ -6,9 +6,15 @@ and are handled as a priority.
 
 ## Supported versions
 
-The project is pre-release (`0.x`: the current tag is `v0.1.0-alpha`, the
-first alpha). Security fixes land on the `main` branch and ship in the
+The project is pre-release (`0.x`: the current tag is `v0.1.1-alpha`, the
+second alpha). Security fixes land on the `main` branch and ship in the
 next tag; there are no backports.
+
+| Version | Supported |
+|---|---|
+| `v0.1.1-alpha` | yes, until the next tag is published |
+| `v0.1.0-alpha` | no: its support period ended when `v0.1.1-alpha` was published; upgrade to `v0.1.1-alpha` |
+| `v0.0.1-tappa9.0` and earlier | no |
 
 **Support period.** A `0.x` tag is supported until the next tag is
 published: on that day its support period ends, and the fix for a
