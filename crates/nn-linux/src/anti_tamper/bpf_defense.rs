@@ -2350,13 +2350,18 @@ fn set_marks_armed<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapD
     a: &mut Array<M, u32>,
     on: bool,
 ) -> std::result::Result<(), String> {
-    let v = if on {
+    a.set(0, &armed_word(on), 0)
+        .map_err(|e| format!("{}: {e}", common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+}
+
+/// The arm flag's word: [`common::exec_marks::EXEC_MARKS_ARMED_ON`] when
+/// armed, 0 (nothing judged) when not.
+fn armed_word(on: bool) -> u32 {
+    if on {
         common::exec_marks::EXEC_MARKS_ARMED_ON
     } else {
         0
-    };
-    a.set(0, &v, 0)
-        .map_err(|e| format!("{}: {e}", common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+    }
 }
 
 /// Lot 2.2 (the review of #644, F5): the degradation a failed refresh of
@@ -2919,6 +2924,33 @@ mod tests {
         };
         assert_eq!(role_images(&one, None).len(), 1);
         assert!(role_images(&OwnExes::default(), None).is_empty());
+    }
+
+    /// The review of #644 (F5): the arm flag's word is the hooks' "armed"
+    /// only when the marks were written whole; the live watchdog's main
+    /// image is kept only when it is a role image already (its own
+    /// `/proc/<pid>/exe`, by kernel key).
+    #[test]
+    fn the_marks_are_armed_only_when_written_and_keep_a_marked_watchdog() {
+        assert_eq!(armed_word(true), common::exec_marks::EXEC_MARKS_ARMED_ON);
+        assert_eq!(armed_word(false), 0);
+        assert_ne!(common::exec_marks::EXEC_MARKS_ARMED_ON, 0);
+        let me = Some(std::process::id());
+        assert_eq!(watchdog_main(me, |_| false), None, "not a role image");
+        let k = watchdog_main(me, |_| true).expect("this test's own executable");
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!(k.ino, m.ino());
+        assert_eq!(
+            k.dev,
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev())
+        );
+        assert_eq!(
+            watchdog_main(Some(common::wire::ROLE_VACATED), |_| true),
+            None
+        );
+        assert_eq!(watchdog_main(Some(0), |_| true), None);
+        assert_eq!(watchdog_main(None, |_| true), None);
     }
 
     /// Lot 2.2 (named): the kernel-read configuration — the classes, each

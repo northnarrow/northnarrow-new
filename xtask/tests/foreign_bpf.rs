@@ -1566,6 +1566,18 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
         ],
     )
     .unwrap();
+    // the idmapping by its layout: maps of its own (6.7 on), an owner
+    // (6.3 to 6.6), or the mount's user namespace (5.12 to 6.2)
+    in_order(
+        body(&r, "mount_idmapped"),
+        &[
+            "let Some(o_map) = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET) else {",
+            "if let Some(o) = off_opt!(MNT_IDMAP_UID_NR_EXTENTS_OFFSET) {\n            return bpf_probe_read_kernel::<u32>(map.add(o) as *const u32).unwrap_or(0) != 0;\n        }",
+            "Some(o) => bpf_probe_read_kernel::<*const u8>(map.add(o) as *const *const u8).unwrap_or(core::ptr::null()),\n            None => map,",
+            "userns_level(ns) != 0",
+        ],
+    )
+    .unwrap();
     assert!(r.contains("if (raw_arg(ctx, 1) | raw_arg(ctx, 2)) & PROT_EXEC != 0 {\n            let _ = nn_role_map(file, 0);"));
     assert!(body(&r, "role_file_mprotect").contains(
         "if (raw_arg(&ctx, 1) | raw_arg(&ctx, 2)) & PROT_EXEC != 0 {\n            let vma = raw_arg(&ctx, 0);\n            if vma != 0 {\n                let _ = nn_role_map(0, vma);"
@@ -1615,6 +1627,55 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
     for needle in ["/maps", "nsswitch", "ld.so.preload"] {
         assert!(!images.contains(needle), "role_images reads {needle}");
     }
+}
+
+/// Lot 2.2 (the review of #644, F3 and F4): the role watch runs at the
+/// agent's start and each round of the link self-check, and at once after
+/// a cgroup attach the kernel let through (the `bpf` ring's row wakes it);
+/// each finding is signed when it appears and its end when it goes; the
+/// census only asks the kernel (`BPF_PROG_QUERY`), it never detaches.
+#[test]
+fn the_cgroup_census_runs_after_each_attach_and_never_detaches() {
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    assert!(m.contains("                    cgroup_attach_wakes_census,\n"));
+    assert!(body(&m, "cgroup_attach_wakes_census").contains(
+        "if crate::anti_tamper::role_watch::is_cgroup_attach_row(raw.cmd, raw.arg) {\n        crate::anti_tamper::role_watch::census_soon();"
+    ));
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "spawn_link_self_check"),
+        &[
+            "if !first {\n                    super::role_watch::wait_round(",
+            "ids.extend(crate::sysctl_cgroup::own_prog_id());",
+            "super::role_watch::preload_findings(watchdog),\n                        super::role_watch::census(&own_ids),",
+            "let (fresh, gone) = signed.fresh(&now, kept);",
+            "crate::self_integrity::report_event(audit_log.as_ref(), f);",
+            "crate::self_integrity::report_cleared(audit_log.as_ref(), f);",
+        ],
+    )
+    .unwrap();
+    let w = code("crates/nn-linux/src/anti_tamper/role_watch.rs");
+    let census = body(&w, "census");
+    assert!(census.contains("crate::sysctl_cgroup::query_cgroup(fd, t)"));
+    for forbidden in [
+        "BPF_PROG_DETACH",
+        "bpf_cmd::BPF_PROG_DETACH",
+        "query_flags: 1",
+    ] {
+        assert!(
+            !w.contains(forbidden),
+            "the census detaches nothing: {forbidden}"
+        );
+    }
+    assert!(
+        body(&w, "census_with")
+            .contains("for (attach, t, _) in common::bpf_cmd::CGROUP_ATTACH_TYPES {")
+    );
+    let s = code("crates/nn-linux/src/sysctl_cgroup.rs");
+    assert!(
+        body(&s, "query_cgroup").contains("query_flags: 0,"),
+        "the cgroup's own programs, not what it inherits"
+    );
 }
 
 /// Lot 2.2 (named): a shared mapping of a write-protected file opened for

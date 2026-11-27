@@ -3283,6 +3283,18 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
 mod tests {
     use super::*;
 
+    /// Lot 2.2 (the review of #644, F3, F4): a preloaded library in a role
+    /// process and a foreign cgroup program on the agent's cgroups are
+    /// signed High.
+    #[test]
+    fn the_role_watch_s_findings_are_high() {
+        assert!(high_kind(crate::anti_tamper::role_watch::PRELOAD_KIND));
+        assert!(high_kind(
+            crate::anti_tamper::role_watch::CGROUP_FOREIGN_KIND
+        ));
+        assert!(!high_kind("bpffs_mount"));
+    }
+
     /// Lot 357 (re-check 3 of #563, R3-1 and R3-3): the integrity round's
     /// reads and writes of the agent's own directories — the overlays, the
     /// watchdog's pidfile, its holds and refused markers, the cross-view's
