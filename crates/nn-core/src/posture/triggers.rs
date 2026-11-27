@@ -881,6 +881,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // summary of the findings its quota held back included.
             // Lot 357: nor a mount the signed window let through, nor (the
             // review of #567) an unmount let through and recorded.
+            // Lot 2.0: nor a write of the SysRq trigger the signed window
+            // let through (recorded Low).
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if *operation == nn_model::FsProtectOperation::PtraceRead {
@@ -901,6 +903,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::BpfHeldLoad
                     | nn_model::FsProtectOperation::MountWindow
                     | nn_model::FsProtectOperation::MountNoted
+                    | nn_model::FsProtectOperation::SysrqWindow
             ) && !operation.is_sole_trace()
             {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
@@ -953,6 +956,10 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         | nn_model::FsProtectOperation::Kprobes
                         | nn_model::FsProtectOperation::Lockdown
                         | nn_model::FsProtectOperation::SysctlRootAttach
+                        // lot 2.0: the SysRq trigger file, refused whatever
+                        // letter it carries; an administrator's `echo w` (a
+                        // dump of the blocked tasks) meets it too
+                        | nn_model::FsProtectOperation::Sysrq
                         // lot 290: a load of a refused program type, a
                         // handle on the agent's maps or programs to read or
                         // inspect them — refused; an administrator's
@@ -5225,8 +5232,9 @@ mod tests {
         // lot 357: a mount the window let through, one more minor (the
         // refused mount is decisive); the review of #567: an unmount let
         // through and recorded, one more; its re-check (b): a read-mode
-        // ptrace access refused, one more
-        assert_eq!((minor, sole), (20, 7));
+        // ptrace access refused, one more; lot 2.0: the SysRq trigger
+        // refused, and a window's write of it, two more
+        assert_eq!((minor, sole), (22, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -5265,6 +5273,8 @@ mod tests {
             w::FS_OP_MOUNT_WINDOW,
             w::FS_OP_MOUNT_NOTED,
             w::FS_OP_PTRACE_READ,
+            w::FS_OP_SYSRQ,
+            w::FS_OP_SYSRQ_WINDOW,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }
@@ -5422,6 +5432,8 @@ mod tests {
             nn_model::FsProtectOperation::ExemptInjection,
             // lot 349: nor the agent's own CPU watch's
             nn_model::FsProtectOperation::CpuConfined,
+            // lot 2.0: nor a window's write of the SysRq trigger
+            nn_model::FsProtectOperation::SysrqWindow,
         ] {
             assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }
@@ -5429,6 +5441,8 @@ mod tests {
             nn_model::FsProtectOperation::Kprobes,
             nn_model::FsProtectOperation::Lockdown,
             nn_model::FsProtectOperation::SysctlRootAttach,
+            // lot 2.0: the SysRq trigger refused
+            nn_model::FsProtectOperation::Sysrq,
         ] {
             assert_eq!(
                 det.detect(&ev(op), &[]),

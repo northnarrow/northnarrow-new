@@ -170,7 +170,8 @@ impl Rule for NnLAt001AntiTamperDenial {
                 "to write a global sysctl (inode {target_dev}:{target_ino}) with a value that aborts \
                  or starves the agent with the host (overcommit, pid_max, threads-max, \
                  max_map_count or real-time throttling), or kernel.ftrace_enabled, refused whatever \
-                 it carries (0 stops the BPF trampolines, the agent's hooks among them)"
+                 it carries (0 stops the BPF trampolines, the agent's hooks among them), or a \
+                 kernel.sysrq mask that lets the keyboard signal processes"
             ),
             // Lot 280a: the cgroup/sysctl program on the root cgroup judged
             // the kernel's copy of the write (no second thread changes it).
@@ -185,8 +186,9 @@ impl Rule for NnLAt001AntiTamperDenial {
                     "to write {name} {value} (judged on the kernel's copy of the write by the \
                      cgroup/sysctl program on the root cgroup) — a value that aborts or starves \
                      the agent with the host (overcommit, pid_max, threads-max, max_map_count, \
-                     real-time throttling), or a write of kernel.ftrace_enabled or \
-                     kernel.sched_rt_period_us, refused whatever it carries"
+                     real-time throttling), a kernel.sysrq mask that lets the keyboard signal \
+                     processes, or a write of kernel.ftrace_enabled or kernel.sched_rt_period_us, \
+                     refused whatever it carries"
                 )
             }
             // Lot 280a: not refused — the signed per-sysctl opt-out let it
@@ -244,6 +246,28 @@ impl Rule for NnLAt001AntiTamperDenial {
                  read kernel memory from every BPF program loaded after it, the agent's next \
                  start among them"
             ),
+            // Lot 2.0: the SysRq trigger file, every caller outside a window.
+            FsProtectOperation::Sysrq => format!(
+                "to write /proc/sysrq-trigger (inode {target_dev}:{target_ino}) outside a \
+                 trusted-installer window — each request letter acts on the whole host (its \
+                 processes, its file systems, its power), outside every other hook"
+            ),
+            FsProtectOperation::SysrqWindow => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) opened /proc/sysrq-trigger for writing (inode \
+                     {target_dev}:{target_ino}), which is refused outside a trusted-installer \
+                     window; the signed window let it through (recorded, not refused). Check \
+                     that the installer or the operator meant it: each request letter acts on \
+                     the whole host."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             // Lot 386: a known root program's packaged loader re-attaching
             // that same program after the agent started (networkd's sysctl
             // monitor, at a restart), proven at the bus: refused all the
@@ -1455,6 +1479,8 @@ mod tests {
             FsProtectOperation::SysctlRootAttach,
             FsProtectOperation::SysctlRootProg,
             FsProtectOperation::Sigio,
+            // lot 2.0
+            FsProtectOperation::Sysrq,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -1569,6 +1595,27 @@ mod tests {
         );
         assert!(v.reasoning.contains("sysctl-allow"), "{}", v.reasoning);
         assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
+        // lot 2.0: the keyboard's SysRq mask widened to the signalling of
+        // processes, named with its value, refused (High)
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::SysctlValue,
+                record_dev(common::cgroup_limits::SYSCTL_SYSRQ, true),
+                1,
+            ))
+            .unwrap();
+        assert!(
+            v.reasoning.contains("to write kernel.sysrq = 1"),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning
+                .contains("kernel.sysrq mask that lets the keyboard signal processes"),
+            "{}",
+            v.reasoning
+        );
+        assert_eq!(v.severity, Severity::High);
     }
 
     /// External audit EBPF-015: a refused new entry names the directory as
@@ -1930,6 +1977,22 @@ mod tests {
             l.contains("security/lockdown") && l.contains("refused it"),
             "{l}"
         );
+        // lot 2.0: the SysRq trigger refused; a window's write let through
+        let q = r(FsProtectOperation::Sysrq);
+        assert!(
+            q.contains("/proc/sysrq-trigger") && q.contains("refused it"),
+            "{q}"
+        );
+        let w = r(FsProtectOperation::SysrqWindow);
+        assert!(
+            w.contains("/proc/sysrq-trigger") && w.contains("the signed window let it through"),
+            "{w}"
+        );
+        assert!(!w.contains("refused it"), "{w}");
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::SysrqWindow))
+            .unwrap();
+        assert_eq!(v.severity, Severity::Low);
         let a = r(FsProtectOperation::SysctlRootAttach);
         assert!(a.contains("root cgroup") && a.contains("refused it"), "{a}");
         let p = r(FsProtectOperation::SysctlRootProg);

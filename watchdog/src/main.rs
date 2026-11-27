@@ -359,6 +359,13 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         "boot sequence complete — entering restart-backoff loop"
     );
 
+    // Lot 2.0: each stop signal's sender, as the kernel delivered it, kept
+    // for the judgement of the stop it ends in (`unrequested_stop`).
+    for signo in [libc::SIGINT, libc::SIGTERM] {
+        if let Err(e) = antitamper_bpf::stop_signal::capture(signo) {
+            warn!(target: "watchdog", signal = signo, error = %e, "a stop signal's sender will not be recorded");
+        }
+    }
     let mut sigint = signal(SignalKind::interrupt())
         .context("installing SIGINT handler")
         .map_err(|e| Failure::new(ExitReason::Signals, e).agent(agent_pid))?;
@@ -372,6 +379,10 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     // Lab PR 216: how the restart loop ended — a stop it was told to make,
     // or a failure with its own exit status. Teardown is the same.
     let mut failure: Option<Failure> = None;
+    // Lot 2.0: the stop signal that ended the loop, judged after it: only a
+    // requested stop (a signed window in force, the host's shutdown) is one
+    // the watchdog was told to make (exit 0)
+    let mut stop_signal: Option<&'static str> = None;
     // External audit WDG-001: a shutdown authorisation must have been
     // signed while the agent it stops was running.
     // The lab round 5 of #582: and the units' slice's OOM kills then, so a
@@ -485,6 +496,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         match select_outcome {
             SelectOutcome::Signal(name) => {
                 info!(target: "watchdog", signal = name, "shutting down");
+                stop_signal = Some(name);
                 break 'restart_loop;
             }
             SelectOutcome::WitnessTick => {
@@ -683,7 +695,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         )
                         .await
                         {
-                            Some((pid, fd)) => {
+                            Ok((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
                                 (agent_started, agent_oom_kills) = agent_life(pid);
@@ -691,7 +703,10 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                                 backoff = RestartBackoff::new();
                                 continue 'restart_loop;
                             }
-                            None => break 'restart_loop,
+                            Err(name) => {
+                                stop_signal = Some(name);
+                                break 'restart_loop;
+                            }
                         }
                     }
                 };
@@ -705,6 +720,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     );
                     if let Some(reason) = sleep_or_signal(delay, &mut sigint, &mut sigterm).await {
                         info!(target: "watchdog", signal = reason, "shutting down during backoff");
+                        stop_signal = Some(reason);
                         break 'restart_loop;
                     }
                 }
@@ -759,7 +775,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     )
                     .await
                     {
-                        Some((pid, fd)) => {
+                        Ok((pid, fd)) => {
                             agent_pid = pid;
                             agent_pidfd = fd;
                             (agent_started, agent_oom_kills) = agent_life(pid);
@@ -767,7 +783,10 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             backoff = RestartBackoff::new();
                             continue 'restart_loop;
                         }
-                        None => break 'restart_loop,
+                        Err(name) => {
+                            stop_signal = Some(name);
+                            break 'restart_loop;
+                        }
                     }
                 }
 
@@ -793,10 +812,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     ) => r,
                     _ = sigint.recv() => {
                         info!(target: "watchdog", signal = "SIGINT", "shutting down during respawn");
+                        stop_signal = Some("SIGINT");
                         break 'restart_loop;
                     }
                     _ = sigterm.recv() => {
                         info!(target: "watchdog", signal = "SIGTERM", "shutting down during respawn");
+                        stop_signal = Some("SIGTERM");
                         break 'restart_loop;
                     }
                 };
@@ -876,18 +897,31 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         )
                         .await
                         {
-                            Some((pid, fd)) => {
+                            Ok((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
                                 (agent_started, agent_oom_kills) = agent_life(pid);
                                 new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                             }
-                            None => break 'restart_loop,
+                            Err(name) => {
+                                stop_signal = Some(name);
+                                break 'restart_loop;
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Lot 2.0: a stop signal nobody requested ends the watchdog as a failure
+    // of its own, which systemd restarts (and its record, signed High by the
+    // agent) — judged before the teardown, while this watchdog still reads
+    // the kernel's window grant as a protected pid.
+    if failure.is_none() {
+        if let Some(name) = stop_signal {
+            failure = unrequested_stop(&cli.bpffs_root, name, agent_pid);
         }
     }
 
@@ -921,6 +955,68 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     }
 }
 
+/// Lot 2.0: the stop signal `name` (`"SIGTERM"`, `"SIGINT"`) that ended the
+/// loop, judged by the agent's and the watchdog's one rule
+/// ([`antitamper_bpf::stop_signal::judge`]): a requested stop — the host's
+/// shutdown, the kernel's signed window grant in force at its delivery (an
+/// install's, an upgrade's, an uninstall's or the operator's `systemctl
+/// kill`) — is one it was told to make (`None`: exit 0, not restarted);
+/// any other is [`ExitReason::UnrequestedSignal`], which systemd restarts
+/// (`Restart=always`, only 0 kept from a restart), recorded under its own
+/// kind for the agent to sign High, with the signal and its sender as the
+/// kernel delivered them.
+fn unrequested_stop(
+    bpffs_root: &std::path::Path,
+    name: &'static str,
+    agent_pid: u32,
+) -> Option<Failure> {
+    use antitamper_bpf::stop_signal;
+    let signo = if name == "SIGINT" {
+        libc::SIGINT
+    } else {
+        libc::SIGTERM
+    };
+    let sender = stop_signal::last(signo);
+    let at = sender.map_or_else(antitamper_bpf::monotonic_ns, |s| s.at_ns);
+    let stop = stop_signal::judge(
+        stop_signal::host_shutdown(),
+        stop_signal::window_in_force(bpffs_root, at),
+    );
+    let what = sender.map_or_else(
+        || format!("{name} (its sender not recorded)"),
+        |s| {
+            let comm = if s.from_process() && s.pid > 0 {
+                antitamper_bpf::read_proc_comm(s.pid as u32)
+            } else {
+                None
+            };
+            s.describe(comm.as_deref())
+        },
+    );
+    if stop.requested() {
+        info!(target: "watchdog", signal = name, sender = %what, ?stop, "a requested stop");
+        return None;
+    }
+    error!(
+        target: "watchdog.tamper",
+        signal = name,
+        sender = %what,
+        "a stop signal the watchdog did not request (no signed window in force, not the host's \
+         shutdown) — exiting with status {} for a restart",
+        ExitReason::UnrequestedSignal.code()
+    );
+    Some(
+        Failure::new(
+            ExitReason::UnrequestedSignal,
+            anyhow::anyhow!(
+                "stopped by a signal it did not request: {what}; no signed trusted-installer \
+                 window was in force and the host was not shutting down"
+            ),
+        )
+        .agent(agent_pid),
+    )
+}
+
 /// The wait on the agent's pidfd ([`wait_for_agent_death`]). `debug-trigger`
 /// builds (the lab's) only: a file `debug-fail-pidfd-wait` beside the agent
 /// pidfile makes it fail once — lab check of lab PR 216 (exit status 20, a
@@ -929,9 +1025,17 @@ async fn wait_agent(pidfd: &OwnedFd, agent_pidfile: &std::path::Path) -> Result<
     #[cfg(feature = "debug-trigger")]
     {
         let trigger = agent_pidfile.with_file_name("debug-fail-pidfd-wait");
+        // lot 2.0: and a SIGTERM the watchdog sends itself (one the
+        // task_kill hook lets through, outside any window)
+        let raise = agent_pidfile.with_file_name("debug-watchdog-raise-sigterm");
         let injected = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                if std::fs::remove_file(&raise).is_ok() {
+                    warn!(target: "watchdog", "debug-trigger: the watchdog sends itself a SIGTERM (lab test of lot 2.0)");
+                    // SAFETY: a signal to this process; its SIGTERM is handled.
+                    let _ = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                }
                 if std::fs::remove_file(&trigger).is_ok() {
                     warn!(target: "watchdog.pidfd", "debug-trigger: pidfd wait failure injected (lab test of lab PR 216)");
                     return anyhow::anyhow!("debug-trigger: pidfd wait failure injected");
@@ -1503,7 +1607,8 @@ struct Hold {
 /// and watchdog gone, silently. It holds instead — alive, still in
 /// PROTECTED_PIDS, `DEGRADED` in `systemctl status` — until an operator
 /// starts the agent again, then supervises it with a fresh restart
-/// window. `None` when the watchdog is told to stop meanwhile.
+/// window. `Err` (the stop signal's name) when the watchdog is told to stop
+/// meanwhile.
 ///
 /// External audit DEP-004: each hold is also recorded for the agent's
 /// signed audit chain ([`record_hold`]) — with the agent unit's state on a
@@ -1530,7 +1635,7 @@ async fn hold(
     agent_bin: &std::path::Path,
     retry: &mut HoldRetry,
     witness: &mut Option<northnarrow_watchdog::witness::Witness>,
-) -> Option<(u32, OwnedFd)> {
+) -> std::result::Result<(u32, OwnedFd), &'static str> {
     let why = held.why;
     // Once the dead agent's PID is reused its pidfile would read as live.
     let _ = std::fs::remove_file(&cli.agent_pidfile);
@@ -1654,11 +1759,11 @@ async fn hold(
             if let Err(e) = record_hold(&path, &ended) {
                 warn!(target: "watchdog.tamper", error = %e, "could not record the end of the hold");
             }
-            Some((pid, pidfd))
+            Ok((pid, pidfd))
         }
         HoldOutcome::Shutdown(name) => {
             info!(target: "watchdog", signal = name, "shutting down while holding");
-            None
+            Err(name)
         }
     }
 }
@@ -2141,4 +2246,30 @@ fn socket_vanished(holds: &std::path::Path, socket: &std::path::Path, agent_pid:
 )]
 fn _trait_anchor() {
     let _: fn(OwnedFd) -> i32 = |fd| fd.into_raw_fd();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lot 2.0: a stop signal that ends the restart loop outside a window
+    /// (no grant readable here) and outside the host's shutdown (this
+    /// test's PID 1 is no `systemd-shutdown`) is the watchdog's failure of
+    /// its own, never the clean stop (exit 0) systemd keeps down.
+    #[test]
+    fn an_unrequested_stop_signal_is_a_failure_systemd_restarts() {
+        assert!(!antitamper_bpf::stop_signal::host_shutdown());
+        let none = std::path::Path::new("/nonexistent/nn-lot-2.0-pins");
+        for name in ["SIGTERM", "SIGINT"] {
+            let f = unrequested_stop(none, name, 4242).expect("a failure");
+            assert_eq!(f.reason, ExitReason::UnrequestedSignal, "{name}");
+            assert_ne!(f.reason.code(), 0);
+            assert_eq!(f.agent_pid, 4242);
+            let e = format!("{:#}", f.error);
+            assert!(e.contains(name), "{e}");
+            assert!(e.contains("no signed trusted-installer window"), "{e}");
+            let rec = exit_record(&f, 1);
+            assert_eq!(rec.reason, nn_proto::watchdog_hold::REASON_UNREQUESTED_STOP);
+        }
+    }
 }

@@ -23,6 +23,10 @@ common = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
 tracing = { workspace = true }
+# Lot 2.0: the sender of a stop signal (its `siginfo`), kept by an action
+# beside the runtime's own handler — the registry tokio's signal streams
+# already use (`stop_signal`).
+signal-hook-registry = "1.4"
 
 [dev-dependencies]
 tempfile = "3"

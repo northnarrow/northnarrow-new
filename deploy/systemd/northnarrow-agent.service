@@ -167,6 +167,10 @@ ExecStart=/usr/local/bin/northnarrow-agent \
 # respawn IS `systemctl start northnarrow-agent.service`, so a
 # crash → backoff → fresh instance of THIS unit (same ExecStart,
 # caps, cgroup, ProtectHome) — never a child of the watchdog.
+# Lot 2.0: a stop signal outside a signed window and the host's shutdown is
+# no clean stop: the agent signs it (`unrequested_stop`) and exits with an
+# error; the watchdog starts it again, or — the watchdog stopped too —
+# systemd restarts the watchdog, whose start pulls this unit in (Wants=).
 Restart=no
 # External audit EBPF-001: outside a signed trusted-installer window the
 # task_kill hook refuses systemd's signals; a stop job (shutdown) then ends

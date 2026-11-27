@@ -275,7 +275,8 @@ pub enum SpecialFs {
     Cgroup2,
     /// A cgroup v1 hierarchy.
     CgroupV1,
-    /// procfs: `oom_score_adj`, `oom_adj`.
+    /// procfs: `oom_score_adj`, `oom_adj`, the guarded sysctls; lot 2.0:
+    /// `sysrq-trigger` ([`SYSRQ_TRIGGER_NAME`]).
     Proc,
     /// Lot 280b: debugfs — `kprobes/enabled` ([`KPROBES_ENABLED_NAME`]).
     Debugfs,
@@ -337,16 +338,45 @@ pub const SYSCTL_KPROBES_OPTIMIZATION: u8 = 10;
 /// file by its filesystem and name ([`SpecialFs::Debugfs`],
 /// [`KPROBES_ENABLED_NAME`]), not in [`SYSCTL_FILES`].
 pub const SYSCTL_KPROBES_ENABLED: u8 = 11;
+/// Lot 2.0: `kernel.sysrq`, the keyboard's SysRq mask — a mask that
+/// enables every request (1) or the signalling of processes (bit 64: the
+/// terminate, kill and OOM-kill requests) lets a keyboard signal every
+/// process on the host outside the agent's signal hook. A write that
+/// enables that function is refused outside a window
+/// ([`sysrq_mask_signals`]); a narrower mask goes through. Never put back
+/// by the integrity round (the host's own setting): a mask found enabling
+/// it is signed as an advisory instead.
+pub const SYSCTL_SYSRQ: u8 = 12;
+
+/// Lot 2.0: the SysRq mask's "every request" value and its process
+/// signalling bit (the kernel's `SYSRQ_ENABLE_SIGNAL`).
+pub const SYSRQ_ENABLE_ALL: i64 = 1;
+pub const SYSRQ_ENABLE_SIGNAL: i64 = 0x40;
+
+/// Lot 2.0: whether the SysRq mask `v` lets the keyboard's requests signal
+/// processes — the kernel's `sysrq_on_mask(SYSRQ_ENABLE_SIGNAL)`: the mask
+/// is 1 (every request), or has the signalling bit (a negative mask has it
+/// as its two's complement does: the kernel stores an `int`).
+#[inline(always)]
+pub const fn sysrq_mask_signals(v: i64) -> bool {
+    v == SYSRQ_ENABLE_ALL || v & SYSRQ_ENABLE_SIGNAL != 0
+}
 
 /// Lot 280b: the debugfs file that arms the kprobes, and its directory.
 pub const KPROBES_ENABLED_NAME: &[u8] = b"enabled";
 pub const KPROBES_DIR_NAME: &[u8] = b"kprobes";
 /// Lot 280b: the securityfs file of the kernel's lockdown mode.
 pub const LOCKDOWN_NAME: &[u8] = b"lockdown";
+/// Lot 2.0: the procfs file of the kernel's SysRq requests
+/// (`/proc/sysrq-trigger`). Unique among procfs's writable files: no
+/// `/proc/<pid>` file and no sysctl is named so (`kernel.sysrq` is the
+/// keyboard's mask, `sysrq`), and a second procfs mount, a bind mount or a
+/// symlink reaches the same name.
+pub const SYSRQ_TRIGGER_NAME: &[u8] = b"sysrq-trigger";
 
 /// The guarded sysctls by their `/proc/sys` file name (unique in procfs:
 /// no `/proc/<pid>` file is named so), and their kinds.
-pub const SYSCTL_FILES: [(&str, u8); 10] = [
+pub const SYSCTL_FILES: [(&str, u8); 11] = [
     ("overcommit_memory", SYSCTL_OVERCOMMIT_MEMORY),
     ("overcommit_ratio", SYSCTL_OVERCOMMIT_RATIO),
     ("overcommit_kbytes", SYSCTL_OVERCOMMIT_KBYTES),
@@ -358,6 +388,8 @@ pub const SYSCTL_FILES: [(&str, u8); 10] = [
     ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
     // lot 280b
     ("kprobes-optimization", SYSCTL_KPROBES_OPTIMIZATION),
+    // lot 2.0
+    ("sysrq", SYSCTL_SYSRQ),
 ];
 
 const fn sysctl_words() -> [(usize, [u64; 3], u8); SYSCTL_FILES.len()] {
@@ -503,6 +535,8 @@ pub const fn sysctl_value_harmful(kind: u8, v: i64) -> bool {
         // outside a window), and 0 disarms them all — the values the round
         // puts back to 1
         SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED => v == 0,
+        // lot 2.0: a SysRq mask that lets the keyboard signal processes
+        SYSCTL_SYSRQ => sysrq_mask_signals(v),
         _ => false,
     }
 }
@@ -559,9 +593,11 @@ pub const fn sysctl_blinds(kind: u8) -> bool {
 /// `name` (its dentry's name, `parent` its directory's) is one the write
 /// deny refuses outside a window, whatever it carries — and the denial's
 /// code: `kprobes/enabled` on debugfs ([`crate::wire::FS_OP_KPROBES`]),
-/// `lockdown` on securityfs ([`crate::wire::FS_OP_LOCKDOWN`]); 0 for any
-/// other file. Pure, so that the host's tests judge what the eBPF program
-/// decides; the names as [`name_words`] packs them.
+/// `lockdown` on securityfs ([`crate::wire::FS_OP_LOCKDOWN`]); lot 2.0:
+/// `sysrq-trigger` on procfs ([`crate::wire::FS_OP_SYSRQ`], whatever its
+/// directory: [`SYSRQ_TRIGGER_NAME`]); 0 for any other file. Pure, so that
+/// the host's tests judge what the eBPF program decides; the names as
+/// [`name_words`] packs them.
 #[inline(always)]
 pub const fn switch_file_op(
     fs: SpecialFs,
@@ -571,6 +607,7 @@ pub const fn switch_file_op(
     const ENABLED: [u64; 3] = name_words(KPROBES_ENABLED_NAME);
     const KPROBES: [u64; 3] = name_words(KPROBES_DIR_NAME);
     const LOCKDOWN: [u64; 3] = name_words(LOCKDOWN_NAME);
+    const SYSRQ: [u64; 3] = name_words(SYSRQ_TRIGGER_NAME);
     match fs {
         SpecialFs::Debugfs
             if same_name(name, KPROBES_ENABLED_NAME.len(), ENABLED)
@@ -580,6 +617,9 @@ pub const fn switch_file_op(
         }
         SpecialFs::Securityfs if same_name(name, LOCKDOWN_NAME.len(), LOCKDOWN) => {
             crate::wire::FS_OP_LOCKDOWN
+        }
+        SpecialFs::Proc if same_name(name, SYSRQ_TRIGGER_NAME.len(), SYSRQ) => {
+            crate::wire::FS_OP_SYSRQ
         }
         _ => 0,
     }
@@ -832,9 +872,11 @@ mod tests {
 
     /// Lot 280b: the kprobes' debugfs switch and the lockdown file, by
     /// their filesystem and names — no other file, no other filesystem.
+    /// Lot 2.0: and procfs's SysRq trigger, in whatever directory its
+    /// dentry is read (the root of any procfs mount; a parent not read).
     #[test]
     fn the_switch_files_are_found_by_filesystem_and_name() {
-        use crate::wire::{FS_OP_KPROBES, FS_OP_LOCKDOWN};
+        use crate::wire::{FS_OP_KPROBES, FS_OP_LOCKDOWN, FS_OP_SYSRQ};
         let n = |t: &[u8]| (t.len(), name_words(t));
         let none = (0usize, [0u64; 3]);
         assert_eq!(
@@ -849,6 +891,15 @@ mod tests {
             switch_file_op(SpecialFs::Securityfs, n(b"lockdown"), none),
             FS_OP_LOCKDOWN
         );
+        for parent in [n(b"/"), none, n(b"proc"), n(b"self")] {
+            assert_eq!(
+                switch_file_op(SpecialFs::Proc, n(b"sysrq-trigger"), parent),
+                FS_OP_SYSRQ,
+                "{parent:?}"
+            );
+        }
+        assert_eq!(SYSRQ_TRIGGER_NAME, b"sysrq-trigger");
+        const { assert!(SYSRQ_TRIGGER_NAME.len() <= LIMIT_NAME_MAX) };
         for (fs, name, parent) in [
             // another directory's `enabled`, another file of kprobes
             (SpecialFs::Debugfs, n(b"enabled"), n(b"tracing")),
@@ -866,6 +917,18 @@ mod tests {
             (SpecialFs::Debugfs, n(b"lockdown"), none),
             (SpecialFs::Securityfs, n(b"lockdow"), none),
             (SpecialFs::Securityfs, n(b"lsm"), none),
+            // lot 2.0: the SysRq trigger's name on another filesystem, and
+            // its neighbours on procfs (the keyboard's mask is a sysctl)
+            (SpecialFs::Debugfs, n(b"sysrq-trigger"), n(b"/")),
+            (SpecialFs::Securityfs, n(b"sysrq-trigger"), none),
+            (SpecialFs::Cgroup2, n(b"sysrq-trigger"), none),
+            (SpecialFs::CgroupV1, n(b"sysrq-trigger"), none),
+            (SpecialFs::Proc, n(b"sysrq"), n(b"kernel")),
+            (SpecialFs::Proc, n(b"sysrq-trigge"), n(b"/")),
+            (SpecialFs::Proc, n(b"sysrq-triggerx"), n(b"/")),
+            (SpecialFs::Proc, n(b"sysrq_trigger"), n(b"/")),
+            (SpecialFs::Proc, n(b"Sysrq-trigger"), n(b"/")),
+            (SpecialFs::Proc, n(b"oom_score_adj"), n(b"4242")),
         ] {
             assert_eq!(
                 switch_file_op(fs, name, parent),
@@ -967,6 +1030,60 @@ mod tests {
         // a write whose bytes could not be read is refused
         assert!(sysctl_write_harmful(SYSCTL_PID_MAX, None));
         assert!(sysctl_write_harmful(SYSCTL_FTRACE_ENABLED, None));
+    }
+
+    /// Lot 2.0 (named test): the keyboard's SysRq mask (`kernel.sysrq`) is
+    /// found by its procfs name and judged by its process-signalling
+    /// function — 1 (every request) and any mask with bit 64 are refused
+    /// outside a window, in every spelling the kernel reads; a narrower mask
+    /// (the distributions' defaults, 0) goes through.
+    #[test]
+    fn the_keyboard_sysrq_mask_cannot_be_widened_to_signal_processes() {
+        let w = |t: &[u8]| Some(limit_value(t).unwrap());
+        let k = |n: &str| sysctl_kind(n.len(), name_words(n.as_bytes()));
+        assert_eq!(k("sysrq"), SYSCTL_SYSRQ);
+        for other in ["sysrq-trigger", "sysrq_trigger", "sysrq2", "sysr", "Sysrq"] {
+            assert_eq!(k(other), SYSCTL_NONE, "{other}");
+        }
+        // the signalling function on: every request, bit 64 alone or with
+        // others, a negative mask (its two's complement has bit 64)
+        for v in [1, 64, 65, 240, 438 | 64, 502, 511, 0x7fff_ffff, -1, -64] {
+            assert!(sysrq_mask_signals(v), "{v}");
+            assert!(sysctl_value_harmful(SYSCTL_SYSRQ, v), "{v}");
+        }
+        // off: none (0), Fedora's sync (16), Ubuntu's 176, Debian's 438,
+        // every other bit (2 to 256, 63), a negative mask without bit 64
+        for v in [0, 2, 4, 8, 16, 32, 128, 256, 176, 438, 63, 0x1bf, -65] {
+            assert!(!sysrq_mask_signals(v), "{v}");
+            assert!(!sysctl_value_harmful(SYSCTL_SYSRQ, v), "{v}");
+        }
+        // the write deny reads the bytes (decimal only: an octal or hex
+        // spelling is refused, whatever it reads as)
+        for bad in [
+            &b"1"[..],
+            b"1\n",
+            b"64",
+            b"240",
+            b"502",
+            b"-1",
+            b"0x40",
+            b"0100",
+            b"01",
+            // the mini-hunt: a leading blank (the kernel skips it), a sign
+            // the kernel does not read
+            b" 1",
+            b"+1",
+        ] {
+            assert!(sysctl_write_harmful(SYSCTL_SYSRQ, w(bad)), "{bad:?}");
+        }
+        for good in [&b"0"[..], b"0\n", b"176", b"438", b"16", b"-65"] {
+            assert!(!sysctl_write_harmful(SYSCTL_SYSRQ, w(good)), "{good:?}");
+        }
+        assert!(sysctl_write_harmful(SYSCTL_SYSRQ, None));
+        // judged by value, never refused whatever it carries
+        assert!(!sysctl_refuses_every_write(SYSCTL_SYSRQ));
+        assert!(!sysctl_blinds(SYSCTL_SYSRQ));
+        assert!(SYSCTL_FILES.contains(&("sysrq", SYSCTL_SYSRQ)));
     }
 
     /// The review of #497 (D2): an io-wq worker's or a kernel thread's
@@ -1092,6 +1209,7 @@ mod tests {
                 ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
                 ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
                 ("kprobes-optimization", SYSCTL_KPROBES_OPTIMIZATION),
+                ("sysrq", SYSCTL_SYSRQ),
             ][..]
         );
         for (name, kind) in SYSCTL_FILES {

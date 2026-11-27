@@ -1085,8 +1085,16 @@ fn high_kind(kind: &str) -> bool {
             | crate::witness::ROLES_VACATED_GAP
             // the review of #597 (P2-1)
             | crate::shutdown_remount::NO_SHUTDOWN_KIND
+            // lot 2.0: a role stopped by a signal it did not request
+            | UNREQUESTED_STOP
     )
 }
+
+/// Lot 2.0: the agent or the watchdog stopped by a stop signal it did not
+/// request — no signed trusted-installer window in force when it came, not
+/// the host's shutdown — and started again: the agent's own record of its
+/// stop, the watchdog's hold record (`REASON_UNREQUESTED_STOP`). High.
+pub const UNREQUESTED_STOP: &str = "unrequested_stop";
 
 /// Lot 374: a start of the watchdog that refused itself (its hold record).
 pub const WATCHDOG_START_REFUSED: &str = "watchdog_start_refused";
@@ -1844,6 +1852,13 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                         ),
                         // The review of #582 (F2 d): the host changed during
                         // the vacancy — the start held, or a retry skipped
+                        // Lot 2.0: the watchdog stopped by a signal it
+                        // did not request (systemd restarts it)
+                        wh::REASON_UNREQUESTED_STOP => (
+                            UNREQUESTED_STOP,
+                            "the watchdog was stopped by a signal it did not request (no signed \
+                             window, not the host's shutdown); systemd restarts it",
+                        ),
                         wh::REASON_RESPAWN_HELD => (
                             WATCHDOG_RESPAWN_HELD,
                             "the watchdog held instead of starting the agent: the host changed \
@@ -2854,6 +2869,16 @@ impl Checker {
                 detail: s.detail,
             }),
         );
+        // Lot 2.0: the keyboard's SysRq mask, read only — one that lets the
+        // keyboard signal processes is an advisory while it holds (the
+        // host's setting: never rewritten; widening it is refused outside a
+        // window by the sysctl judges)
+        if let Some(detail) = crate::sysctl_guard::sysrq_posture(Path::new("/")) {
+            c.push(Finding {
+                kind: "sysrq_keyboard_signals",
+                detail,
+            });
+        }
         c.extend(
             config_overlays(Path::new(CONFIG_DIR))
                 .into_iter()
@@ -3794,6 +3819,8 @@ mod tests {
             (wh::REASON_WITNESS_UNAVAILABLE, WITNESS_UNAVAILABLE),
             // the review of #582 (F2 d): a respawn held, the host changed
             (wh::REASON_RESPAWN_HELD, WATCHDOG_RESPAWN_HELD),
+            // lot 2.0: a stop the watchdog did not request
+            (wh::REASON_UNREQUESTED_STOP, UNREQUESTED_STOP),
         ];
         let body = reasons
             .iter()
@@ -3821,9 +3848,19 @@ mod tests {
             WATCHDOG_START_REFUSED,
             WITNESS_UNAVAILABLE,
             WATCHDOG_RESPAWN_HELD,
+            // lot 2.0
+            UNREQUESTED_STOP,
         ] {
             assert!(high_kind(kind), "{kind}");
         }
+        let unrequested = f.iter().find(|x| x.kind == UNREQUESTED_STOP).unwrap();
+        assert!(
+            unrequested
+                .detail
+                .contains("stopped by a signal it did not request"),
+            "{}",
+            unrequested.detail
+        );
         let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();
         assert!(
             refused
@@ -6313,6 +6350,28 @@ mod tests {
             f[0].detail
         );
         assert!(held_pin_findings(Vec::new(), |_| Ok(())).is_empty());
+    }
+
+    /// Lot 2.0 (named): every round reads the keyboard's SysRq mask and
+    /// signs a mask that lets the keyboard signal processes as its own
+    /// finding (an advisory, `nn_evidence::held`) — read only: the round's
+    /// restore (`sysctl_guard::check`) never names it.
+    #[test]
+    fn the_round_signs_a_keyboard_sysrq_mask_that_signals_processes() {
+        let code = include_str!("self_integrity.rs");
+        let at = code.find("fn collect_round(").unwrap();
+        let end = at + code[at..].find("fn apply(").unwrap();
+        let body = &code[at..end];
+        let p = body
+            .find("if let Some(detail) = crate::sysctl_guard::sysrq_posture(Path::new(\"/\")) {")
+            .expect("the SysRq mask read by the round");
+        assert!(body[p..].contains(
+            "c.push(Finding {\n                kind: \"sysrq_keyboard_signals\",\n                detail,\n            });"
+        ));
+        assert_eq!(
+            nn_evidence::held::hold_of("sysrq_keyboard_signals", "detected"),
+            nn_evidence::held::Hold::Advisory
+        );
     }
 
     /// Fix round 3 of #567: the round reads the held pins outside a window

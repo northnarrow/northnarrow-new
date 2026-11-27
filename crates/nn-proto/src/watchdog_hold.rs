@@ -17,8 +17,8 @@
 //! and since lab PR 216 [`REASON_WATCHDOG_EXIT`], [`REASON_WATCHDOG_FAILED`],
 //! [`REASON_STUCK_RECOVERY_FAILED`], [`REASON_EVENT_LOOP_STALLED`],
 //! [`REASON_HOLD_RETRY`], [`REASON_HOLD_ENDED`]; lot 359:
-//! [`REASON_PIN_HANDLE_FAILED`]); the agent signs them under
-//! their own kind.
+//! [`REASON_PIN_HANDLE_FAILED`]; lot 2.0: [`REASON_UNREQUESTED_STOP`]); the
+//! agent signs them under their own kind.
 
 use alloc::string::String;
 
@@ -142,6 +142,13 @@ pub const REASON_WITNESS_UNAVAILABLE: &str = "witness_unavailable";
 /// detail names it). Also a hold's retry it skipped for the same reason.
 /// The agent signs it High (`watchdog_respawn_held`).
 pub const REASON_RESPAWN_HELD: &str = "respawn_held_host_changed";
+/// Lot 2.0: the watchdog stopped on a stop signal (SIGTERM, SIGINT) it did
+/// not request — no signed trusted-installer window in force when it came,
+/// not the host's shutdown (PID 1 not `systemd-shutdown`). Not a clean
+/// stop: it exits with a status of its own (`ExitReason::UnrequestedSignal`)
+/// and systemd restarts it. The detail names the signal and its sender as
+/// the kernel delivered them. The agent signs it High (`unrequested_stop`).
+pub const REASON_UNREQUESTED_STOP: &str = "unrequested_stop";
 /// Lot 353: how many stuck recoveries make a restart loop…
 pub const RESTART_LOOP_RECOVERIES: usize = 3;
 /// …within this many seconds.
@@ -149,6 +156,14 @@ pub const RESTART_LOOP_WINDOW_SECS: u64 = 600;
 /// Lot 353: the stop reason of an agent the watchdog's stuck recovery
 /// stopped (its `agent_stop` row, its heartbeat's stop beat).
 pub const STUCK_STOP_REASON: &str = "stuck_unresponsive";
+/// Lot 2.0: the stop reason of an agent ended by a stop signal (SIGTERM,
+/// SIGINT, SIGHUP) it did not request — no signed trusted-installer window
+/// in force when it came, not the host's shutdown: never a clean stop (its
+/// `agent_stop` row, its heartbeat's stop beat). The agent exits with an
+/// error, signs the stop High (`unrequested_stop`, naming the signal and
+/// its sender), and the watchdog, or systemd through the watchdog's unit,
+/// starts it again.
+pub const UNREQUESTED_STOP_REASON: &str = "unrequested_signal";
 /// Lot 353: where the watchdog leaves, before its stuck recovery's SIGINT,
 /// the one [`HoldRecord`] (`REASON_STUCK_UNRESPONSIVE`) the agent reads to
 /// name its stop ([`STUCK_STOP_REASON`]); the agent removes it.

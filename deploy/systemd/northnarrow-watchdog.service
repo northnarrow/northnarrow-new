@@ -109,6 +109,10 @@ ExecStart=/usr/local/bin/northnarrow-watchdog \
 # record; a death by any signal (SIGKILL, SIGHUP, an abort) is restarted
 # too. With Restart=on-failure, "pidfd wait failed" exited 0 and was never
 # restarted, and a SIGHUP counted as a clean stop.
+# Lot 2.0: a SIGTERM/SIGINT outside a signed window and the host's shutdown
+# is no stop the watchdog was told to make: it exits 21 (a `unrequested_stop`
+# record, the signal and its sender named), systemd restarts it, and its
+# start pulls the agent back in (Wants=) when the agent is down as well.
 Restart=always
 RestartPreventExitStatus=0
 # External audit EBPF-001: outside a signed trusted-installer window the

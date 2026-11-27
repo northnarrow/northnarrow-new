@@ -384,6 +384,7 @@ async fn watch_loop(
         sigint,
         sigterm,
         sighup,
+        window,
     } = signals;
     // External audit SNS-001: a telemetry task that ended (a dead ring
     // pump, a drain, the open-sensor rule refresher) is checked for here;
@@ -410,6 +411,8 @@ async fn watch_loop(
                 debug_hang_next_action(&cli.admin_socket, dispatcher);
                 #[cfg(feature = "debug-trigger")]
                 debug_walk_on_workers(&cli.admin_socket);
+                #[cfg(feature = "debug-trigger")]
+                debug_raise_sigterm(&cli.admin_socket);
                 // R12c (lab PR 270): the response dispatcher's thread ended —
                 // no response runs (each is answered "not run" and counted);
                 // as a dead pump: signed, and the agent stops for a restart.
@@ -462,20 +465,22 @@ async fn watch_loop(
                     warn!(detail = %detail, "SIGINT from the watchdog's stuck recovery; shutting down");
                     return nn_proto::watchdog_hold::STUCK_STOP_REASON;
                 }
-                info!("SIGINT received; shutting down");
-                return "sigint";
+                return signal_stop(libc::SIGINT, "sigint", window, audit_log);
             }
             _ = sigterm.recv() => {
                 // External audit EBPF-001: PID 1's SIGTERM reaches the agent
                 // only inside a signed trusted-installer window or from
-                // `systemd-shutdown`, the last stage of a shutdown.
-                let reason = if pid1_is_systemd_shutdown() { "system_shutdown" } else { "sigterm" };
-                info!(reason, "SIGTERM received; shutting down");
-                return reason;
+                // `systemd-shutdown`, the last stage of a shutdown. Lot 2.0:
+                // any other SIGTERM (the kernel's own, a kernel without `bpf`
+                // in its LSM chain) is no clean stop.
+                if pid1_is_systemd_shutdown() {
+                    info!(reason = "system_shutdown", "SIGTERM received; shutting down");
+                    return "system_shutdown";
+                }
+                return signal_stop(libc::SIGTERM, "sigterm", window, audit_log);
             }
             _ = sighup.recv() => {
-                info!("SIGHUP received; shutting down");
-                return "sighup";
+                return signal_stop(libc::SIGHUP, "sighup", window, audit_log);
             }
             // Tappa 8 A8: admin-authorised graceful shutdown. The
             // dispatcher has already (a) verified the
@@ -506,6 +511,79 @@ async fn watch_loop(
                 return "admin_shutdown";
             }
         }
+    }
+}
+
+/// Lot 2.0: the stop reason of the stop signal `signo` — `clean` when it
+/// was a requested stop (the host's shutdown, a signed trusted-installer
+/// window in force at its delivery: the agent's own window, or the
+/// kernel's grant at the signal's time), else
+/// [`nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON`], a failure the
+/// watchdog (or systemd, through the watchdog's unit) restarts, signed High
+/// first with the signal and its sender as the kernel delivered them.
+fn signal_stop(
+    signo: i32,
+    clean: &'static str,
+    window: &northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    audit_log: &AuditHandle,
+) -> &'static str {
+    use antitamper_bpf::stop_signal;
+    let sender = stop_signal::last(signo);
+    let at = sender.map_or_else(antitamper_bpf::monotonic_ns, |s| s.at_ns);
+    let in_window = window.is_window_open()
+        || window
+            .bpffs_root()
+            .is_some_and(|root| stop_signal::window_in_force(root, at));
+    let stop = stop_signal::judge(stop_signal::host_shutdown(), in_window);
+    let reason = stop_reason_of(stop, clean);
+    let what = sender.map_or_else(
+        || {
+            format!(
+                "{} (its sender not recorded)",
+                stop_signal::signal_name(signo)
+            )
+        },
+        |s| {
+            let comm = if s.from_process() && s.pid > 0 {
+                antitamper_bpf::read_proc_comm(s.pid as u32)
+            } else {
+                None
+            };
+            s.describe(comm.as_deref())
+        },
+    );
+    if stop.requested() {
+        info!(reason, sender = %what, ?stop, "stop signal received; shutting down");
+    } else {
+        error!(
+            reason,
+            sender = %what,
+            "a stop signal the agent did not request (no signed window in force, not the host's \
+             shutdown) — stopping as a failure, for a restart"
+        );
+        northnarrow_agent::self_integrity::report_event(
+            audit_log.as_ref(),
+            &northnarrow_agent::self_integrity::Finding {
+                kind: northnarrow_agent::self_integrity::UNREQUESTED_STOP,
+                detail: format!(
+                    "the agent (pid {}) was stopped by a signal it did not request: {what}; no \
+                     signed trusted-installer window was in force and the host was not shutting \
+                     down — not a clean stop: it exits for a restart",
+                    std::process::id()
+                ),
+            },
+        );
+    }
+    reason
+}
+
+/// Lot 2.0: the stop reason of a stop signal judged `stop` (`clean`: the
+/// requested one's).
+fn stop_reason_of(stop: antitamper_bpf::stop_signal::Stop, clean: &'static str) -> &'static str {
+    if stop.requested() {
+        clean
+    } else {
+        nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON
     }
 }
 
@@ -557,6 +635,20 @@ fn debug_hang_next_action(admin_socket: &std::path::Path, dispatcher: &Dispatche
     }
     warn!("debug-trigger: the next response's action hangs past the stall bound");
     dispatcher.hang_next_action();
+}
+
+/// `debug-trigger` builds only (lot 2.0): a file `debug-raise-sigterm` next
+/// to the admin socket makes the agent send itself a SIGTERM — a stop signal
+/// the `task_kill` hook lets through (a process's own), outside any window:
+/// the lab's check that a stop nobody requested is signed and restarted.
+#[cfg(feature = "debug-trigger")]
+fn debug_raise_sigterm(admin_socket: &std::path::Path) {
+    if !debug_trigger(admin_socket, "debug-raise-sigterm") {
+        return;
+    }
+    warn!("debug-trigger: the agent sends itself a SIGTERM");
+    // SAFETY: a signal to this process; its SIGTERM is handled.
+    let _ = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
 }
 
 /// `debug-trigger` builds only: a file `debug-walk-on-workers` next to the
@@ -688,4 +780,51 @@ fn debug_abort_pump(
         pump = label,
         found, "debug-trigger: pump aborted on request (lab test of SNS-001)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use antitamper_bpf::stop_signal::Stop;
+
+    /// Lot 2.0: a stop signal is a clean stop only when it was requested —
+    /// the host's shutdown or a signed window; any other is the failure
+    /// reason the heartbeat's verifier and the stop's result take as such.
+    #[test]
+    fn an_unrequested_stop_signal_is_no_clean_stop() {
+        assert_eq!(stop_reason_of(Stop::Window, "sigterm"), "sigterm");
+        assert_eq!(stop_reason_of(Stop::HostShutdown, "sighup"), "sighup");
+        let r = stop_reason_of(Stop::Unrequested, "sigterm");
+        assert_eq!(r, nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON);
+        assert!(!nn_evidence::heartbeat::CLEAN_STOP_REASONS.contains(&r));
+        for clean in ["sigterm", "sigint", "sighup"] {
+            assert_ne!(stop_reason_of(Stop::Unrequested, clean), clean);
+        }
+    }
+
+    /// Lot 2.0: the agent's judgement of a stop signal — outside a window
+    /// (and outside the host's shutdown: this test's PID 1 is no
+    /// `systemd-shutdown`) a failure; with the agent's own signed window
+    /// open, the clean reason.
+    #[test]
+    fn a_stop_signal_is_clean_only_inside_a_window() {
+        use northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride;
+        assert!(!antitamper_bpf::stop_signal::host_shutdown());
+        let window = TrustedInstallerOverride::inert();
+        let none: AuditHandle = None;
+        assert_eq!(
+            signal_stop(libc::SIGHUP, "sighup", &window, &none),
+            nn_proto::watchdog_hold::UNREQUESTED_STOP_REASON
+        );
+        window.arm(60, Instant::now());
+        assert!(window.is_window_open());
+        assert_eq!(
+            signal_stop(libc::SIGHUP, "sighup", &window, &none),
+            "sighup"
+        );
+        assert_eq!(
+            signal_stop(libc::SIGTERM, "sigterm", &window, &none),
+            "sigterm"
+        );
+    }
 }

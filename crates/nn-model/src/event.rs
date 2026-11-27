@@ -1263,6 +1263,12 @@ pub enum FsProtectOperation {
     /// never for the packaged journald in its units). `target_dev` the
     /// ptrace mode, `target_ino` the target tgid.
     PtraceRead,
+    /// Lot 2.0: a write of `/proc/sysrq-trigger` refused outside a signed
+    /// trusted-installer window, whatever it carries; the target its inode.
+    Sysrq,
+    /// Lot 2.0: NOT a refusal — a write-open of `/proc/sysrq-trigger` let
+    /// through by the signed trusted-installer window; the target its inode.
+    SysrqWindow,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1323,6 +1329,8 @@ impl FsProtectOperation {
             crate::wire::FS_OP_MOUNT_WINDOW => Self::MountWindow,
             crate::wire::FS_OP_MOUNT_NOTED => Self::MountNoted,
             crate::wire::FS_OP_PTRACE_READ => Self::PtraceRead,
+            crate::wire::FS_OP_SYSRQ => Self::Sysrq,
+            crate::wire::FS_OP_SYSRQ_WINDOW => Self::SysrqWindow,
             other => Self::Unknown(other),
         }
     }
@@ -1381,6 +1389,8 @@ impl FsProtectOperation {
             Self::MountWindow => "mount_window",
             Self::MountNoted => "mount_noted",
             Self::PtraceRead => "ptrace_read",
+            Self::Sysrq => "sysrq",
+            Self::SysrqWindow => "sysrq_window",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2293,6 +2303,13 @@ mod tests {
                 crate::wire::FS_OP_PTRACE_READ,
                 FsProtectOperation::PtraceRead,
                 "ptrace_read",
+            ),
+            // lot 2.0: the SysRq trigger, refused, and a window's write
+            (crate::wire::FS_OP_SYSRQ, FsProtectOperation::Sysrq, "sysrq"),
+            (
+                crate::wire::FS_OP_SYSRQ_WINDOW,
+                FsProtectOperation::SysrqWindow,
+                "sysrq_window",
             ),
         ];
         for (byte, op, name) in cases {

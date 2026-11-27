@@ -23,6 +23,10 @@ pub(crate) struct Signals {
     pub(crate) sigint: tokio::signal::unix::Signal,
     pub(crate) sigterm: tokio::signal::unix::Signal,
     pub(crate) sighup: tokio::signal::unix::Signal,
+    /// Lot 2.0: the signed trusted-installer window, which makes a stop
+    /// signal a requested stop (`crate::run_loop::signal_stop`).
+    pub(crate) window:
+        Arc<northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride>,
 }
 
 /// What [`start`] started.
@@ -195,7 +199,16 @@ pub(crate) fn start(
     // SIGTERM reaches the agent only from itself, the watchdog, PID 1
     // inside a signed trusted-installer window, or `systemd-shutdown` at
     // the end of a shutdown (the task_kill hook refuses everyone else) —
-    // and from anyone on a kernel without `bpf` in its LSM chain.
+    // and from anyone on a kernel without `bpf` in its LSM chain. Lot 2.0:
+    // and from the kernel itself, which no signal hook sees — each one's
+    // sender is kept (`stop_signal::capture`), and a stop signal outside a
+    // signed window and the host's shutdown is no clean stop
+    // (`crate::run_loop::signal_stop`).
+    for signo in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        if let Err(e) = antitamper_bpf::stop_signal::capture(signo) {
+            warn!(signal = signo, error = %e, "a stop signal's sender will not be recorded");
+        }
+    }
     let sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     let sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
@@ -206,6 +219,7 @@ pub(crate) fn start(
             sigint,
             sigterm,
             sighup,
+            window: Arc::clone(installer_override),
         },
     })
 }

@@ -230,6 +230,10 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
             "| FS_OP_NICE",
             "| FS_OP_IOPRIO",
             "| FS_OP_SYSCTL",
+            // lot 2.0: the SysRq trigger, refused at the write-open too, and
+            // a window's write of it
+            "| FS_OP_SYSRQ",
+            "| FS_OP_SYSRQ_WINDOW",
         ],
     )
     .unwrap();

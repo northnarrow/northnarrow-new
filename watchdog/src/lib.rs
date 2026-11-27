@@ -180,7 +180,7 @@ pub struct Cli {
 ///
 /// | status | reason |
 /// |---|---|
-/// | 0 | stopped: SIGTERM/SIGINT, or a shutdown signed by the admin quorum |
+/// | 0 | stopped: SIGTERM/SIGINT inside a signed trusted-installer window or in the host's shutdown, or a shutdown signed by the admin quorum |
 /// | 1 | an error without a status of its own (none is known) |
 /// | 2 | the command line was refused (clap) |
 /// | 10 | process hardening (`prctl`) failed |
@@ -191,6 +191,7 @@ pub struct Cli {
 /// | 15 | the signal handlers could not be installed |
 /// | 16 | lot 374: the start refused itself (a loader variable, a mapped file not expected) |
 /// | 20 | the wait on the agent's pidfd failed |
+/// | 21 | lot 2.0: a stop signal it did not request (no signed window in force, not the host's shutdown) |
 /// | 30 | `--record-unit-failure`: the record could not be written |
 ///
 /// Each non-zero exit of the daemon leaves a [`REASON_WATCHDOG_EXIT`]
@@ -210,12 +211,13 @@ pub enum ExitReason {
     Signals,
     StartSelfCheck,
     PidfdWait,
+    UnrequestedSignal,
     RecordFailed,
 }
 
 impl ExitReason {
     /// Every reason, in the order of the table above.
-    pub const ALL: [ExitReason; 12] = [
+    pub const ALL: [ExitReason; 13] = [
         ExitReason::Stopped,
         ExitReason::Unclassified,
         ExitReason::Usage,
@@ -227,6 +229,7 @@ impl ExitReason {
         ExitReason::Signals,
         ExitReason::StartSelfCheck,
         ExitReason::PidfdWait,
+        ExitReason::UnrequestedSignal,
         ExitReason::RecordFailed,
     ];
 
@@ -244,6 +247,7 @@ impl ExitReason {
             ExitReason::Signals => 15,
             ExitReason::StartSelfCheck => 16,
             ExitReason::PidfdWait => 20,
+            ExitReason::UnrequestedSignal => 21,
             ExitReason::RecordFailed => 30,
         }
     }
@@ -262,6 +266,7 @@ impl ExitReason {
             ExitReason::Signals => "signal_handlers_failed",
             ExitReason::StartSelfCheck => "start_self_check",
             ExitReason::PidfdWait => "pidfd_wait_failed",
+            ExitReason::UnrequestedSignal => "unrequested_signal",
             ExitReason::RecordFailed => "record_failed",
         }
     }
@@ -325,7 +330,13 @@ pub fn exit_record(failure: &Failure, at: u64) -> nn_proto::watchdog_hold::HoldR
     nn_proto::watchdog_hold::HoldRecord {
         at,
         agent_pid: failure.agent_pid,
-        reason: nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT.to_string(),
+        // lot 2.0: a stop nobody requested under its own kind (High)
+        reason: if failure.reason == ExitReason::UnrequestedSignal {
+            nn_proto::watchdog_hold::REASON_UNREQUESTED_STOP
+        } else {
+            nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT
+        }
+        .to_string(),
         detail: format!(
             "exit status {} ({}): {}",
             failure.reason.code(),
@@ -5775,6 +5786,26 @@ mod tests {
         let usage = Cli::try_parse_from(["northnarrow-watchdog", "--no-such-flag"]).unwrap_err();
         assert_eq!(usage.exit_code(), i32::from(ExitReason::Usage.code()));
         assert_eq!(ExitReason::PidfdWait.code(), 20);
+        // lot 2.0: a stop nobody requested is restarted (never 0) and
+        // recorded under its own kind
+        assert_eq!(ExitReason::UnrequestedSignal.code(), 21);
+        let f = Failure::new(
+            ExitReason::UnrequestedSignal,
+            anyhow::anyhow!("SIGTERM sent by the kernel itself"),
+        )
+        .agent(7);
+        let rec = exit_record(&f, 1);
+        assert_eq!(rec.reason, nn_proto::watchdog_hold::REASON_UNREQUESTED_STOP);
+        assert!(
+            rec.detail.contains("exit status 21 (unrequested_signal)"),
+            "{}",
+            rec.detail
+        );
+        let other = exit_record(
+            &Failure::new(ExitReason::PidfdWait, anyhow::anyhow!("x")),
+            1,
+        );
+        assert_eq!(other.reason, nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT);
     }
 
     /// Static review C-44 / G-05: the wait on the agent's pidfd failing is

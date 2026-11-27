@@ -188,9 +188,9 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     (
         "cgroup_files.rs",
         "refuse_switch",
-        1,
+        2,
         Enforced(
-            "the kprobes and lockdown switches: kprobes/enabled=0 disarms every kprobe of the agent, lockdown takes the kernel-memory helpers from its programs (it blinds the agent)",
+            "the kprobes and lockdown switches: kprobes/enabled=0 disarms every kprobe of the agent, lockdown takes the kernel-memory helpers from its programs (it blinds the agent); lot 2.0: the SysRq trigger file, whose requests act on the whole host outside every other hook (refused to every caller outside a window, root included; its second site signs a window's write, let through)",
         ),
     ),
     (

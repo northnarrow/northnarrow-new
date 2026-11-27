@@ -864,6 +864,15 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_to_string(root.join(p.trim_start_matches('/')))",
         KNOB,
     ),
+    // lot 2.0: the keyboard's SysRq mask — absent only on a kernel without
+    // SysRq (no request at all); any other failure is the advisory's
+    // finding ("not known"), never a default
+    (
+        "crates/nn-linux/src/sysctl_guard.rs",
+        "read_to_string(root.join(SYSRQ.trim_start_matches('/')),)",
+        "lot 2.0: /proc/sys/kernel/sysrq absent is a kernel built without SysRq (no keyboard \
+         request exists); every other failed read is a signed finding, not a default",
+    ),
     (
         "crates/nn-linux/src/telemetry_probe.rs",
         "read_to_string(p)",

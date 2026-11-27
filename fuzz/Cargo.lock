@@ -1183,6 +1183,7 @@ dependencies = [
  "aya",
  "libc",
  "northnarrow-common",
+ "signal-hook-registry",
  "tracing",
 ]
 

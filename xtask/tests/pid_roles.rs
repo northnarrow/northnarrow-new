@@ -66,8 +66,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 273: the moved task is a target, the writer a caller
         ("cgroup_guard.rs", 1, 2),
         // lot 273b: the process an `oom_score_adj` belongs to is a target,
-        // the writer a caller
-        ("cgroup_files.rs", 1, 1),
+        // the writer a caller; lot 2.0: the writer of the SysRq trigger
+        // inside a window — a caller (the family's own open is not recorded)
+        ("cgroup_files.rs", 1, 2),
         // lot 273c: the process whose limits or priorities change is a
         // target, the caller a caller
         ("task_limits.rs", 1, 1),

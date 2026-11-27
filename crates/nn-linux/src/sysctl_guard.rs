@@ -41,6 +41,14 @@
 //! the agent's among them) by the write deny's debugfs branch; a 0 found
 //! by the round (set before the start, inside a window) is put back to 1,
 //! signed.
+//!
+//! Lot 2.0: `kernel.sysrq`, the keyboard's SysRq mask — a write that lets
+//! the keyboard's requests signal processes (1, or bit 64) is refused
+//! outside a window by both programs (`common::cgroup_limits::
+//! sysrq_mask_signals`); a narrower mask goes through. It is NOT in
+//! [`GUARDED`]: the round never rewrites the host's mask. A mask found
+//! enabling the signalling (set at boot by `sysctl.d`, inside a window) is
+//! a signed advisory of the round while it holds ([`sysrq_posture`]).
 
 use std::path::Path;
 
@@ -48,7 +56,7 @@ use common::cgroup_limits::{
     SYSCTL_FTRACE_ENABLED, SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION,
     SYSCTL_MAX_MAP_COUNT, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
     SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
-    limit_value, rt_throttling_off, sysctl_blinds, sysctl_write_harmful,
+    limit_value, rt_throttling_off, sysctl_blinds, sysctl_write_harmful, sysrq_mask_signals,
 };
 
 /// The guarded files, their kinds and the safe value put back (`None`:
@@ -160,6 +168,44 @@ pub fn note_ftrace(root: &Path) -> Ftrace {
         }
     }
     now
+}
+
+/// Lot 2.0: the keyboard's SysRq mask (absent without `CONFIG_MAGIC_SYSRQ`).
+pub const SYSRQ: &str = "/proc/sys/kernel/sysrq";
+
+/// Lot 2.0: the keyboard's SysRq mask under `root` (`/` on the host, a
+/// directory in the tests), judged as the kernel does
+/// (`sysrq_mask_signals`): the advisory's detail when it lets the
+/// keyboard's requests signal processes — or when it is no integer (not
+/// known: the safe side) — `None` when it does not, or when the kernel has
+/// no SysRq. Only read: the host's mask is never rewritten by the agent.
+pub fn sysrq_posture(root: &Path) -> Option<String> {
+    let t = match antitamper_bpf::kernel_roots::read_to_string(
+        root.join(SYSRQ.trim_start_matches('/')),
+    ) {
+        Ok(t) => t,
+        // no SysRq in this kernel (`CONFIG_MAGIC_SYSRQ` off): no request at all
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(format!(
+                "kernel.sysrq could not be read ({e}): whether SysRq can signal processes from a \
+                 keyboard is not known"
+            ));
+        }
+    };
+    let t = t.trim();
+    const WHAT: &str = "SysRq can signal processes from a keyboard, the agent's among them, \
+         outside its signal hook (a stop it did not request is signed and restarted); the mask \
+         cannot be widened outside a window and the agent does not rewrite it — a mask without \
+         bit 64 (Ubuntu's 176, Debian's 438) closes it";
+    match t.parse::<i64>() {
+        Ok(v) if sysrq_mask_signals(v) => Some(format!("kernel.sysrq is {v}: {WHAT}")),
+        Ok(_) => None,
+        Err(_) => Some(format!(
+            "kernel.sysrq reads {t:?}, not an integer: whether SysRq can signal processes from a \
+             keyboard is not known"
+        )),
+    }
 }
 
 /// One finding of the round.
@@ -510,6 +556,56 @@ mod tests {
         let d = host(&[("/proc/sys/kernel/pid_max", "10000\n")]);
         let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
         assert_eq!(r[0].kind, "sysctl_restored", "{r:?}");
+    }
+
+    /// Lot 2.0 (named): the keyboard's SysRq mask is judged and never
+    /// written — a mask that lets the keyboard signal processes (1, bit 64)
+    /// is the advisory's finding, a narrower one (the distributions'
+    /// defaults) none, an absent file (no SysRq) none, a mask that is no
+    /// integer a finding (not known); the round's restore never names it.
+    #[test]
+    fn the_keyboard_sysrq_mask_is_an_advisory_never_rewritten() {
+        for (mask, found) in [
+            ("1\n", true),
+            ("64\n", true),
+            ("502\n", true),
+            ("-1\n", true),
+            ("x\n", true),
+            ("0\n", false),
+            ("16\n", false),
+            ("176\n", false),
+            ("438\n", false),
+        ] {
+            let d = host(&[(SYSRQ, mask)]);
+            let p = sysrq_posture(d.path());
+            assert_eq!(p.is_some(), found, "{mask:?}: {p:?}");
+            if let Some(line) = p {
+                assert!(line.starts_with("kernel.sysrq "), "{line}");
+                assert!(
+                    line.contains("SysRq can signal processes from a keyboard"),
+                    "{line}"
+                );
+            }
+            // the round leaves it as it is: no finding, no write
+            assert!(check(d.path(), 16 << 30, true).is_empty(), "{mask:?}");
+            assert_eq!(
+                std::fs::read_to_string(d.path().join(SYSRQ.trim_start_matches('/'))).unwrap(),
+                mask
+            );
+        }
+        // absent: a kernel without SysRq; a mask that cannot be read (a
+        // directory in its place): a finding, never a default
+        assert_eq!(sysrq_posture(host(&[]).path()), None);
+        let d = host(&[]);
+        std::fs::create_dir_all(d.path().join(SYSRQ.trim_start_matches('/'))).unwrap();
+        let p = sysrq_posture(d.path()).expect("an unreadable mask is a finding");
+        assert!(p.starts_with("kernel.sysrq could not be read"), "{p}");
+        assert!(
+            GUARDED
+                .iter()
+                .all(|(p, k, _)| *k != common::cgroup_limits::SYSCTL_SYSRQ && *p != SYSRQ),
+            "the round never rewrites the host's SysRq mask"
+        );
     }
 
     /// Lot 280b (named): the kprobes' switches at 0 (set at boot, inside a

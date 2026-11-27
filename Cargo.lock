@@ -1236,6 +1236,7 @@ dependencies = [
  "aya",
  "libc",
  "northnarrow-common",
+ "signal-hook-registry",
  "tempfile",
  "tracing",
 ]

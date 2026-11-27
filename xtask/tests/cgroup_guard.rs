@@ -156,8 +156,9 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
             "Ok(m) => m,",
-            // lot 280b: and the switches of debugfs and securityfs
-            "match special_fs(magic) {\n            Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n            Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n            Some(SpecialFs::Proc) => {\n                refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n            }\n            Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),\n            None => false,\n        }",
+            // lot 280b: and the switches of debugfs and securityfs; lot 2.0:
+            // and procfs's SysRq trigger, after the sysctls and oom_score_adj
+            "match special_fs(magic) {\n            Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n            Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n            Some(SpecialFs::Proc) => {\n                refuse_sysctl(file, inode, hook, phase)\n                    || refuse_oom_adj(file, inode, phase)\n                    || refuse_switch(file, inode, SpecialFs::Proc, phase)\n            }\n            Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),\n            None => false,\n        }",
         ],
     )
     .unwrap();
@@ -168,18 +169,27 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     );
     // Lot 280b: a switch's write is refused by its names alone (the shared
     // judge), the family and a window passing first, and an inode that
-    // cannot be read refused all the same (signed 0:0)
+    // cannot be read refused all the same (signed 0:0). Lot 2.0: inside a
+    // window (never for the family) the SysRq trigger's open is recorded,
+    // and let through; outside one it is refused as every switch.
+    let sw = body(&c, "refuse_switch");
     in_order(
-        body(&c, "refuse_switch"),
+        sw,
         &[
             "let op = switch_file_op(fs, name, parent);",
             "if op == 0 {\n            return false;\n        }",
-            "if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {\n            return false;\n        }",
+            "let caller = (bpf_get_current_pid_tgid() >> 32) as u32;",
+            "if caller_may(caller) {",
+            "if op == FS_OP_SYSRQ && phase == Phase::Open && !crate::task_kill::is_exempt_pid(caller) {",
+            "sign(phase, FS_OP_SYSRQ_WINDOW, key);",
+            "return false;\n        }",
             "read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });",
             "sign(phase, op, key);\n        true",
         ],
     )
     .unwrap();
+    assert_eq!(sw.matches("return false;").count(), 4, "{sw}");
+    assert_eq!(sw.matches("sign(").count(), 2, "{sw}");
     // Lot 273d (the review of #492): a guarded sysctl's harmful write
     // refused outside a window, judged at the write by the shared verdict
     // (R1: written_value() appears nowhere else in it)
