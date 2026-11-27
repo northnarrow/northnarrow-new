@@ -2721,6 +2721,50 @@ impl BpfGuard {
                         );
                     }
                 }
+                // lot 353 (re-check 1 of #563): the pins walked by path
+                // (`/sys/fs/bpf`) — off the runtime's worker
+                let live: HashSet<u32> =
+                    crate::runtime::off_the_runtime(|| live_links(own.pin_root.as_deref()))
+                        .into_iter()
+                        .filter(|(_, prog)| *prog != 0)
+                        .map(|(id, _)| id)
+                        .collect();
+                for id in &ids {
+                    // re-read per link: the stop can begin during the walk
+                    if guard.stopping() {
+                        return;
+                    }
+                    if live.contains(id)
+                        || guard.0.retired_links.lock().contains(id)
+                        || !reported.insert(*id)
+                    {
+                        continue;
+                    }
+                    error!(
+                        link_id = id,
+                        "ANTI-TAMPER: one of the agent's own BPF links is GONE — an LSM hook or sensor was \
+                     detached from outside the agent"
+                    );
+                    if let Some(log) = &audit_log {
+                        let draft = AuditEntryDraft {
+                            op: LINK_MISSING_AUDIT_OP.to_string(),
+                            extra: serde_json::json!({ "link_id": id, "links_registered": ids.len() }),
+                            key_fp: "agent-self".to_string(),
+                            cosigner_fps: Vec::new(),
+                            result: "detected".to_string(),
+                            client_pid: std::process::id(),
+                            client_uid: 0,
+                            client_comm: "northnarrow-agent".to_string(),
+                            client_exe: None,
+                        };
+                        if let Err(e) = log.lock().append(draft) {
+                            warn!(
+                                error = format!("{e:#}"),
+                                "BPF self-defence: audit entry for the missing link failed"
+                            );
+                        }
+                    }
+                }
                 // lot 2.2 (the review of #644, F3 and F4): a preloaded
                 // library in a role process, a foreign cgroup program on the
                 // agent's cgroups — each signed High once while it holds,
@@ -2780,50 +2824,6 @@ impl BpfGuard {
                 }
                 for f in &gone {
                     crate::self_integrity::report_cleared(audit_log.as_ref(), f);
-                }
-                // lot 353 (re-check 1 of #563): the pins walked by path
-                // (`/sys/fs/bpf`) — off the runtime's worker
-                let live: HashSet<u32> =
-                    crate::runtime::off_the_runtime(|| live_links(own.pin_root.as_deref()))
-                        .into_iter()
-                        .filter(|(_, prog)| *prog != 0)
-                        .map(|(id, _)| id)
-                        .collect();
-                for id in &ids {
-                    // re-read per link: the stop can begin during the walk
-                    if guard.stopping() {
-                        return;
-                    }
-                    if live.contains(id)
-                        || guard.0.retired_links.lock().contains(id)
-                        || !reported.insert(*id)
-                    {
-                        continue;
-                    }
-                    error!(
-                        link_id = id,
-                        "ANTI-TAMPER: one of the agent's own BPF links is GONE — an LSM hook or sensor was \
-                     detached from outside the agent"
-                    );
-                    if let Some(log) = &audit_log {
-                        let draft = AuditEntryDraft {
-                            op: LINK_MISSING_AUDIT_OP.to_string(),
-                            extra: serde_json::json!({ "link_id": id, "links_registered": ids.len() }),
-                            key_fp: "agent-self".to_string(),
-                            cosigner_fps: Vec::new(),
-                            result: "detected".to_string(),
-                            client_pid: std::process::id(),
-                            client_uid: 0,
-                            client_comm: "northnarrow-agent".to_string(),
-                            client_exe: None,
-                        };
-                        if let Err(e) = log.lock().append(draft) {
-                            warn!(
-                                error = format!("{e:#}"),
-                                "BPF self-defence: audit entry for the missing link failed"
-                            );
-                        }
-                    }
                 }
             }
         });

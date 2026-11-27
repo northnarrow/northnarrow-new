@@ -65,7 +65,7 @@ const PLATFORM_EXPANSIONS: [&str; 4] = ["x86_64", "haswell", "xeon_phi", "aarch6
 /// The names `/etc/ld.so.preload`'s text holds, as the loader splits it
 /// (glibc's `rtld.c`: space, tab, newline and `:` separate them).
 pub fn preload_tokens(text: &str) -> Vec<&str> {
-    text.split(|c: char| c == ':' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+    text.split([':', ' ', '\t', '\n', '\r'])
         .filter(|t| !t.is_empty())
         .collect()
 }
@@ -237,24 +237,29 @@ pub fn census_with(
 /// most [`MAX_CGROUPS`] — opened beneath the cgroup2 root the start
 /// anchored (`antitamper_bpf::kernel_roots::cgroup_root`).
 fn census_targets() -> Result<Vec<(String, std::fs::File)>, String> {
-    let (root, _) = antitamper_bpf::kernel_roots::cgroup_root()?;
-    let base = format!("/proc/self/fd/{}", root.as_raw_fd());
+    use antitamper_bpf::kernel_roots;
+    let (root, at) = kernel_roots::cgroup_root()?;
     let mut out: Vec<(String, std::fs::File)> = Vec::new();
     let mut walk: Vec<String> = vec![SLICE.to_string()];
     while let Some(rel) = walk.pop() {
-        let Ok(dir) = std::fs::File::open(format!("{base}/{rel}")) else {
+        if out.len() >= MAX_CGROUPS {
+            break;
+        }
+        let path = at.join(&rel);
+        let Ok(dir) =
+            kernel_roots::open(&path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        else {
             continue;
         };
-        if out.len() < MAX_CGROUPS {
-            if let Ok(entries) = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
-                for e in entries.flatten() {
-                    if e.file_type().is_ok_and(|t| t.is_dir()) && rel.matches('/').count() < 2 {
-                        walk.push(format!("{rel}/{}", e.file_name().to_string_lossy()));
-                    }
+        if rel.matches('/').count() < 2 {
+            for name in kernel_roots::read_dir_max(&path, MAX_CGROUPS).unwrap_or_default() {
+                let child = format!("{rel}/{}", name.to_string_lossy());
+                if kernel_roots::symlink_metadata(at.join(&child)).is_ok_and(|m| m.is_dir()) {
+                    walk.push(child);
                 }
             }
-            out.push((format!("/{rel}"), dir));
         }
+        out.push((format!("/{rel}"), dir));
     }
     out.push(("/ (the root cgroup)".to_string(), root));
     Ok(out)
