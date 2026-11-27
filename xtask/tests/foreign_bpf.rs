@@ -1571,10 +1571,13 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
     in_order(
         body(&r, "mount_idmapped"),
         &[
-            "let Some(o_map) = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET) else {",
+            "let o_userns = off_opt!(VFSMOUNT_MNT_USERNS_OFFSET);",
+            "let o_map = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET);",
+            "if let Some(o) = o_userns {",
+            "return userns_level(ns) != 0;",
             "if let Some(o) = off_opt!(MNT_IDMAP_UID_NR_EXTENTS_OFFSET) {\n            return bpf_probe_read_kernel::<u32>(map.add(o) as *const u32).unwrap_or(0) != 0;\n        }",
-            "Some(o) => bpf_probe_read_kernel::<*const u8>(map.add(o) as *const *const u8).unwrap_or(core::ptr::null()),\n            None => map,",
-            "userns_level(ns) != 0",
+            "match off_opt!(MNT_IDMAP_OWNER_OFFSET) {",
+            "!= 0\n            }\n            None => {\n                crate::fail_open::bump(",
         ],
     )
     .unwrap();

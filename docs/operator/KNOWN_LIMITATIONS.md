@@ -780,6 +780,37 @@ not cause as an incident.
   BTF the open refusal is not armed, a signed degradation. *Evidence:*
   `the_memory_views_are_refused_at_their_open_with_the_hooks_decisions`;
   lot 367; internal check Phase 3b (F3b-1).
+- **A cgroup BPF program on the agent's cgroups can be found after the
+  fact.** Outside a trusted-installer window, the kernel refuses a cgroup
+  BPF program attached to `northnarrow.slice` or to the agent's unit
+  cgroups, judged on the descriptor the attach names. The kernel reads that
+  descriptor again after the check, and offers no later point where the
+  attach could be refused, so a second thread that swaps the descriptor in
+  between attaches past it. A program attached before the agent started,
+  or inside a window, is not refused either. The agent asks the kernel
+  what is attached to those cgroups and to the root cgroup at its start,
+  every 10 seconds (a window's close included), and right after each
+  cgroup attach the kernel lets through: each program that is not the
+  agent's is a signed High `cgroup_bpf_foreign` finding, listed by
+  `nn-admin status` (the advisories, and the role marks' line) while it
+  stays. The agent never detaches it. A host whose root cgroup carries a
+  container network's or runtime's own programs (Cilium attaches socket
+  programs there) sees each of them listed: advisories, no sensor
+  degraded. *For you:* identify the program
+  (`bpftool cgroup tree`) and detach it if it is not your own. *Evidence:*
+  `the_census_names_every_program_not_the_agent_s`;
+  `the_cgroup_census_runs_after_each_attach_and_never_detaches`; lot 2.2.
+- **A preloaded library the kernel trusts keeps the role.** The agent and
+  the watchdog hold their roles only with their own binary as their main
+  image and trusted code in every other executable mapping, judged when
+  it is mapped (a root-owned regular file nobody else can write, on a
+  local filesystem). A library `/etc/ld.so.preload` names that passes that
+  test (one the start's self-check lets through) keeps the role, and the
+  agent signs a High `role_preloaded_library` advisory while it is
+  mapped; one that fails it takes the role away, signed. A write of
+  `/etc/ld.so.preload` outside a window is not refused yet (a later lot of
+  stage S2). *Evidence:* `a_preloaded_library_is_found_among_the_role_s_mappings`;
+  `an_untrusted_mapping_takes_the_role_away_by_its_first_reason`; lot 2.2.
 
 ## Detection coverage
 

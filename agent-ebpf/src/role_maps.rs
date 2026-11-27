@@ -61,7 +61,7 @@ use crate::btf_offsets::{
     FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_MODE_OFFSET, INODE_I_NLINK_OFFSET,
     INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, MNT_IDMAP_OWNER_OFFSET, MNT_IDMAP_UID_NR_EXTENTS_OFFSET, PATH_MNT_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, SUPER_BLOCK_S_USER_NS_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
-    USER_NAMESPACE_LEVEL_OFFSET, VFSMOUNT_MNT_IDMAP_OFFSET, VM_AREA_STRUCT_VM_FILE_OFFSET,
+    USER_NAMESPACE_LEVEL_OFFSET, VFSMOUNT_MNT_IDMAP_OFFSET, VFSMOUNT_MNT_USERNS_OFFSET, VM_AREA_STRUCT_VM_FILE_OFFSET,
     VM_AREA_STRUCT_VM_FLAGS_OFFSET,
 };
 
@@ -370,17 +370,20 @@ unsafe fn userns_level(ns: *const u8) -> u32 {
 }
 
 /// Whether `file` was opened through an idmapped mount: the mount's
+/// `mnt_userns` other than the initial user namespace (5.12 to 6.2), or its
 /// `mnt_idmap` with maps of its own (from 6.7) or of a user namespace other
-/// than the initial one (6.3 to 6.6), or its `mnt_userns` other than the
-/// initial one (5.12 to 6.2; the slot's alternative path, told by neither
-/// of the two `mnt_idmap` fields being known).
+/// than the initial one (6.3 to 6.6). A kernel with neither field has no
+/// idmapped mount (before 5.12); one whose idmapping has neither known
+/// layout is read as not idmapped, counted.
 #[inline(always)]
 unsafe fn mount_idmapped(file: *const u8) -> bool {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
-        let Some(o_map) = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET) else {
+        let o_userns = off_opt!(VFSMOUNT_MNT_USERNS_OFFSET);
+        let o_map = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET);
+        if o_userns.is_none() && o_map.is_none() {
             return false;
-        };
+        }
         let mnt = bpf_probe_read_kernel::<*const u8>(
             file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_MNT_OFFSET)) as *const *const u8,
         )
@@ -389,6 +392,13 @@ unsafe fn mount_idmapped(file: *const u8) -> bool {
             crate::fail_open::bump(northnarrow_common::fail_open::hook::FILE_PERMISSION);
             return false;
         }
+        if let Some(o) = o_userns {
+            let ns = bpf_probe_read_kernel::<*const u8>(mnt.add(o) as *const *const u8).unwrap_or(core::ptr::null());
+            return userns_level(ns) != 0;
+        }
+        let Some(o_map) = o_map else {
+            return false;
+        };
         let map = bpf_probe_read_kernel::<*const u8>(mnt.add(o_map) as *const *const u8).unwrap_or(core::ptr::null());
         if map.is_null() {
             return false;
@@ -396,10 +406,15 @@ unsafe fn mount_idmapped(file: *const u8) -> bool {
         if let Some(o) = off_opt!(MNT_IDMAP_UID_NR_EXTENTS_OFFSET) {
             return bpf_probe_read_kernel::<u32>(map.add(o) as *const u32).unwrap_or(0) != 0;
         }
-        let ns = match off_opt!(MNT_IDMAP_OWNER_OFFSET) {
-            Some(o) => bpf_probe_read_kernel::<*const u8>(map.add(o) as *const *const u8).unwrap_or(core::ptr::null()),
-            None => map,
-        };
-        userns_level(ns) != 0
+        match off_opt!(MNT_IDMAP_OWNER_OFFSET) {
+            Some(o) => {
+                userns_level(bpf_probe_read_kernel::<*const u8>(map.add(o) as *const *const u8).unwrap_or(core::ptr::null()))
+                    != 0
+            }
+            None => {
+                crate::fail_open::bump(northnarrow_common::fail_open::hook::FILE_PERMISSION);
+                false
+            }
+        }
     }
 }
