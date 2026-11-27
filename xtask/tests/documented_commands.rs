@@ -509,14 +509,10 @@ fn problem_named(cmds: &BTreeMap<Vec<String>, Command>, words: &[String]) -> Opt
 
 /// Lot 1.7b: what the prose names that `nn-admin` does not take, left for the
 /// documents' lot: `(document, the command as read, the lot that owns it,
-/// the rule it breaks)`.
-const PROSE_DEBT: &[(&str, &str, &str, &str)] = &[(
-    "docs/operator/UPGRADE_NOTES_WAVE4.md",
-    "heartbeat verify --max-skew-secs",
-    "lot 1.9 (S1, documents)",
-    "a code span names a command nn-admin has: `heartbeat verify` is none (the option is \
-     `heartbeat watch`'s); the wave-4 notes are frozen by plan, only the documents' lot edits them",
-)];
+/// the rule it breaks)`. Lot 1.9 paid the one entry (`UPGRADE_NOTES_WAVE4.md`'s
+/// `heartbeat verify --max-skew-secs`, now `heartbeat watch`'s option): a new
+/// entry needs an owner and the rule it breaks.
+const PROSE_DEBT: &[(&str, &str, &str, &str)] = &[];
 
 /// Every `nn-admin` command the README and the operator guides give is one
 /// `nn-admin` takes, by its own help.

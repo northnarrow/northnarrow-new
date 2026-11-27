@@ -275,7 +275,7 @@ fleet-wide signals from the cloud broker. A signal seen on one host is
 ambiguous; a signal confirmed on N hosts in the same fleet is high
 confidence and reduces both detection time AND false-positive rate. This
 principle is what mechanically enables "block the threat from the first
-machine onward" — a CrowdStrike / SentinelOne-class capability that V1
+machine onward" — a capability that V1
 does not provide.
 
 Critically: **fleet-aware ≠ fleet-data-shared**. Only IoCs and behavioral
@@ -920,30 +920,22 @@ design-doc hygiene).
   `RansomwareEncryption`) by the copies' content and names, not by the
   mass-write arm. Encryption in place from a session still raises the arm
   for the larger files; small documents encrypted in place from a login session are judged by the tracker's rename and content signals only (a session threshold of their own is to be measured on a development corpus first: lot 283).
-- **What the arm does not see (the review of #500, C1), and who does.**
-  The arm pairs a replacement's halves (the copies written, the originals
-  deleted) within a bounded window, and counts per process, with a
-  per-cgroup window for rewrites. Work spread beyond those bounds — over
-  more time than the window, over processes or units that do not share an
-  actor, below the per-process counts — is no shape for the arm; the
-  ransomware tracker judges part of it (its own, longer pairing, its
-  entropy and rename signals, a deleter that descends from the writer),
-  and what neither judges is a stated limit, as on `main`. A truncated
-  original the kernel's bounded map has forgotten counts nothing at its
-  unlink, as before. In tracepoint mode the arm counts files written and
-  no replacement shape, and the tracker is blind (no `MassWrite`, no
-  `FileBurst`). NN-L-IMP-001's own signals have floors of their own (a
-  minimum size for rewrites, enough ciphertext for its entropy measure,
-  the deleter being the writer's actor); small documents encrypted in
-  place are the tracker's by their renames to a new extension.
-- **The kernel windows evict.** The per-process windows (`OPEN_WRITES`,
-  `OPEN_UNLINKS`, bounded LRU maps, as before the lot) restart a process's counts under very heavy write activity from many processes:
-  fewer counts, not more. The lot's maps evict the other way — a file or a
-  name seen again counts again (`OPEN_OVERWRITE_SEEN`,
-  `OPEN_DESTROY_SEEN`), a process's own temporary file forgotten counts as
-  an original (`OPEN_CREATED`) — save `OPEN_HAD_DATA`, above. Documented,
-  not changed: that much write activity is a host under a fork storm,
-  which other signals see.
+- **What the arm does not see, and who does.** The arm pairs a
+  replacement's halves (the copies written, the originals deleted) within
+  a bounded window, and counts per process, with a per-cgroup window for
+  rewrites. Work outside those bounds is no shape for the arm; the
+  ransomware tracker judges part of it with its own, longer pairing and its
+  entropy and rename signals, and what neither judges is a stated limit,
+  as on `main`. In tracepoint mode the arm counts files written and no
+  replacement shape, and the tracker has no input (no `MassWrite`, no
+  `FileBurst`). NN-L-IMP-001's signals have floors of their own; small
+  documents encrypted in place are the tracker's by their renames to a new
+  extension.
+- **The kernel windows are bounded.** Under very heavy write activity from
+  many processes they forget entries: some counts restart (fewer counts),
+  others count a file or a name again (more). Documented, not changed:
+  that much write activity is a host under a fork storm, which other
+  signals see.
 - **Corroboration is per actor scope, not per process tree** (future work).
   A signal of one process of a login session or a workload vouches for
   another process of the same scope, as the lab's `iptables` (podman's CNI
@@ -960,11 +952,11 @@ design-doc hygiene).
     root's, a file with another link), or runs in a session, still raises
     the arm;
   - *a root daemon running as a listed unit gets that unit's listed
-    directories exempt, and nothing else*: the unit is recognised by its name; whatever runs as or in that unit writes those
-    directories unseen by the arm; its writes anywhere else count, and so
-    do the same directories written from any other cgroup;
+    directories exempt, and nothing else*: what runs in that unit writes
+    those directories unseen by the arm; its writes anywhere else count,
+    and so do the same directories written from any other cgroup;
   - *own data is classified by the directory a file is in when it is
-    opened* (the dentries, not the mount): a rewrite made there is judged as own data and reaches
+    opened*: a rewrite made there is judged as own data and reaches
     NN-L-IMP-001 only. A file with another link is no one's own data;
   - *tracepoint mode* knows no own data (no kernel summary): every
     crossing counts there, as before.

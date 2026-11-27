@@ -24,9 +24,8 @@ ruling on the open questions in §13.
 ## 1. Purpose & scope
 
 **File Integrity Monitoring (FIM) is the customer-visible Phase 1
-detection feature.** Existing competitors (Carbon Black, CrowdStrike
-Falcon, SentinelOne, Wazuh) all ship FIM as a headline capability —
-"tell me when /etc/passwd changes, alert on a new binary in
+detection feature.** FIM is a basic expectation of an endpoint
+product — "tell me when /etc/passwd changes, alert on a new binary in
 /usr/local/bin/, notify on `chmod 4755 /tmp/<file>`". NorthNarrow
 must match this baseline to be a credible XDR competitor.
 

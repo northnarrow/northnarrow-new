@@ -36,9 +36,8 @@ K1-K8 sprint completes (project SHIP order).
 ## 1. Purpose & scope
 
 **Network Observability is the second customer-visible Phase 1
-detection feature after FIM.** Competitors (Carbon Black,
-CrowdStrike Falcon, SentinelOne, Wazuh) all ship "outbound
-connection telemetry" as table stakes — operators expect to
+detection feature after FIM.** Outbound connection telemetry is
+a basic expectation of an endpoint product: operators expect to
 answer "what processes called home over the last 24 hours, to
 where, and what does each conversation look like". NorthNarrow
 must match this baseline AND deliver a differentiated capability

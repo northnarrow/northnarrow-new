@@ -99,23 +99,33 @@ The Active Defender does the first and refuses the second.
 
 ### C1 — Environmental Awareness Module *(DDACD Ph1 + Ph2)*
 
-**What it is.** ADE builds and continuously maintains an intimate model
-of the host it defends:
+**What it is.** ADE builds an intimate model of the host it defends, and
+changes it only by a signed act:
 
 - **Install-time inventory:** installed packages + versions, running
   services, listening sockets, user/group/sudo topology, kernel +
   module set, scheduled jobs, container/namespace layout.
-- **Continuous baseline:** process-spawn behaviour, network topology
-  (who talks to whom), privileged process trees, file-access patterns
-  — the "normal" against which anomaly is judged.
+- **A record of first uses, learned in a bounded window and sealed**
+  (rewritten after the alpha; replaces the earlier "continuous
+  baseline"): for each service and binary, identified by kernel objects
+  (an inode, a content hash, a cgroup) and never by a name, the first time
+  it shows each security-relevant behaviour — process spawns, network
+  peers, privileged process trees, classes of files it opens. The record
+  learns only inside a bounded window that covers the host's rare normal
+  work (restarts, an upgrade, a log rotation, a backup). At the end of the
+  window an operator seals it with a signed act, and from then on it
+  changes only by another signed act. A baseline that keeps adapting would
+  absorb an attack as normal; a sealed record cannot. The record is
+  planned for stage S3 of the roadmap after the alpha
+  (`ROADMAP.md`).
 - **Topology for positioning:** identifies high-yield observation
   points (shared service accounts, privileged trees) that inform where
   C3 places deception and where sensors matter most.
 
 **Why it matters.** Every other component is downstream of knowing the
 ground. Vulnerability intel (C2) needs the inventory; deception (C3)
-needs the topology; forensics (C4) needs the baseline to say what was
-abnormal. This is why C1 is the **V1.5 foundation, built first**.
+needs the topology; forensics (C4) needs the sealed record to say what was
+a first use. This is why C1 is the **V1.5 foundation, built first**.
 
 **Builds on:** DDACD Phase 1 "customer environment fingerprinting" +
 Phase 2 "sensor placement optimization" (today: doctrine concepts, no
