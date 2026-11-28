@@ -2303,7 +2303,6 @@ fn write_role_marks<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<Map
     want: &[(common::wire::InodeKey, &'static str)],
 ) -> std::result::Result<usize, String> {
     use crate::anti_tamper::filesystem::AyaInodeKey;
-    use common::exec_marks::MARK_ROLE;
     let stale: Vec<AyaInodeKey> = map
         .keys()
         .filter_map(std::result::Result::ok)
@@ -2313,16 +2312,70 @@ fn write_role_marks<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<Map
         map.remove(k)
             .map_err(|e| format!("removing a stale role mark: {e}"))?;
     }
-    let mut n = 0;
-    for (key, what) in want {
-        let old = map.get(&AyaInodeKey(*key), 0).unwrap_or(0);
-        if old & MARK_ROLE == 0 {
-            map.insert(&AyaInodeKey(*key), &(old | MARK_ROLE), 0)
-                .map_err(|e| format!("{what} ({}:{}): {e}", key.dev, key.ino))?;
-        }
-        n += 1;
+    add_role_marks(map, want)
+}
+
+/// Lot M9: the words to write so that every image of `want` carries
+/// `MARK_ROLE` — `old(key)` its word now (`None`: not in the map), the bits
+/// S12 owns kept; an image marked already needs no write. Nothing is ever
+/// removed here. Pure, so that what [`write_role_marks`] and
+/// [`premark_own_images`] write is tested once.
+pub fn role_mark_writes(
+    want: &[(common::wire::InodeKey, &'static str)],
+    old: impl Fn(common::wire::InodeKey) -> Option<u32>,
+) -> Vec<(common::wire::InodeKey, u32, &'static str)> {
+    use common::exec_marks::MARK_ROLE;
+    want.iter()
+        .filter_map(|(key, what)| {
+            let word = old(*key).unwrap_or(0);
+            (word & MARK_ROLE == 0).then_some((*key, word | MARK_ROLE, *what))
+        })
+        .collect()
+}
+
+/// [`role_mark_writes`] applied to `map`: `want` marked, nothing removed.
+/// The images of `want` (marked now).
+fn add_role_marks<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    map: &mut HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
+    want: &[(common::wire::InodeKey, &'static str)],
+) -> std::result::Result<usize, String> {
+    use crate::anti_tamper::filesystem::AyaInodeKey;
+    let writes = role_mark_writes(want, |k| map.get(&AyaInodeKey(k), 0).ok());
+    for (key, word, what) in writes {
+        map.insert(&AyaInodeKey(key), &word, 0)
+            .map_err(|e| format!("{what} ({}:{}): {e}", key.dev, key.ino))?;
     }
-    Ok(n)
+    Ok(want.len())
+}
+
+/// Lot M9 (the AlmaLinux 9 nightly of 28/11): this start's own role
+/// binaries marked in the pinned `EXEC_MARKS` (`MARK_ROLE` added, nothing
+/// removed: [`arm_role_marks`] writes the whole set later) BEFORE the start
+/// claims a role — [`super::preregister_self`] calls it ahead of the early
+/// `PROTECTED_PIDS` entry. From that entry on the process holds a role, and
+/// a mapping hook still attached (the predecessor's: pinned where the guard
+/// enforces, a dying one's in a debug build) judges each executable mapping
+/// it makes against its MAIN image's mark. A binary the predecessor did not
+/// mark (an upgrade's, a test's copy) was unmarked until this start's own
+/// arm, so its first executable mapping took the role away
+/// (`CODE_MAIN_UNMARKED`) — on AlmaLinux 9 the worker account's lookup,
+/// which loads glibc's NSS module (`passwd: sss files systemd`) — and every
+/// BPF load of the start was then refused (`start refused gate="sensors"`).
+/// The marks are the ones the arm writes, from the same identities, earlier:
+/// a mapping that is not trusted code still takes the role away. `Ok(0)`: no
+/// pinned map (no predecessor, nothing judged); the images marked otherwise.
+pub fn premark_own_images(
+    pin_root: &Path,
+    own: &crate::anti_tamper::OwnExes,
+) -> std::result::Result<usize, String> {
+    let pin = pin_root.join(common::exec_marks::EXEC_MARKS_MAP_NAME);
+    if !pin.exists() {
+        return Ok(0);
+    }
+    let md = MapData::from_pin(&pin).map_err(|e| e.to_string())?;
+    let mut map: HashMap<MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
+        HashMap::try_from(Map::HashMap(md)).map_err(|e| e.to_string())?;
+    add_role_marks(&mut map, &role_images(own, None))
 }
 
 /// The main image of the live watchdog (`/proc/<pid>/exe`), by kernel key,
@@ -2924,6 +2977,63 @@ mod tests {
         };
         assert_eq!(role_images(&one, None).len(), 1);
         assert!(role_images(&OwnExes::default(), None).is_empty());
+    }
+
+    /// Lot M9: the words written to mark the role images — `MARK_ROLE` added
+    /// to an image without it (a word S12 set kept whole), no write for one
+    /// marked already, and never a removal (the pre-mark of a start adds its
+    /// binaries to the predecessor's marks; the arm drops the stale ones).
+    #[test]
+    fn a_role_mark_write_adds_the_mark_and_keeps_every_other_bit() {
+        use common::exec_marks::{MARK_ROLE, MARKS_RESERVED_S12};
+        let key = |ino| common::wire::InodeKey {
+            dev: 0x0fc0_0004,
+            ino,
+        };
+        let want = [(key(127), "a role binary"), (key(133), "a role binary")];
+        // none marked: both written, with the mark only
+        let w = role_mark_writes(&want, |_| None);
+        assert_eq!(
+            w.iter().map(|(k, v, _)| (*k, *v)).collect::<Vec<_>>(),
+            [(key(127), MARK_ROLE), (key(133), MARK_ROLE)]
+        );
+        // the predecessor marked 133 (the XFS inode a new copy reused): no
+        // write for it; 127 carries an S12 bit, kept
+        let s12 = MARKS_RESERVED_S12 & 0x100;
+        let w = role_mark_writes(&want, |k| match k.ino {
+            127 => Some(s12),
+            133 => Some(MARK_ROLE),
+            _ => None,
+        });
+        assert_eq!(
+            w.iter().map(|(k, v, _)| (*k, *v)).collect::<Vec<_>>(),
+            [(key(127), s12 | MARK_ROLE)]
+        );
+        // nothing wanted, nothing written (an image not wanted is not removed)
+        assert!(role_mark_writes(&[], |_| Some(0)).is_empty());
+    }
+
+    /// Lot M9 (the AlmaLinux 9 nightly of 28/11): the early registration
+    /// marks this start's binaries BEFORE it enters `PROTECTED_PIDS` — from
+    /// the entry on, a predecessor's mapping hook judges the process's
+    /// executable mappings against its main image's mark, and the first one
+    /// (el9: glibc's NSS module, at the worker account's lookup) took the
+    /// role of a start whose binary the predecessor had not marked: every
+    /// BPF load refused, `start refused gate="sensors"`.
+    #[test]
+    fn the_early_registration_marks_the_start_s_binaries_first() {
+        let src = include_str!("mod.rs");
+        let body = &src[src
+            .find("pub fn preregister_self(")
+            .expect("preregister_self")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let mark = body
+            .find("premark_own_images(")
+            .expect("preregister_self marks the start's binaries");
+        let entry = body
+            .find("register_protected_pid(")
+            .expect("preregister_self registers the start");
+        assert!(mark < entry, "the marks after the PROTECTED_PIDS entry");
     }
 
     /// The review of #644 (F5): the arm flag's word is the hooks' "armed"

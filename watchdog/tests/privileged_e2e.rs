@@ -281,6 +281,13 @@ impl E2eFixture {
 
     /// [`Self::spawn_agent`] with `extra` arguments after the fixture's.
     fn spawn_agent_with(&mut self, extra: &[&std::ffi::OsStr]) -> u32 {
+        self.launch_agent_with(extra);
+        self.wait_agent_pidfile()
+    }
+
+    /// Lot M9: the agent started (`sudo`'s child, in `agent_child`), not
+    /// waited for — [`Self::wait_agent_pidfile`] waits.
+    fn launch_agent_with(&mut self, extra: &[&std::ffi::OsStr]) {
         // Seed admin.pub with one fresh keypair just so AdminAuth::load
         // doesn't reject an empty file. Tests don't actually use the
         // key — they only need the agent's anti_tamper bring-up.
@@ -310,7 +317,10 @@ impl E2eFixture {
             .spawn()
             .expect("sudo spawn agent");
         self.agent_child = Some(child);
+    }
 
+    /// The pid in the agent's pidfile, once it is there (at most 30 s).
+    fn wait_agent_pidfile(&self) -> u32 {
         // Poll for pidfile readiness (agent writes it AFTER all
         // anti-tamper attach completes — solid readiness signal). 30 s,
         // like the respawn waits: a cold boot on the lab guest was seen
@@ -1697,4 +1707,148 @@ fn a_role_its_holder_left_outside_a_window_is_recorded_high() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Lot M9: `path`'s `(dev, ino)` as the kernel keys it in `EXEC_MARKS`
+/// (`new_encode_dev`: the major above bit 20).
+fn kernel_key(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).expect("stat the copy");
+    let dev = m.dev();
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    ((major << 20) | minor, m.ino())
+}
+
+/// Lot M9: the pinned `EXEC_MARKS` (`bpftool … -j`: 16 key bytes, the
+/// device then the inode, little-endian; a 4-byte word) — empty when it
+/// is not pinned or not readable.
+fn exec_marks() -> Vec<((u64, u64), u32)> {
+    let Ok(out) = Command::new("sudo")
+        .args(["bpftool", "map", "dump", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/EXEC_MARKS"))
+        .arg("-j")
+        .output()
+    else {
+        return Vec::new();
+    };
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    body.split("},{")
+        .filter_map(|rec| {
+            let k = json_bytes(rec, "key")?;
+            let v = json_bytes(rec, "value")?;
+            (k.len() == 16 && v.len() == 4).then(|| {
+                let dev = u64::from_le_bytes(k[..8].try_into().expect("8 bytes"));
+                let ino = u64::from_le_bytes(k[8..].try_into().expect("8 bytes"));
+                ((dev, ino), u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            })
+        })
+        .collect()
+}
+
+/// `key` carries the role mark (bit 0, `exec_marks::MARK_ROLE`) in `marks`.
+fn role_marked(marks: &[((u64, u64), u32)], key: (u64, u64)) -> bool {
+    marks.iter().any(|(k, w)| *k == key && w & 1 != 0)
+}
+
+/// The tgids of the pinned `ROLE_UNMARKED` (the processes that lost their
+/// role) — empty when it is not pinned or not readable.
+fn role_unmarked_tgids() -> Vec<u32> {
+    let Ok(out) = Command::new("sudo")
+        .args(["bpftool", "map", "dump", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/ROLE_UNMARKED"))
+        .arg("-j")
+        .output()
+    else {
+        return Vec::new();
+    };
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    body.split("},{")
+        .filter_map(|rec| json_bytes(rec, "key"))
+        .filter(|k| k.len() == 4)
+        .map(|k| u32::from_le_bytes([k[0], k[1], k[2], k[3]]))
+        .collect()
+}
+
+/// The children of `pid` (`pgrep -P`).
+fn children_of(pid: u32) -> Vec<u32> {
+    Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Lot M9 (the AlmaLinux 9 nightly of 28/11): a start's own binary is in
+/// the pinned `EXEC_MARKS` BEFORE the start enters `PROTECTED_PIDS`, a
+/// binary its predecessor never marked included (an upgrade's, a new test
+/// copy). It used to be marked only at the start's own arm, seconds after
+/// that early registration: a predecessor's mapping hook still attached
+/// then judged the registered process's first executable mapping against
+/// an unmarked main image and took its role (el9: glibc's NSS module at the
+/// worker account's lookup, `passwd: sss files systemd`) — every BPF load
+/// of the start refused, `start refused gate="sensors"`: the first agent of
+/// `a_role_its_holder_left_outside_a_window_is_recorded_high`, started
+/// 0.3 s after the previous test's respawned agent was killed, on the
+/// AlmaLinux 9 guest. Here the predecessor is gone before the start, and
+/// the marks are read the moment the start's pid is in `PROTECTED_PIDS`.
+#[test]
+fn a_start_s_own_binary_is_marked_before_it_claims_its_role() {
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent();
+    // A second copy made while the first exists: an inode of its own, which
+    // no start marked (XFS gives a freed inode number to the next file).
+    let second = InstalledAgent::install();
+    let key = kernel_key(second.agent_exe());
+    assert!(
+        !role_marked(&exec_marks(), key),
+        "the new copy carries the role mark before any start of it: {key:?}"
+    );
+    fx.unprotect_and_sigkill_agent(pid0);
+    let gone = Instant::now() + Duration::from_secs(10);
+    while Path::new(&format!("/proc/{pid0}")).exists() && Instant::now() < gone {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{pid0}")).exists(),
+        "the first agent (pid {pid0}) outlived its SIGKILL by 10 s"
+    );
+    // the first copy kept to the end: its inode is not the second's
+    let _first = fx.agent_install.replace(second);
+    let _ = fs::remove_file(fx.agent_pidfile());
+    fx.launch_agent_with(&[]);
+    let sudo = fx
+        .agent_child
+        .as_ref()
+        .map(Child::id)
+        .expect("the start's sudo");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut claimed = None;
+    while claimed.is_none() && Instant::now() < deadline {
+        let pids = dump_protected_pids();
+        match children_of(sudo).into_iter().find(|p| pids.contains(p)) {
+            // read at once: the start's own arm writes the marks seconds later
+            Some(p) => claimed = Some((p, exec_marks())),
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let (pid, marks) = claimed.expect("the start never entered PROTECTED_PIDS");
+    assert!(
+        role_marked(&marks, key),
+        "pid {pid} entered PROTECTED_PIDS with its own binary {key:?} unmarked: {marks:?}"
+    );
+    assert_eq!(
+        fx.wait_agent_pidfile(),
+        pid,
+        "the start that registered is the one ready"
+    );
+    assert!(
+        !role_unmarked_tgids().contains(&pid),
+        "the start (pid {pid}) lost its role"
+    );
 }

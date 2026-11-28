@@ -38,8 +38,12 @@ pub(crate) fn bootstrap(
     // anti_tamper::attach does it again, with the stale-pid scan.
     // Lab PR 218: whether the previous hooks may close the agent's files to
     // this process until the attach registers it (the audit preflight).
+    // Lot M9: this start's binaries marked first (the role marks), so the
+    // predecessor's mapping hooks judge its mappings with its main image
+    // marked from the registration on.
     let early_registration_failed = match northnarrow_agent::anti_tamper::preregister_self(
         std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT),
+        &cli.own_exes(),
     ) {
         Ok(true) => {
             info!(

@@ -1585,9 +1585,27 @@ fn evict_stale_pids(ebpf: &mut Ebpf, keep: &[ExeIdentity]) -> Result<usize> {
 /// (the stale-pid scan, the pin of this boot's map); the BPF guard lets
 /// the successor of an exited agent open the map only from its main
 /// thread in its first minute, which is where this is called.
-pub fn preregister_self(bpffs_root: &Path) -> Result<bool> {
+///
+/// Lot M9: `own`'s binaries are marked in the pinned `EXEC_MARKS` first
+/// ([`bpf_defense::premark_own_images`]): once registered the process
+/// holds a role, and the predecessor's mapping hooks judge its executable
+/// mappings against its main image's mark. A mark that cannot be written
+/// is said, and the registration goes on (as before the lot).
+pub fn preregister_self(bpffs_root: &Path, own: &OwnExes) -> Result<bool> {
     if !bpffs_root.join(PROTECTED_PIDS_MAP_NAME).exists() {
         return Ok(false);
+    }
+    match bpf_defense::premark_own_images(bpffs_root, own) {
+        Ok(0) => {}
+        Ok(n) => info!(
+            marked = n,
+            "role marks: this start's binaries marked before it claims its role"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "role marks: this start's binaries NOT marked before it claims its role — a \
+             predecessor's mapping hook may take the role from its first executable mapping"
+        ),
     }
     register_protected_pid(Some(bpffs_root), std::process::id())?;
     Ok(true)
