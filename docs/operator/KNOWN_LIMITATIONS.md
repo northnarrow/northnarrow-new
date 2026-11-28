@@ -1401,8 +1401,8 @@ lists the known false positives of each rule.
   such a host load the four at boot, before the agent starts (a file in
   `/etc/modules-load.d/` naming them; a running `firewalld` loads them
   too). *Evidence:* lot M9 (the AlmaLinux 9 lab: after a cold boot with
-  only `nf_tables` loaded, `e2e_force_combat_then_unlock_via_cli` never
-  reached ISOLATE, on `v0.1.1-alpha`'s tree and on the lot's; with the
+  only nf_tables loaded, `e2e_force_combat_then_unlock_via_cli` never
+  reached ISOLATE, on the v0.1.1-alpha tree and on the lot's; with the
   modules loaded beforehand it passed; the four modules measured by
   applying the rules with no agent running, to a chain nothing jumps to).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
