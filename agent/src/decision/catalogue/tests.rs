@@ -92,9 +92,10 @@ fn reference_problems(id: &str, refs: &[AttackRef], p: &Pinned) -> Vec<String> {
 fn every_shipped_rule_declares_a_valid_attack_mapping() {
     let p = pinned();
     let rules = render::shipped_rules();
+    // lot 2.3a: NN-L-AT-002, one more of v2-rules.tsv's
     assert_eq!(
         rules.len(),
-        90 + 1 + 4,
+        91 + 1 + 4,
         "the rules v2-rules.tsv counts, and NN-L-EXECQ-001 (lab PR 223) and the exec \
          policy's four (lab PR 226), not in it"
     );

@@ -1059,7 +1059,11 @@ fn a_held_program_is_refused_at_every_run_and_attach() {
         &[
             "if caller_is_exempt() || crate::inode_protect::override_active() {",
             "return HELD_PASS;",
-            "prog_id_of_fd(fd as u32)",
+            // lot 2.3a: one number whose every bit is defined (the
+            // verifier refused an undefined payload read after the window's
+            // global call)
+            "prog_id_word(fd as u32)",
+            "PROG_ID_NONE => return HELD_PASS,",
             "crate::fail_open::bump(fail_open_hook::BPF);",
             "PROG_CONTENT_HELD.get(&id)",
             "if fresh_instance_may_load() {",
@@ -1084,8 +1088,15 @@ fn a_held_program_is_refused_at_every_run_and_attach() {
     .unwrap();
     // the program, not the descriptor: its id through the caller's table
     in_order(
-        body(&c, "prog_id_of_fd"),
-        &["private_of_fd(fd)?", "prog_id_of(prog as *const c_void)"],
+        body(&c, "prog_id_word"),
+        &[
+            "match private_of_fd(fd) {",
+            "Err(()) => PROG_ID_UNREAD,",
+            "Ok(None) => PROG_ID_NONE,",
+            "prog_id_of(prog as *const c_void)",
+            "Some(id) => u64::from(id),",
+            "None => PROG_ID_UNREAD,",
+        ],
     )
     .unwrap();
     // the perf event's attach, which no bpf command carries
@@ -1278,7 +1289,8 @@ fn an_inode_of_one_role_is_changed_by_that_role_alone() {
         v,
         &[
             "let flags = match PROTECTED_INODES.get(&key) {",
-            "if override_active() {\n            return None;\n        }",
+            // lot 2.3a: the key files are lifted by no window
+            "if override_active() && !window_kept(&key) {\n            return None;\n        }",
             "if crate::task_kill::is_exempt_pid(caller_tgid) {",
             "match ROLE_WRITE_INODES.get(&key) {",
             "Some(role) if *role != crate::bpf_defense::caller_role() => {}",
@@ -1753,4 +1765,28 @@ fn a_shared_writable_mapping_of_a_protected_file_is_refused_in_a_window_too() {
     assert!(body(&r, "try_role_mmap_file").contains(
         "if file != 0 && matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE) && nn_shared_map_refused(file) == 1 {\n            return -EPERM;\n        }"
     ));
+}
+
+/// Lot 2.3a: every pin a start makes under the pin root exists before the
+/// census of the agent's own objects (`register_own_objects`) — the tree
+/// window's programs too. Attached after it, a restart (an upgrade, a
+/// respawn, the privileged suites' second fixture) found the previous
+/// start's `prog_tree_*` and `link_tree_*` pins with their programs not
+/// loaded yet: twenty `foreign_pin` findings held at every restart (the
+/// status's sixteen lines filled, the findings after them only counted),
+/// and the tree's link names missing from `OWN_PIN_NAMES`, frozen there.
+#[test]
+fn the_tree_window_s_pins_exist_before_the_census_of_own_objects() {
+    let at = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&at, "attach_reporting"),
+        &[
+            "bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root)",
+            "bpf_defense::zero_window_maps(ebpf)",
+            "window_tree::attach(ebpf, &btf, pin_root)",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
+            "filesystem::register_bpffs_pins(ebpf, root)",
+        ],
+    )
+    .unwrap();
 }

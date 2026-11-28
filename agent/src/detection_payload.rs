@@ -127,7 +127,8 @@ pub(crate) fn exe_from_event(event: &Event) -> Option<String> {
         | Event::NetListener(_)
         | Event::NetInbound(_)
         | Event::DnsAnswer(_)
-        | Event::TlsClientHello(_) => None,
+        | Event::TlsClientHello(_)
+        | Event::WindowRecord { .. } => None,
     }
 }
 
@@ -156,16 +157,22 @@ pub(crate) fn file_from_event(event: &Event) -> Option<String> {
         | Event::NetListener(_)
         | Event::NetInbound(_)
         | Event::DnsAnswer(_)
-        | Event::TlsClientHello(_) => None,
+        | Event::TlsClientHello(_)
+        | Event::WindowRecord { .. } => None,
     }
 }
 
 /// The refused operation of an anti-tamper denial
 /// ([`DetectionRecord::operation`]); lab PR 224: `connect` for a connect
-/// the `socket_connect` deny refused; `None` for every other event.
+/// the `socket_connect` deny refused; lot 2.3a: an outsider's refusal a
+/// window record names; `None` for every other event.
 pub(crate) fn operation_from_event(event: &Event) -> Option<String> {
     match event {
         Event::FsProtectDenial { operation, .. } => Some(operation.to_string()),
+        Event::WindowRecord {
+            operation: Some(operation),
+            ..
+        } => Some(operation.to_string()),
         Event::NetFlow(nf) if nf.phase == nn_model::telemetry::FlowPhase::Denied => {
             Some("connect".to_string())
         }

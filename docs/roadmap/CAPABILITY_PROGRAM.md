@@ -14874,6 +14874,11 @@ no level changed.
   - Host: the full gates (6,185 workspace tests passed, golden ×5, MSRV 1.89, 15 fuzz targets, 5 portable targets, lockfiles unchanged); `verify-release-tag.sh version
     v0.1.0-alpha` passes; the CHANGELOG's 0.1.0-alpha section untouched
     (`verify-release-tag.sh` refuses an `[Unreleased]` on top).
+- **Lot M8 — Rust toolchain 1.100.1 (no behaviour change, no level
+  change).** `channel = "1.100.1"` (released 2026-11-27: one library fix, so
+  that some types are again seen as `Iterator`; no codegen or LLVM change, so
+  no eBPF or verifier effect and no lab). `rust-version` 1.98 and the eBPF
+  nightly stay. Gates: see the PR.
 - **Lot 397 — Rust toolchain 1.100.0 (no behaviour change, no level
   change).**
   - What was open: `rust-toolchain.toml` pinned 1.99.1 while 1.100.0 was
@@ -15417,3 +15422,12 @@ no level changed.
     stopped and started again inside a 20 s window), a held
     `watchdog_gone`, not seen on 22.04.
   - Host: the full gates, all green.
+- **Lot 2.3a — the trusted-installer window per process tree, the kernel
+  side (stage S2, lane K; no level change).** The kernel holds the window
+  per process tree: only the processes the window's root forked are
+  lifted, an outsider is refused and signed High (NN-L-AT-002), and
+  `admin.pub` and the signing key are lifted by no window. Ten new
+  programs: the eBPF object holds 144. The install, upgrade and uninstall
+  flows keep the host-wide window until lots 2.3b and 2.4. The lot's full
+  note, its lab and its gates are in its PR, for the stage's documents
+  lot.

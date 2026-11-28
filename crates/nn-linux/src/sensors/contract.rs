@@ -444,7 +444,9 @@ pub const SOURCES: [SourceContract; 16] = [
     SourceContract {
         source: "fs_protect",
         sensors: &["deny_hooks", "sysctl_judge"],
-        events: &[K::FsProtectDenial],
+        // lot 2.3a: and the trusted-installer window's own ring, a second
+        // pump of this source (its records are the same hooks')
+        events: &[K::FsProtectDenial, K::WindowRecord],
         attach: attach::DENY_HOOKS,
         also: &[],
         needs_bpf_lsm: true,

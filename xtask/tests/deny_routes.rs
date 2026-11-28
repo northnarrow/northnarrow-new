@@ -367,11 +367,51 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ),
     (
         "inode_protect.rs",
+        "try_inode_rename",
+        1,
+        Enforced(
+            "the rename or exchange of an ancestor of the agent's paths (/etc, /var/lib, the binaries' and the units' directories): it moves the agent's tree from under the paths it is read by; the key files' directory and its ancestors are kept by any window (lot 2.3a)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
         "try_inode_setattr",
         1,
         Enforced(OWN_FILES),
     ),
     ("inode_protect.rs", "try_file_ioctl", 1, Enforced(OWN_FILES)),
+    (
+        "inode_protect.rs",
+        "try_file_ioctl",
+        1,
+        Enforced(
+            "a passthrough command (SG_IO, an NVMe command) to a disk under the agent's files or its sg, bsg or NVMe node, under the kernel-read option's block-device class — a write of any block past the descriptor's mode; recorded otherwise (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_unlink",
+        1,
+        Enforced(
+            "the removal of an entry named after our units in a directory of their enablement links, a link made after the start included: the units not started at the next boot (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rename",
+        1,
+        Enforced(
+            "the rename, out of or over, of an entry named after our units in a directory of their enablement links (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Enforced(
+            "an outsider's write-open of the cgroup.kill or cgroup.freeze of an open tree window's root's cgroup or one above it: its members killed or frozen with their cgroup, no task_kill sees it (lot 2.3a, D7)",
+        ),
+    ),
     (
         "inode_protect.rs",
         "try_file_ioctl",
@@ -391,6 +431,14 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         "try_protected_open_deny",
         1,
         Delegated("refuse_write("),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Enforced(
+            "a foreign write-open of a block device that backs the agent's files (its key's blocks under the page cache), or of its disk's sg node, refused under the kernel-read option's block-device class as its read-open is, recorded otherwise (lot 2.3a, the review of #647)",
+        ),
     ),
     (
         "inode_protect.rs",
@@ -477,7 +525,23 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         Enforced("the sysctl guard's value judge: the values refuse_sysctl guards"),
     ),
     ("task_kill.rs", "try_task_kill", 1, Enforced(AGENT)),
+    (
+        "task_kill.rs",
+        "try_task_kill",
+        1,
+        Enforced(
+            "a signal to a member of an open trusted-installer window from outside its tree, PID 1's included (lot 2.3a, D7)",
+        ),
+    ),
     ("task_limits.rs", "task_setrlimit_deny", 1, Enforced(AGENT)),
+    (
+        "task_limits.rs",
+        "task_setrlimit_deny",
+        1,
+        Enforced(
+            "an outsider's resource limit on a member of an open tree window: an RLIMIT_CPU below its use is a SIGKILL no task_kill sees, mid-install (lot 2.3a, D7)",
+        ),
+    ),
     (
         "task_limits.rs",
         "task_setscheduler_deny",
@@ -486,6 +550,22 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ),
     ("task_limits.rs", "task_setnice_deny", 1, Enforced(AGENT)),
     ("task_limits.rs", "task_setioprio_deny", 1, Enforced(AGENT)),
+    (
+        "window_tree.rs",
+        "tree_ptrace",
+        1,
+        Enforced(
+            "a ptrace check of a member of an open trusted-installer window from outside its tree, in either mode (a debugger, /proc/<pid>/mem, fd, environ, maps, process_vm_*, pidfd_getfd, kcmp, a perf event on its pid): what the tree runs is not changed from outside (lot 2.3a, D7)",
+        ),
+    ),
+    (
+        "window_tree.rs",
+        "tree_fd_receive",
+        1,
+        Enforced(
+            "while a tree window is open, an io_uring ring's or a protected inode's descriptor received outside the agent's family: no descriptor crosses the tree's boundary (lot 2.3a, D7)",
+        ),
+    ),
 ];
 
 /// The eBPF object's sources (all of each file: the scans read its

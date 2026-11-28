@@ -2110,8 +2110,9 @@ pub fn kernel_read_refused_now() -> Vec<String> {
 /// Lot 2.2: `KERNEL_READ_CONF`'s slots for the option's classes `mask`,
 /// this kernel's lockdown values (`resolved`, in
 /// `common::wire::KERNEL_READ_LOCKDOWN`'s order) and its uprobe PMU type.
-/// The block-device class has no lockdown question (lot 2.3's), so it
-/// arms nothing here; an unresolved reason stays 0 (never matched).
+/// The block-device class has no lockdown question: lot 2.3a's `file_open`
+/// reads its bit in the mask slot (a read-open of a device that backs the
+/// agent's files refused); an unresolved reason stays 0 (never matched).
 pub fn kernel_read_conf(
     mask: u32,
     resolved: &[Option<u32>; common::wire::KERNEL_READ_LOCKDOWN.len()],
@@ -2121,8 +2122,7 @@ pub fn kernel_read_conf(
         KERNEL_READ_LOCKDOWN, KREAD_SLOT_MASK, KREAD_SLOT_REASONS, KREAD_SLOT_UPROBE_PMU,
     };
     let mut conf = [0u32; common::wire::KERNEL_READ_CONF_SLOTS as usize];
-    let lockdown_or_perf = mask & !common::wire::KERNEL_READ_BLOCK_DEVICE;
-    conf[KREAD_SLOT_MASK as usize] = lockdown_or_perf;
+    conf[KREAD_SLOT_MASK as usize] = mask;
     for (i, (_, class)) in KERNEL_READ_LOCKDOWN.iter().enumerate() {
         if mask & class != 0 {
             conf[KREAD_SLOT_REASONS as usize + i] = resolved[i].unwrap_or(0);
@@ -2165,6 +2165,10 @@ pub fn kernel_read_armed(
     if guards & GUARD_PERF != 0 {
         armed |= mask & common::wire::KERNEL_READ_PERF;
     }
+    // Lot 2.3a: the block-device class is judged by the `file_open` deny
+    // (`protected_open_deny`, a deny hook of the start's count: without it
+    // the agent does not start), on the devices the agent registered.
+    armed |= mask & common::wire::KERNEL_READ_BLOCK_DEVICE;
     armed
 }
 
@@ -2573,8 +2577,9 @@ pub fn refresh_role_marks(
 /// agent ran), summed.
 pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, String> {
     use common::wire::{
-        FS_GRANT_V2_MAP_NAME, TREE_MEMBERS_MAP_NAME, WINDOW_EVENT_DROPS_MAP_NAME,
-        WINDOW_LEASES_MAP_NAME, WINDOW_LEASES_MAX,
+        FS_GRANT_V2_MAP_NAME, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBERS_MAP_NAME,
+        TREE_PENDING_MAP_NAME, WINDOW_EVENT_DROPS_MAP_NAME, WINDOW_LEASES_MAP_NAME,
+        WINDOW_LEASES_MAX,
     };
     {
         let m = ebpf
@@ -2602,6 +2607,31 @@ pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, Stri
         let mut h: HashMap<&mut MapData, u32, PodMember> =
             HashMap::try_from(m).map_err(|e| e.to_string())?;
         let keys: Vec<u32> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    // lot 2.3a (the review of #647): the fork span's children, and the
+    // root's cgroup files an outsider may not write
+    {
+        let m = ebpf
+            .map_mut(TREE_PENDING_MAP_NAME)
+            .ok_or_else(|| format!("{TREE_PENDING_MAP_NAME} missing"))?;
+        let mut h: HashMap<&mut MapData, u64, u64> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<u64> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let m = ebpf
+            .map_mut(TREE_CGROUP_FILES_MAP_NAME)
+            .ok_or_else(|| format!("{TREE_CGROUP_FILES_MAP_NAME} missing"))?;
+        let mut h: HashMap<&mut MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<super::filesystem::AyaInodeKey> =
+            h.keys().filter_map(std::result::Result::ok).collect();
         for k in keys {
             h.remove(&k).map_err(|e| e.to_string())?;
         }
@@ -3042,8 +3072,9 @@ mod tests {
 
     /// Lot 2.2 (named): the kernel-read configuration — the classes, each
     /// named lockdown reason's running value, the uprobe PMU for perf;
-    /// nothing for a class not named, an unresolved reason 0, the block
-    /// device none here.
+    /// nothing for a class not named, an unresolved reason 0. Lot 2.3a: the
+    /// block device's bit in the mask slot (`file_open` reads it), and
+    /// nothing else for it (it has no lockdown question).
     #[test]
     fn the_kernel_read_configuration_follows_the_classes() {
         use common::wire::*;
@@ -3051,25 +3082,22 @@ mod tests {
         let off = kernel_read_conf(0, &resolved, Some(9));
         assert_eq!(off, [0; KERNEL_READ_CONF_SLOTS as usize]);
         let all = kernel_read_conf(KERNEL_READ_ALL, &resolved, Some(9));
-        assert_eq!(
-            all[KREAD_SLOT_MASK as usize],
-            KERNEL_READ_ALL & !KERNEL_READ_BLOCK_DEVICE
-        );
+        assert_eq!(all[KREAD_SLOT_MASK as usize], KERNEL_READ_ALL);
         assert_eq!(&all[1..6], &[2, 22, 27, 23, 0], "PERF unresolved: 0");
         assert_eq!(all[KREAD_SLOT_UPROBE_PMU as usize], 9);
         let mem = kernel_read_conf(KERNEL_READ_PHYSICAL_MEMORY, &resolved, Some(9));
         assert_eq!(&mem[1..6], &[2, 22, 0, 0, 0]);
         assert_eq!(mem[KREAD_SLOT_UPROBE_PMU as usize], 0, "no perf: no PMU");
         let bdev = kernel_read_conf(KERNEL_READ_BLOCK_DEVICE, &resolved, Some(9));
-        assert_eq!(
-            bdev, [0; KERNEL_READ_CONF_SLOTS as usize],
-            "lot 2.3's class"
-        );
+        let mut want = [0; KERNEL_READ_CONF_SLOTS as usize];
+        want[KREAD_SLOT_MASK as usize] = KERNEL_READ_BLOCK_DEVICE;
+        assert_eq!(bdev, want, "lot 2.3a: the mask's bit only");
     }
 
     /// Lot 2.2 (named): the classes the kernel refuses — a lockdown class
     /// only with its guard and a reason this kernel names, perf only with
-    /// its guard, the block device never here.
+    /// its guard; lot 2.3a: the block device by the `file_open` deny,
+    /// whatever the guards.
     #[test]
     fn the_kernel_read_classes_refused_follow_the_guards() {
         use common::wire::*;
@@ -3082,19 +3110,28 @@ mod tests {
                 | KERNEL_READ_TRACEFS
                 | KERNEL_READ_KPROBES
                 | KERNEL_READ_PERF
+                | KERNEL_READ_BLOCK_DEVICE
         );
         assert_eq!(
             kernel_read_armed(KERNEL_READ_ALL, GUARD_PERF, &resolved),
-            KERNEL_READ_PERF
+            KERNEL_READ_PERF | KERNEL_READ_BLOCK_DEVICE
         );
         assert_eq!(
-            kernel_read_armed(KERNEL_READ_ALL, GUARD_LOCKDOWN, &[None; 5]),
+            kernel_read_armed(
+                KERNEL_READ_ALL & !KERNEL_READ_BLOCK_DEVICE,
+                GUARD_LOCKDOWN,
+                &[None; 5]
+            ),
             0,
             "no reason named: nothing refused"
         );
         assert_eq!(
             kernel_read_armed(KERNEL_READ_BLOCK_DEVICE, both, &resolved),
-            0
+            KERNEL_READ_BLOCK_DEVICE
+        );
+        assert_eq!(
+            kernel_read_armed(KERNEL_READ_BLOCK_DEVICE, 0, &[None; 5]),
+            KERNEL_READ_BLOCK_DEVICE
         );
     }
 
@@ -3193,7 +3230,7 @@ mod tests {
     /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
     /// of the agent's programs is its own; anything else named `link_*` is
     /// reported, not registered — 70 of them no longer overflow the
-    /// 64-entry `OWN_PIN_NAMES` and refuse the start. Lot 301: every entry
+    /// `OWN_PIN_NAMES` (64 entries then, 128 since lot 2.3a) and refuse the start. Lot 301: every entry
     /// of the pin directories is judged, whatever its name (the root's
     /// `prog_task_kill` that is no BPF object is reported too), a directory
     /// is walked, not reported.

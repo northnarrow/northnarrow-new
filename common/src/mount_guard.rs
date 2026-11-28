@@ -134,6 +134,12 @@ pub const MG_LOCK: u8 = 32;
 /// or a recursive `MS_PRIVATE` in PID 1's namespace (the review of #569),
 /// reaches the lock ([`lock_touched`]).
 pub const MG_LOCK_ABOVE: u8 = 64;
+/// Lot 2.3a (the review of #647, the key files): the key files (`admin.pub`, the
+/// agent's signing key) and their directory: a mount on, over or below
+/// one is refused inside a window too — no window lifts it (the window
+/// lifts what it lifts of [`MG_OWN`] and [`MG_ON`] elsewhere). Propagated
+/// to the points below like [`MG_OWN`] (`Point::below`).
+pub const MG_KEPT: u8 = 128;
 
 // ── The mounts held, by their id (the `MOUNT_HELD` map, F1) ──────────────
 
@@ -984,7 +990,7 @@ pub struct Point {
     /// The `MOUNT_PROTECTED` flags of the target dentry (the top: for a
     /// stacked target, the root of the mount it covers), 0 when none.
     pub flags: u8,
-    /// [`MG_OWN`] and [`MG_VIEW`] of the point's ancestors (within
+    /// [`MG_OWN`], [`MG_VIEW`] and [`MG_KEPT`] of the point's ancestors (within
     /// [`MAX_WALK`]), and of the point itself when the target is stacked.
     pub below: u8,
     /// The magic of the point's file system (its low 32 bits: every magic
@@ -1592,9 +1598,16 @@ pub fn decide_as(op: u8, q: &Query) -> Verdict {
     };
     match why {
         None => Verdict::Allow,
-        Some(w) if q.window => Verdict::Window(w),
+        Some(w) if q.window && !point_kept(&q.point) => Verdict::Window(w),
         Some(w) => Verdict::Refuse(w),
     }
+}
+
+/// Lot 2.3a (the key files): the point is a key file, their directory or below it
+/// ([`MG_KEPT`]): no window lifts a mount there.
+#[inline(always)]
+pub const fn point_kept(p: &Point) -> bool {
+    (p.flags | p.below) & MG_KEPT != 0
 }
 
 // ── The record ─────────────────────────────────────────────────────────
@@ -4097,5 +4110,34 @@ mod tests {
         assert!(vacates(4_026_532_300, host));
         assert!(!guards_own_namespace(0, host));
         assert!(!vacates(0, host));
+    }
+
+    /// Lot 2.3a (the key files): a mount on the key files' directory or below it is
+    /// refused inside a window too; the window lifts it elsewhere.
+    #[test]
+    fn a_mount_on_or_below_the_key_directory_is_refused_inside_a_window() {
+        let on = |flags: u8, below: u8| Point {
+            flags,
+            below,
+            ..plain(0xEF53, &["northnarrow", "etc"])
+        };
+        for (p, why) in [
+            (on(MG_OWN | MG_HOLD | MG_KEPT, 0), MG_WHY_ON),
+            (on(0, MG_OWN | MG_KEPT), MG_WHY_BELOW_OWN),
+        ] {
+            for op in [MG_OP_MOUNT, MG_OP_BIND, MG_OP_MOVE_MOUNT] {
+                let mut q = host(op, p, "");
+                q.window = true;
+                assert!(point_kept(&q.point));
+                assert_eq!(decide(&q), Verdict::Refuse(why), "op {op}");
+                q.window = false;
+                assert_eq!(decide(&q), Verdict::Refuse(why), "op {op}");
+            }
+        }
+        // the agent's other directories: the window lifts it, as before
+        let mut q = host(MG_OP_MOUNT, on(MG_OWN | MG_HOLD, 0), "");
+        q.window = true;
+        assert!(!point_kept(&q.point));
+        assert_eq!(decide(&q), Verdict::Window(MG_WHY_ON));
     }
 }

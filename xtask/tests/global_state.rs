@@ -517,6 +517,13 @@ const STATICS: &[Kept] = &[
         "the inodes this boot registered in the pinned PROTECTED_INODES",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/filesystem.rs",
+        "ENABLEMENT_KEYS",
+        Kernel,
+        "lot 2.3a: the units' enablement links this start registered in the pinned \
+         PROTECTED_INODES, withdrawn by its refusal's tail (one start per process)",
+    ),
+    kept(
         "crates/nn-linux/src/journald_identity.rs",
         "KERNEL",
         Kernel,
@@ -682,6 +689,18 @@ const STATICS: &[Kept] = &[
         "ROLES_AT_START",
         Kernel,
         "the review of #582 (F4 b): both roles' ROLE_TGIDS slots and ROLE_MARKS words as the one eBPF object's load reused them, read once before the start claims its role; the witness round judges the gap from them",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/window_tree.rs",
+        "ATTACHED",
+        Kernel,
+        "lot 2.3a: which of the per-tree window's programs the one eBPF object's start attached, read by the tree grant's manifest",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/window_tree.rs",
+        "HELD",
+        Kernel,
+        "lot 2.3a: the per-tree window's links attached without a bpffs, held for the one eBPF object's life",
     ),
     kept(
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
@@ -1102,6 +1121,11 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "degradation::withdraw",
         "lot 353 (re-check 2 of #563, R2-3): that hold withdrawn once its preparation answers",
+    ),
+    (
+        "filesystem::withdraw_enablement_links",
+        "lot 2.3a: a refused start withdraws the enablement links it registered in the pinned \
+         PROTECTED_INODES (its one start's), before its own pid leaves PROTECTED_PIDS",
     ),
     (
         "loop_progress::start",

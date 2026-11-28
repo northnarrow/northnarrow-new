@@ -1590,6 +1590,14 @@ const NOT_VIEWS: &[&str] = &[
 /// anchored (a test binary).
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-admin/src/admin_cli.rs",
+        1,
+        "lot 2.3a: `trusted-installer-grant --tree`'s root (the minimal path's grant for one tree): \
+         the operator's nn-admin reads its parent's start once from /proc/<ppid>/stat — a CLI \
+         process of its own that anchors no root, never the agent; a read that fails fails the \
+         request, nothing is granted",
+    ),
+    (
         "crates/nn-linux/src/sandbox/mod.rs",
         1,
         "a forked child's allocation-free count of its own threads: beneath the /proc root the \

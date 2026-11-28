@@ -575,6 +575,10 @@ planned = false
 # Lot 2.1 (S2 scaffold): the per-inode marks of executable images (the role
 # mark, the bits reserved for S12), shared by the eBPF programs and the agent
 "exec_marks" = "northnarrow-common"
+# Lot 2.3a (S2): the per-tree window's kernel decisions (the lift test, the
+# exec rule, the block devices, the ancestors), shared by the eBPF programs
+# and the agent
+"window_tree" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

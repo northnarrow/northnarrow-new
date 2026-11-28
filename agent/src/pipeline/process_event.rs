@@ -662,6 +662,31 @@ pub(crate) fn process_event(
                         target_dev, target_ino,
                         "KERNEL STATE: found by the kernel-state round (not refused)"
                     );
+                } else if *operation == nn_model::FsProtectOperation::FatalSignal {
+                    // lot 2.3a (lot 330 a): let through, recorded Low
+                    info!(
+                        pid, uid, comm = %Escaped(comm),
+                        signal = target_dev,
+                        target = target_ino,
+                        "FATAL SIGNAL LET THROUGH: a signal that ends or stops a protected \
+                         process, from PID 1 under the window's stop grant or as \
+                         systemd-shutdown, the agent's family or the process itself (recorded, \
+                         not refused)"
+                    );
+                } else if matches!(
+                    operation,
+                    nn_model::FsProtectOperation::BdevWriteNoted
+                        | nn_model::FsProtectOperation::BdevPassthroughNoted
+                ) {
+                    // lot 2.3a (the review of #647): recorded High, let through
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        op = %operation,
+                        target_dev, target_ino,
+                        "BLOCK DEVICE RAW WRITE: a write-open or a passthrough command to a disk \
+                         under the agent's files (recorded, not refused; refused under \
+                         kernel-read-refuse block-device)"
+                    );
                 } else {
                     warn!(
                         pid, uid, comm = %Escaped(comm),
@@ -845,6 +870,24 @@ pub(crate) fn process_event(
                                  window (the mount guard refuses it outside one)",
                                 common::mount_guard::op_name(op)
                             )
+                        } else if *operation == nn_model::FsProtectOperation::FatalSignal {
+                            // lot 2.3a (lot 330 a): every end of a protected
+                            // process has its record, the let-through ones too
+                            format!(
+                                "not refused: signal {target_dev} to protected pid {target_ino} \
+                                 let through (PID 1 under the window's stop grant or as \
+                                 systemd-shutdown, the agent's family, the process itself)"
+                            )
+                        } else if matches!(
+                            operation,
+                            nn_model::FsProtectOperation::BdevWriteNoted
+                                | nn_model::FsProtectOperation::BdevPassthroughNoted
+                        ) {
+                            // lot 2.3a (the review of #647): the default
+                            "not refused: a raw write path to a disk under the agent's files, \
+                             recorded (refused under the kernel-read option's block-device \
+                             class)"
+                                .to_string()
                         } else {
                             "denied in kernel (anti-tamper LSM hook)".to_string()
                         };
@@ -857,6 +900,67 @@ pub(crate) fn process_event(
                             suppressed_before,
                         );
                     }
+                }
+            }
+            return;
+        }
+        // Lot 2.3a: a record of the trusted-installer window's own ring —
+        // an outsider refused while the window is open, a member that left
+        // the tree, the window closed by the kernel. The kernel acted
+        // already, so neither the rule engine nor the executor runs: it is
+        // signed by NN-L-AT-002 (its severity by the record's class, High
+        // never lower for an outsider, a kept refusal, an eviction), every
+        // one — bounded in the kernel (an outsider's record is written with
+        // its denial, past the denial budgets; an eviction or a close once
+        // per member), never coalesced (each carries its CPU's sequence
+        // number). A refusal is also its own denial record, NN-L-AT-001's,
+        // which the posture weighs; this record raises no trigger.
+        Event::WindowRecord {
+            tgid,
+            generation,
+            kind,
+            class,
+            operation,
+            detail,
+            seq,
+            cpu,
+            ..
+        } => {
+            use northnarrow_agent::decision::Rule as _;
+            let at002 = northnarrow_agent::decision::rules::anti_tamper::NnLAt002TreeWindowRecord;
+            warn!(
+                tgid,
+                generation,
+                kind = %kind,
+                class = %class,
+                op = operation.map_or("-", |o| o.as_str()),
+                detail,
+                seq,
+                cpu,
+                "TRUSTED-INSTALLER WINDOW RECORD"
+            );
+            if let Some(verdict) = at002.evaluate(&event) {
+                let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+                let suppressed_before = match budget_admit_sole_trace(&verdict.rule_id, uid) {
+                    Admit::Record { suppressed_before } => suppressed_before,
+                    Admit::Hold { .. } => 0,
+                };
+                warn!(
+                    rule = %verdict.rule_id,
+                    severity = ?verdict.severity,
+                    reasoning = %Escaped(&verdict.reasoning),
+                    "VERDICT (rule)"
+                );
+                if let Some(sink) = detection_sink {
+                    let outcome = window_record_outcome(*kind, *detail);
+                    sink.record_denial(
+                        &event,
+                        &verdict,
+                        at002.attack(),
+                        posture.current_kind(),
+                        outcome,
+                        suppressed_before,
+                    );
                 }
             }
             return;
@@ -1219,6 +1323,27 @@ fn budget_admit_sole_trace(rule: &str, uid: u32) -> Admit {
     }
 }
 
+/// Lot 2.3a: what the kernel did about a window ring's record, as the
+/// signed detection's response names it.
+fn window_record_outcome(kind: nn_model::WindowRecordKind, detail: u64) -> String {
+    use nn_model::WindowRecordKind as K;
+    match kind {
+        K::OutsiderRefused => {
+            "denied in kernel (outside the trusted-installer window's tree)".to_string()
+        }
+        K::Eviction if detail & 0xff == common::window_tree::EVICT_FULL => {
+            "not refused: left outside the trusted-installer window's tree in kernel (the \
+             members' map full: nothing lifted for it)"
+                .to_string()
+        }
+        K::Eviction => "not refused: its lift taken away in kernel (it left the \
+                        trusted-installer window's tree)"
+            .to_string(),
+        K::Close => "not refused: the trusted-installer window closed in kernel".to_string(),
+        other => format!("recorded (the trusted-installer window's ring: {other})"),
+    }
+}
+
 /// R12c (lab PR 270): [`detection_budget::admit_acted`] — an acting
 /// decision is always recorded; the WARN when its (rule, uid) runs out of
 /// budget for journal lines.
@@ -1522,6 +1647,155 @@ mod tests {
         assert!(
             held <= 150 - uses as u64,
             "a sole trace counted held ({held})"
+        );
+    }
+
+    /// Lot 2.3a (named): a window ring's record is signed by NN-L-AT-002
+    /// outside the engine, every one — 300 outsiders refused while a window
+    /// is open are 300 records, High, each naming the refused operation and
+    /// what the kernel did, as an eviction (High) and the window's close
+    /// (Low) are; a fatal signal let through to a protected process is
+    /// NN-L-AT-001's Low record saying it was not refused.
+    #[test]
+    fn the_window_s_records_are_signed_every_one_and_a_fatal_signal_let_through_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        let judge = |e: Event| {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                e,
+            )
+        };
+        use nn_model::{FsProtectOperation as Op, WindowClass, WindowRecordKind as K};
+        let record = |tgid: u32, kind: K, class: WindowClass, detail: u64| Event::WindowRecord {
+            tgid,
+            start_ticks: 77,
+            generation: 9,
+            kind,
+            class,
+            operation: (kind == K::OutsiderRefused).then_some(Op::Unlink),
+            detail,
+            seq: u64::from(tgid),
+            cpu: 0,
+            boot_ns: 1,
+        };
+        for i in 0..300u32 {
+            judge(record(
+                933_000 + i,
+                K::OutsiderRefused,
+                WindowClass::Outsider,
+                709,
+            ));
+        }
+        judge(record(
+            933_500,
+            K::Eviction,
+            WindowClass::ExecEvicted,
+            common::window_tree::EVICT_ENV,
+        ));
+        judge(record(
+            933_501,
+            K::Close,
+            WindowClass::NoWindow,
+            common::window_tree::CLOSE_ROOT_EXIT,
+        ));
+        judge(Event::FsProtectDenial {
+            pid: 1,
+            uid: 0,
+            comm: "systemd".to_string(),
+            target_dev: 15,
+            target_ino: 4242,
+            operation: Op::FatalSignal,
+            timestamp_ns: 5_000,
+        });
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let at002 = |r: &&northnarrow_agent::detection_store::DetectionRecord| {
+            r.rule_id.as_deref() == Some("NN-L-AT-002_TreeWindowRecord")
+        };
+        let outsiders: Vec<_> = records
+            .iter()
+            .filter(at002)
+            .filter(|r| (933_000..933_300).contains(&r.principal.pid))
+            .collect();
+        assert_eq!(outsiders.len(), 300, "every outsider's record");
+        for r in &outsiders {
+            assert_eq!(r.severity, nn_model::Severity::High);
+            assert_eq!(r.operation.as_deref(), Some("unlink"));
+            assert!(
+                r.response
+                    .starts_with("denied in kernel (outside the trusted-installer"),
+                "{}",
+                r.response
+            );
+        }
+        let of = |pid: u32| -> Vec<_> {
+            records
+                .iter()
+                .filter(at002)
+                .filter(|r| r.principal.pid == pid)
+                .collect()
+        };
+        let evicted = of(933_500);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].severity, nn_model::Severity::High);
+        assert!(evicted[0].response.contains("its lift taken away"));
+        let closed = of(933_501);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].severity, nn_model::Severity::Low);
+        assert!(closed[0].response.contains("window closed in kernel"));
+        let fatal: Vec<_> = records
+            .iter()
+            .filter(|r| r.operation.as_deref() == Some("fatal_signal"))
+            .collect();
+        assert_eq!(fatal.len(), 1, "{records:#?}");
+        assert_eq!(fatal[0].severity, nn_model::Severity::Low);
+        assert!(
+            fatal[0]
+                .response
+                .starts_with("not refused: signal 15 to protected pid 4242 let through"),
+            "{}",
+            fatal[0].response
         );
     }
 

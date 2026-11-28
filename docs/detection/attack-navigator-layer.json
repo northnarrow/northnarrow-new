@@ -11,7 +11,7 @@
       "#ffffff",
       "#66b1ff"
     ],
-    "maxValue": 8,
+    "maxValue": 9,
     "minValue": 0
   },
   "hideDisabled": false,
@@ -541,7 +541,7 @@
       "techniqueID": "T1027.011"
     },
     {
-      "comment": "R016_DebuggerServiceUid, NN-L-AT-001_AntiTamperDenial",
+      "comment": "R016_DebuggerServiceUid, NN-L-AT-001_AntiTamperDenial, NN-L-AT-002_TreeWindowRecord",
       "enabled": true,
       "metadata": [
         {
@@ -551,9 +551,13 @@
         {
           "name": "rule",
           "value": "NN-L-AT-001_AntiTamperDenial (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-AT-002_TreeWindowRecord (unit)"
         }
       ],
-      "score": 2,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "stealth",
       "techniqueID": "T1055.008"
@@ -637,12 +641,16 @@
       "techniqueID": "T1564.001"
     },
     {
-      "comment": "NN-L-FIM-022_LdSoPreloadModified, NN-L-EXECENV-001_PreloadFromStaging, NN-L-EXECENV-002_ExecEnvironmentTrick, NN-L-EXECENV-003_ExecMappingFromStaging",
+      "comment": "NN-L-FIM-022_LdSoPreloadModified, NN-L-AT-002_TreeWindowRecord, NN-L-EXECENV-001_PreloadFromStaging, NN-L-EXECENV-002_ExecEnvironmentTrick, NN-L-EXECENV-003_ExecMappingFromStaging",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-FIM-022_LdSoPreloadModified (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-AT-002_TreeWindowRecord (unit)"
         },
         {
           "name": "rule",
@@ -657,7 +665,7 @@
           "value": "NN-L-EXECENV-003_ExecMappingFromStaging (no proof)"
         }
       ],
-      "score": 4,
+      "score": 5,
       "showSubtechniques": false,
       "tactic": "stealth",
       "techniqueID": "T1574.006"
@@ -685,7 +693,7 @@
       "techniqueID": "T1620"
     },
     {
-      "comment": "NN-L-BPF-002_BpfForeignHandleOrDetach, NN-L-FIM-024_AntiTamperHoneypotModified, NN-L-EVA-001_SecurityServiceStopped, NN-L-EVA-002_SecurityToolSwitchedOff, NN-L-EVA-003_SecurityToolKilled, NN-L-EVA-004_SecurityToolConfigChanged, NN-L-NET-021_SensorRecordFlood, NN-L-AT-001_AntiTamperDenial",
+      "comment": "NN-L-BPF-002_BpfForeignHandleOrDetach, NN-L-FIM-024_AntiTamperHoneypotModified, NN-L-EVA-001_SecurityServiceStopped, NN-L-EVA-002_SecurityToolSwitchedOff, NN-L-EVA-003_SecurityToolKilled, NN-L-EVA-004_SecurityToolConfigChanged, NN-L-NET-021_SensorRecordFlood, NN-L-AT-001_AntiTamperDenial, NN-L-AT-002_TreeWindowRecord",
       "enabled": true,
       "metadata": [
         {
@@ -719,9 +727,13 @@
         {
           "name": "rule",
           "value": "NN-L-AT-001_AntiTamperDenial (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-AT-002_TreeWindowRecord (unit)"
         }
       ],
-      "score": 8,
+      "score": 9,
       "showSubtechniques": false,
       "tactic": "defense-impairment",
       "techniqueID": "T1685"

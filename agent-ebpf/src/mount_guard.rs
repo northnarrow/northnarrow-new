@@ -51,7 +51,7 @@ use northnarrow_common::mount_guard::{
     reach_in, record_dev, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
     BTRFS_SUPER_MAGIC, DEPTH_DEEPER, GUARD_HOST, HELD_REFUSE, MAX_STACK, MAX_WALK, MG_HOLD,
     MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
-    MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
+    MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MG_KEPT, MS_NOEXEC, MS_RDONLY,
     umount_spread, umount_takes_held, Spread, HELD_UNDER, PLACE_ANY_GROUP, REACH_OTHER_NS,
     below_of, below_takes_held, umount_below, Tree,
     lock_bind, lock_maker, lock_shutdown_step, lock_step_at, lock_touched, lock_verdict,
@@ -1024,7 +1024,7 @@ unsafe fn point_of(
         let mut j = 0u32;
         while j < MAX_WALK {
             cur = peek_ptr(cur.add(o.d_parent as usize));
-            below |= flags_at(&key_of(o, cur)) & (MG_OWN | MG_VIEW);
+            below |= flags_at(&key_of(o, cur)) & (MG_OWN | MG_VIEW | MG_KEPT);
             j += 1;
         }
         p.below = below;
