@@ -2790,7 +2790,7 @@ exit: 2
 |
 |   tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'
 |
-| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <COMMAND>...
+| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <PROGRAM>...
 |
 | For more information, try '--help'.
 
@@ -2802,9 +2802,9 @@ exit: 2
 --- stderr
 | error: the following required arguments were not provided:
 |   --key <KEY>
-|   <COMMAND>...
+|   <PROGRAM>...
 |
-| Usage: nn-admin window-run --key <KEY> -- <COMMAND>...
+| Usage: nn-admin window-run --key <KEY> -- <PROGRAM>...
 |
 | For more information, try '--help'.
 
@@ -2856,7 +2856,7 @@ exit: 2
 --- stderr
 | error: the argument '--interactive' cannot be used multiple times
 |
-| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <COMMAND>...
+| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <PROGRAM>...
 |
 | For more information, try '--help'.
 
@@ -2868,7 +2868,7 @@ exit: 2
 --- stderr
 | error: unexpected value 'yes' for '--interactive' found; no more were expected
 |
-| Usage: nn-admin window-run --key <KEY> --interactive -- <COMMAND>...
+| Usage: nn-admin window-run --key <KEY> --interactive -- <PROGRAM>...
 |
 | For more information, try '--help'.
 

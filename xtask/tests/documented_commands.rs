@@ -77,7 +77,9 @@ fn commands() -> BTreeMap<Vec<String>, Command> {
                     let opens = t.matches('[').count() as i32;
                     let inside = depth + opens > 0;
                     let bare = t.trim_matches(|c| c == '[' || c == ']' || c == '.');
-                    if !inside && bare.starts_with("--") {
+                    // lot 2.3b: a bare `--` (`window-run -- <COMMAND>`) ends
+                    // the options, it is none
+                    if !inside && bare.starts_with("--") && bare.len() > 2 {
                         c.required.insert(bare.to_string());
                         if toks.get(i + 1).is_some_and(|n| n.starts_with('<')) {
                             i += 1;
@@ -433,6 +435,12 @@ fn problem(cmds: &BTreeMap<Vec<String>, Command>, words: &[String]) -> Option<St
     let mut i = n;
     while i < words.len() {
         let w = &words[i];
+        // lot 2.3b (`window-run -- <command>`): a bare `--` ends the options;
+        // what follows is the command's own, one trailing positional
+        if w == "--" {
+            positionals += usize::from(i + 1 < words.len());
+            break;
+        }
         if w.starts_with('-') && w.len() > 1 {
             let (name, inline) = match w.split_once('=') {
                 Some((k, _)) => (k.to_string(), true),
@@ -496,7 +504,7 @@ fn problem_named(cmds: &BTreeMap<Vec<String>, Command>, words: &[String]) -> Opt
             return Some(format!("`{}` has no command `{next}`", path.join(" ")));
         }
     }
-    for w in &words[n..] {
+    for w in words[n..].iter().take_while(|w| *w != "--") {
         if w.starts_with('-') && w.len() > 1 {
             let name = w.split_once('=').map_or(w.as_str(), |(k, _)| k);
             if !c.options.contains_key(name) {
@@ -621,6 +629,19 @@ fn the_checker_reads_commands_and_refuses_wrong_ones() {
     );
     assert!(say(&["audit", "verfy"]).unwrap().contains("names a group"));
     assert!(say(&["nosuch"]).unwrap().contains("no command"));
+    // lot 2.3b: `--` ends the options, the command after it is checked as
+    // nothing of nn-admin's; an option before it still is
+    assert_eq!(say(&["window-run", "--key", "k", "--", "apt", "--yes"]), None);
+    assert!(
+        say(&["window-run", "--key", "k", "--nosuch", "--", "apt"])
+            .unwrap()
+            .contains("no option")
+    );
+    assert!(
+        say(&["window-run", "--key", "k", "--"])
+            .unwrap()
+            .contains("positional")
+    );
     // a usage's required option, as the matrix gave it before lot 385
     let mut old = BTreeMap::new();
     old.insert(

@@ -626,8 +626,8 @@ enum Cmd {
         /// checked it (repeatable).
         #[arg(long = "accept-foreign", value_name = "SHA256")]
         accept_foreign: Vec<String>,
-        /// The command and its arguments, after `--`.
-        #[arg(last = true, required = true, value_name = "COMMAND")]
+        /// The program to run and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "PROGRAM")]
         command: Vec<String>,
     },
 

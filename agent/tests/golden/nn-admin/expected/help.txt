@@ -1999,10 +1999,10 @@ exit: 0
 --- stdout
 | Run a command inside a trusted-installer window for its own process tree: the agent's protections are lifted for this command and every process it starts, and for nothing else on the host. The grant is signed by --key (its admin.pub line MUST carry the `trusted-installer` role). The command reads /dev/null as its input and gets a minimal environment: the system PATH, the locale, the terminal, HOME, USER, LOGNAME, NN_GRANT_KEY, the package tools' non-interactive switches, and NN_WINDOW_GENERATION (the window's number, for `window-stop` and `window-lease`). While the window is open, a process outside it cannot change the system's programs, libraries, the loader's configuration or the package managers' hooks. The window is refused when such a hook or configuration file is owned by no package or differs from the package database (the refusal names each with its SHA-256). It ends when the command exits, at --window-secs (600 s at most), or at the agent's next start. The exit status is the command's
 |
-| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <COMMAND>...
+| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <PROGRAM>...
 |
 | Arguments:
-|   <COMMAND>...  The command and its arguments, after `--`
+|   <PROGRAM>...  The program to run and its arguments, after `--`
 |
 | Options:
 |       --key <KEY>                      Path to the operator's `trusted-installer`-role admin private key
