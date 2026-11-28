@@ -684,6 +684,8 @@ containment that only a signed human command lifts.
 work on systems Rust, eBPF or kernel security and want to be on the early list, open an issue
 with a short note. *Issue title: "General inquiry".* Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+**First-time contributors.** No Rust or eBPF needed: try the tester guide or the `.rpm` on a throwaway VM and tell us what happened. Start from the [`good first issue`](https://github.com/northnarrow/northnarrow-new/labels/good%20first%20issue) label and ["Your first contribution"](CONTRIBUTING.md#your-first-contribution-no-rust-needed). NorthNarrow is listed on [Up For Grabs](https://up-for-grabs.net).
+
 **Press and media.** Give your publication, deadline and angle; we answer time-sensitive
 requests within the working day. *Issue title: "Press / media inquiry".*
 
