@@ -581,6 +581,15 @@ enum Cmd {
         /// names no installer. install.sh and uninstall.sh pass it.
         #[arg(long = "for-installer")]
         for_installer: bool,
+        // Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
+        // replaces it with `window-run`): the grant for one process tree,
+        // rooted at this command's parent (its pid and its start, signed).
+        // Never falls back to the host-wide grant.
+        /// Lab only: the window is for the process tree of this command's
+        /// parent, not the whole host. A refusal is final: no other grant
+        /// is asked for.
+        #[arg(long = "tree", hide = true, conflicts_with = "for_installer")]
+        tree: bool,
     },
 
     // External audit CMB-016.
@@ -2322,6 +2331,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             agent_id_file,
             socket,
             for_installer,
+            tree,
         } => {
             // Clamp client-side to the agent's ceiling (the agent also
             // clamps; this gives the operator a clear message instead
@@ -2333,6 +2343,11 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     "trusted-installer-grant: --window-secs {window_secs} clamped to {clamped} \
                      (agent ceiling)"
                 );
+            }
+            // lot 2.3a's minimal path (lot 2.3b replaces it): the tree
+            // grant, rooted at this command's parent; never the plain one
+            if tree {
+                return run_tree_grant_cmd(&socket, &key, &agent_id_file, clamped);
             }
             let run = if for_installer {
                 run_trusted_installer_grant_for_installer
@@ -5625,6 +5640,52 @@ fn warn_harmful_dropins(
     }
 }
 
+/// Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
+/// replaces it with `window-run`): `trusted-installer-grant --tree` — the
+/// grant for this command's parent's process tree (its pid and its start,
+/// read from `/proc`, inside the signed scope). A refusal is final: the
+/// plain grant is never asked for instead (the design's section 5).
+fn run_tree_grant_cmd(
+    socket: &std::path::Path,
+    key: &std::path::Path,
+    agent_id_file: &std::path::Path,
+    window_secs: u32,
+) -> ExitCode {
+    let (root_pid, root_start_ticks) = match crate::admin_cli::parent_root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("trusted-installer-grant: the window's root (this command's parent): {e:#}");
+            return ExitCode::from(1);
+        }
+    };
+    match crate::admin_cli::run_trusted_installer_tree_grant(
+        socket,
+        key,
+        agent_id_file,
+        window_secs,
+        root_pid,
+        root_start_ticks,
+    ) {
+        Ok(TrustedInstallerGrantOutcome::Success) => {
+            let tty = colour_on(std::io::stdout().is_terminal());
+            println!(
+                "{}",
+                colorize(
+                    &format!(
+                        "trusted-installer-grant: window armed for {window_secs}s for the \
+                         process tree of {root_pid} (this command's parent) only"
+                    ),
+                    "32",
+                    tty
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(outcome) => exit_from_trusted_installer_grant(outcome, window_secs),
+        Err(e) => exit_from_request_error("trusted-installer-grant", &e),
+    }
+}
+
 /// The `host_dropins` lines of a status's degradations, their prefix cut.
 fn harmful_dropin_lines(degradations: &[String]) -> Vec<&str> {
     degradations
@@ -5699,6 +5760,14 @@ fn exit_from_trusted_installer_grant(
         }
         TrustedInstallerGrantOutcome::UnknownOperation => {
             eprintln!("trusted-installer-grant: server rejected operation");
+            ExitCode::from(5)
+        }
+        TrustedInstallerGrantOutcome::Refused => {
+            eprintln!(
+                "trusted-installer-grant: the agent verified the grant and refused it, nothing \
+                 armed (a window is already open, or the agent could not open this one: its \
+                 journal says why)"
+            );
             ExitCode::from(5)
         }
         TrustedInstallerGrantOutcome::ProtocolVersionUnsupported { server_version } => {
@@ -7783,5 +7852,60 @@ mod audit_verify_source_tests {
             audit_verify_source_in(Some(given.clone()), &log).unwrap(),
             given
         );
+    }
+}
+
+/// Lot 2.3a's minimal path (lot 2.3b replaces it): `trusted-installer-grant
+/// --tree`, the lab's grant for one process tree, is hidden from the help
+/// and never combined with `--for-installer`.
+#[cfg(test)]
+mod tree_flag_tests {
+    use super::{Cli, Cmd, command};
+    use clap::Parser as _;
+
+    #[test]
+    fn the_tree_flag_parses_is_hidden_and_excludes_for_installer() {
+        let cli = Cli::try_parse_from([
+            "nn-admin",
+            "trusted-installer-grant",
+            "--key",
+            "/k",
+            "--tree",
+        ])
+        .expect("parses");
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::TrustedInstallerGrant {
+                    tree: true,
+                    for_installer: false,
+                    ..
+                }
+            ),
+            "{cli:?}"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "nn-admin",
+                "trusted-installer-grant",
+                "--key",
+                "/k",
+                "--tree",
+                "--for-installer",
+            ])
+            .is_err()
+        );
+        let mut cmd = command();
+        let sub = cmd
+            .find_subcommand_mut("trusted-installer-grant")
+            .expect("trusted-installer-grant");
+        let tree = sub
+            .get_arguments()
+            .find(|a| a.get_id() == "tree")
+            .expect("--tree");
+        assert!(tree.is_hide_set());
+        let help = sub.render_long_help().to_string();
+        assert!(!help.contains("--tree"), "{help}");
+        assert!(help.contains("--for-installer"), "{help}");
     }
 }

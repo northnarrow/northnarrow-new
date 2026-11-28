@@ -62,6 +62,35 @@
 //! FS suspension is a V2 follow-up. The DETECTION downgrade, by
 //! contrast, IS tightly path-scoped to the agent's own units in the
 //! rule layer.
+//!
+//! ## The window per process tree (lot 2.3a's minimal path)
+//!
+//! Lot 2.3a's minimal path, for the tests and the lab only; lot 2.3b
+//! replaces it (the real admin handler, `nn-admin window-run`, the
+//! admission policy, the leases, the controlled stop). The design:
+//! `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Trusted-installer window per
+//! process tree", sections 1 and 5.
+//!
+//! - [`TrustedInstallerOverride::arm_tree`] writes the kernel half in the
+//!   design's order: the members of the line (`TREE_MEMBERS`, the root
+//!   flagged), a second read of every line process's tracer, seccomp mode
+//!   and start, then the grant (`FS_GRANT_V2`: this boot's session, the
+//!   next generation, a `CLOCK_BOOTTIME` deadline, the heartbeat). It is
+//!   refused while any window is open (one window at a time: the
+//!   host-wide one's handler asks [`TrustedInstallerOverride::legacy_arming`]
+//!   first, under the same lock), while the kernel manifest names anything
+//!   missing (`window_tree::manifest_missing`), and with no pin root.
+//! - [`TrustedInstallerOverride::tree_tick`] (the one-second ticker)
+//!   writes the heartbeat, and closes the window at its deadline, when the
+//!   kernel closed it (`TREE_CLOSED` names its generation: the root's
+//!   death or eviction) or when the root's pid no longer has its start.
+//! - [`TrustedInstallerOverride::close_tree`] zeroes the grant first, then
+//!   empties the members, then `TREE_CLOSED` (only once the grant is gone:
+//!   a window the kernel closed never opens again for the span between).
+//! - A tree window softens nothing in the agent:
+//!   [`TrustedInstallerOverride::is_window_open`] stays false (lot 2.3b
+//!   judges by who acted).
+//! - Each grant, refusal and close appends to the audit log.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,7 +107,10 @@ use super::{
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
-use common::wire::{FsGrant, KillGrant};
+use common::wire::{
+    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, KillGrant, TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME,
+    TreeMember, WINDOW_MAX_NS,
+};
 
 // R08b (lab PR 251): the agent's own units and a window's grant are the
 // window's vocabulary, which the rules moving to nn-core read (NN-L-FIM-009,
@@ -135,6 +167,16 @@ pub struct TrustedInstallerOverride {
     /// one pass takes out a key another registered once its path no
     /// longer names it.
     own_dropin_keys: crate::own_dropins::Registered,
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it): one window at a
+    /// time. Held by [`Self::arm_tree`] for its whole arming, and by the
+    /// host-wide grant's handler across its arming
+    /// ([`Self::legacy_arming`]), so two grants racing on two connections
+    /// cannot both open a window.
+    arming: Mutex<()>,
+    /// Lot 2.3a: fast path of [`Self::tree_window_open`] and the ticker.
+    tree_armed: AtomicBool,
+    /// Lot 2.3a: the tree window's state (its grant, the generations).
+    tree: Mutex<TreeState>,
 }
 
 #[derive(Default)]
@@ -143,6 +185,27 @@ struct Inner {
     deadline: Option<Instant>,
     /// Who opened the current window and until when (lab PR 225).
     grant: Option<WindowGrant>,
+}
+
+/// Lot 2.3a's minimal path (lot 2.3b replaces it): the tree window as the
+/// agent armed it.
+#[derive(Default)]
+struct TreeState {
+    /// The last generation handed out this boot (0: none yet). Raised when
+    /// a grant writes its first member, so a generation whose members were
+    /// written is never handed out again, even when that arming was
+    /// refused after.
+    last_generation: u64,
+    /// The window open, `None` when closed.
+    open: Option<TreeWindow>,
+}
+
+struct TreeWindow {
+    /// The grant as written in `FS_GRANT_V2[0]` (the heartbeat moves).
+    grant: FsGrantV2,
+    /// A heartbeat that could not be written was reported (once per
+    /// window: the kernel's grace ends the window 60 s after the last one).
+    beat_failed: bool,
 }
 
 impl TrustedInstallerOverride {
@@ -166,6 +229,9 @@ impl TrustedInstallerOverride {
             reloader: Mutex::new(None),
             armed_at: Mutex::new(None),
             own_dropin_keys: crate::own_dropins::Registered::default(),
+            arming: Mutex::new(()),
+            tree_armed: AtomicBool::new(false),
+            tree: Mutex::new(TreeState::default()),
         }
     }
 
@@ -612,6 +678,742 @@ impl TrustedInstallerOverride {
             );
         }
     }
+
+    // ── Lot 2.3a's minimal path (lot 2.3b replaces it): the tree window ──
+
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it): one window at a
+    /// time for the host-wide grant. Its handler takes this before it
+    /// verifies and arms ([`Self::arm_for`]) and holds it until the arming
+    /// is done: `Err` (the reason) while a tree window is open — the grant
+    /// is then refused, not armed. [`Self::arm_tree`] takes the same lock,
+    /// so the two cannot race.
+    pub fn legacy_arming(&self) -> std::result::Result<parking_lot::MutexGuard<'_, ()>, String> {
+        let permit = self.arming.lock();
+        match self.tree.lock().open.as_ref() {
+            Some(w) => Err(format!(
+                "a trusted-installer window per process tree is open (generation {}, root \
+                 {}): one window at a time",
+                w.grant.generation, w.grant.root_tgid
+            )),
+            None => Ok(permit),
+        }
+    }
+
+    /// Lot 2.3a: whether a tree window is open (armed by [`Self::arm_tree`],
+    /// not yet closed by [`Self::close_tree`] or [`Self::tree_tick`]). It
+    /// softens nothing: [`Self::is_window_open`] stays false meanwhile.
+    pub fn tree_window_open(&self) -> bool {
+        self.tree_armed.load(Ordering::SeqCst)
+    }
+
+    /// Lot 2.3a: the open tree window's generation (`None`: none open).
+    pub fn tree_generation(&self) -> Option<u64> {
+        self.tree.lock().open.as_ref().map(|w| w.grant.generation)
+    }
+
+    /// The agent's own processes, never on a tree's line: this process and
+    /// the roles the kernel's `ROLE_TGIDS` names (the agent, the watchdog).
+    /// `Err` when the pin root is there and the roles cannot be read: the
+    /// grant is then refused, never judged without them (with no pin root
+    /// no tree window opens anyway).
+    pub fn own_tgids(&self) -> std::result::Result<Vec<u32>, String> {
+        let mut own = vec![std::process::id()];
+        if let Some(root) = self.bpffs_root.as_deref() {
+            own.extend(read_role_tgids(root)?.into_iter().filter(|p| *p != 0));
+        }
+        Ok(own)
+    }
+
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it): arm the window for
+    /// the tree of `root` (`(pid, start_ticks)`), whose `line` (root first,
+    /// down to the requester: [`line_to_root`]) becomes its first members,
+    /// for `window_secs` (clamped to `[1, max]`, the max never above 600 s).
+    /// `Ok` the window's generation; `Err` why it was refused (logged and
+    /// recorded; nothing of it is left in the kernel's maps).
+    pub fn arm_tree(
+        &self,
+        window_secs: u32,
+        root: (u32, u64),
+        line: &[(u32, u64)],
+    ) -> std::result::Result<u64, String> {
+        let mut pinned = self.bpffs_root.as_deref().map(PinnedTreeMaps);
+        self.arm_tree_with(
+            pinned.as_mut().map(|m| m as &mut dyn TreeMaps),
+            &ProcFs(Path::new("/proc")),
+            &super::window_tree::manifest_missing(),
+            boottime_ns(),
+            window_secs,
+            root,
+            line,
+        )
+    }
+
+    /// Lot 2.3a: a tree grant refused before [`Self::arm_tree`] (the walk
+    /// of its line, [`line_to_root`]): logged and recorded, as the arming's
+    /// own refusals.
+    pub fn note_tree_refusal(&self, why: &str) {
+        warn!(
+            target: "anti_tamper.trusted_installer",
+            reason = why,
+            "trusted-installer window per process tree REFUSED"
+        );
+        self.audit_tree(
+            "trusted_installer_tree_grant_refused",
+            serde_json::json!({ "reason": why }),
+            format!("refused: {why}"),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_tree_with(
+        &self,
+        maps: Option<&mut dyn TreeMaps>,
+        reader: &dyn LineReader,
+        missing: &[String],
+        now_boot_ns: u64,
+        window_secs: u32,
+        root: (u32, u64),
+        line: &[(u32, u64)],
+    ) -> std::result::Result<u64, String> {
+        let one_window = self.arming.lock();
+        let armed =
+            self.arm_tree_locked(maps, reader, missing, now_boot_ns, window_secs, root, line);
+        drop(one_window);
+        match &armed {
+            Ok(g) => {
+                info!(
+                    target: "anti_tamper.trusted_installer",
+                    generation = g.generation,
+                    root_pid = g.root_tgid,
+                    members = line.len(),
+                    "trusted-installer window per process tree ARMED"
+                );
+                self.audit_tree(
+                    "trusted_installer_tree_window_open",
+                    serde_json::json!({
+                        "generation": g.generation,
+                        "root_pid": g.root_tgid,
+                        "root_start_ticks": g.root_start_ticks,
+                        "members": line.iter().map(|(pid, _)| *pid).collect::<Vec<u32>>(),
+                        "expires_boot_ns": g.expires_boot_ns,
+                    }),
+                    format!("opened: generation {}", g.generation),
+                );
+            }
+            Err(why) => self.note_tree_refusal(why),
+        }
+        armed.map(|g| g.generation)
+    }
+
+    /// [`Self::arm_tree_with`] under the one-window lock: the refusals, then
+    /// the design's order (members, the second read, the grant).
+    #[allow(clippy::too_many_arguments)]
+    fn arm_tree_locked(
+        &self,
+        maps: Option<&mut dyn TreeMaps>,
+        reader: &dyn LineReader,
+        missing: &[String],
+        now_boot_ns: u64,
+        window_secs: u32,
+        root: (u32, u64),
+        line: &[(u32, u64)],
+    ) -> std::result::Result<FsGrantV2, String> {
+        if self.is_window_open() {
+            return Err(
+                "the host-wide trusted-installer window is open: one window at a time".to_string(),
+            );
+        }
+        let mut tree = self.tree.lock();
+        if let Some(w) = tree.open.as_ref() {
+            return Err(format!(
+                "a trusted-installer window per process tree is open (generation {}): one \
+                 window at a time",
+                w.grant.generation
+            ));
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "window_tree_unavailable: {} (never a host-wide window instead)",
+                missing.join("; ")
+            ));
+        }
+        let Some(maps) = maps else {
+            return Err("no bpffs pin root this boot: no tree window".to_string());
+        };
+        if self.session_nonce == 0 {
+            return Err("no session nonce this boot: no tree window".to_string());
+        }
+        if line.first() != Some(&root) {
+            return Err("the line does not begin at the signed root".to_string());
+        }
+        if line.len() > MAX_TREE_LINE
+            || (1..line.len()).any(|i| line[..i].iter().any(|(p, _)| *p == line[i].0))
+        {
+            return Err(
+                "the line is longer than the walk allows, or names a pid twice".to_string(),
+            );
+        }
+        let generation = tree
+            .last_generation
+            .checked_add(1)
+            .ok_or_else(|| "no generation left this boot".to_string())?;
+        // spent from here on: never handed out again this boot
+        tree.last_generation = generation;
+        // 1. the members of the line, the root flagged
+        for &(pid, start_ticks) in line {
+            let member = TreeMember {
+                start_ticks,
+                generation,
+                flags: if (pid, start_ticks) == root {
+                    TREE_MEMBER_ROOT
+                } else {
+                    0
+                },
+                _pad: 0,
+            };
+            if let Err(e) = maps.put_member(pid, member) {
+                return Err(withdrawn(
+                    maps,
+                    format!("member {pid} not written to {TREE_MEMBERS_MAP_NAME}: {e}"),
+                ));
+            }
+        }
+        // 2. the second read: a tracer, a filter or another process found
+        // now clears the members, and the grant is refused
+        for &(pid, start_ticks) in line {
+            let why = match (reader.hop(pid), reader.guards(pid)) {
+                (Ok(hop), _) if hop.start_ticks != start_ticks => Some(format!(
+                    "process {pid}'s start is {} now, {start_ticks} at the walk (another \
+                     process)",
+                    hop.start_ticks
+                )),
+                (Ok(_), Ok((0, 0))) => None,
+                (Ok(_), Ok((tracer, seccomp))) => Some(format!(
+                    "process {pid} is traced (TracerPid {tracer}) or filtered (Seccomp \
+                     {seccomp}) at the second read"
+                )),
+                (Err(e), _) | (_, Err(e)) => Some(format!("process {pid} at the second read: {e}")),
+            };
+            if let Some(why) = why {
+                return Err(withdrawn(maps, why));
+            }
+        }
+        // 3. the grant
+        let max_secs = self
+            .max_window
+            .as_secs()
+            .clamp(1, WINDOW_MAX_NS / 1_000_000_000);
+        let secs = u64::from(window_secs).clamp(1, max_secs);
+        let grant = FsGrantV2 {
+            nonce: self.session_nonce,
+            root_tgid: root.0,
+            generation,
+            expires_boot_ns: now_boot_ns.saturating_add(secs.saturating_mul(1_000_000_000)),
+            root_start_ticks: root.1,
+            heartbeat_boot_ns: now_boot_ns,
+            first_grant_boot_ns: now_boot_ns,
+        };
+        if let Err(e) = maps.write_grant(grant) {
+            let _ = maps.write_grant(FsGrantV2::default());
+            return Err(withdrawn(
+                maps,
+                format!("{FS_GRANT_V2_MAP_NAME} not written: {e}"),
+            ));
+        }
+        tree.open = Some(TreeWindow {
+            grant,
+            beat_failed: false,
+        });
+        self.tree_armed.store(true, Ordering::SeqCst);
+        Ok(grant)
+    }
+
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it), the one-second
+    /// ticker's (`now_boot_ns`: `CLOCK_BOOTTIME`, [`boottime_ns`]): the open
+    /// tree window's heartbeat, or its close — at its deadline, when the
+    /// kernel closed it (`TREE_CLOSED`: its root died or left the tree), or
+    /// when the root's pid no longer has the root's start. A cheap no-op
+    /// (one atomic load) while no tree window is open.
+    pub fn tree_tick(&self, now_boot_ns: u64) {
+        if !self.tree_armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(root) = self.bpffs_root.as_deref() else {
+            return;
+        };
+        self.tree_tick_with(
+            &mut PinnedTreeMaps(root),
+            &ProcFs(Path::new("/proc")),
+            now_boot_ns,
+        );
+    }
+
+    /// [`Self::tree_tick`] on `maps` and `reader`: the close's reason, when
+    /// it closed the window.
+    fn tree_tick_with(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        now_boot_ns: u64,
+    ) -> Option<&'static str> {
+        if !self.tree_armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut tree = self.tree.lock();
+        let g = tree.open.as_ref()?.grant;
+        let reason = if now_boot_ns >= g.expires_boot_ns {
+            Some("ttl_expired")
+        } else if maps
+            .read_closed()
+            .is_ok_and(|c| common::window_tree::window_closed(&c, g.nonce, g.generation))
+        {
+            Some("closed_by_kernel")
+        } else if reader.hop(g.root_tgid).map(|h| h.start_ticks) != Ok(g.root_start_ticks) {
+            Some("root_exited")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let closed = close_tree_locked(&mut tree, &self.tree_armed, maps);
+            drop(tree);
+            if let Some(c) = closed {
+                self.audit_tree_close(reason, &c);
+            }
+            return Some(reason);
+        }
+        let beat = FsGrantV2 {
+            heartbeat_boot_ns: now_boot_ns.max(g.heartbeat_boot_ns),
+            ..g
+        };
+        let written = maps.write_grant(beat);
+        if let Some(w) = tree.open.as_mut() {
+            match written {
+                Ok(()) => {
+                    w.grant = beat;
+                    w.beat_failed = false;
+                }
+                Err(e) if !w.beat_failed => {
+                    w.beat_failed = true;
+                    warn!(
+                        target: "anti_tamper.trusted_installer",
+                        error = %e,
+                        generation = g.generation,
+                        "tree window: heartbeat not written — the kernel ends the window 60 s \
+                         after the last one"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it): close the open tree
+    /// window (`reason` in its record): the grant zeroed first, then the
+    /// members emptied, then `TREE_CLOSED` (only once the grant is gone).
+    /// `false` when none was open.
+    pub fn close_tree(&self, reason: &str) -> bool {
+        let Some(root) = self.bpffs_root.as_deref() else {
+            return false;
+        };
+        self.close_tree_with(&mut PinnedTreeMaps(root), reason)
+    }
+
+    fn close_tree_with(&self, maps: &mut dyn TreeMaps, reason: &str) -> bool {
+        let mut tree = self.tree.lock();
+        let closed = close_tree_locked(&mut tree, &self.tree_armed, maps);
+        drop(tree);
+        match closed {
+            Some(c) => {
+                self.audit_tree_close(reason, &c);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn audit_tree_close(&self, reason: &str, c: &TreeClosed) {
+        let result = if c.failed.is_empty() {
+            info!(
+                target: "anti_tamper.trusted_installer",
+                reason,
+                generation = c.grant.generation,
+                "trusted-installer window per process tree CLOSED"
+            );
+            format!("closed: {reason}")
+        } else {
+            tracing::error!(
+                target: "anti_tamper.trusted_installer",
+                reason,
+                generation = c.grant.generation,
+                failed = %c.failed.join("; "),
+                "tree window close FAILED in part — the kernel's grace or deadline ends it"
+            );
+            format!("close_failed: {reason} (the kernel grant ends at its grace or deadline)")
+        };
+        self.audit_tree(
+            "trusted_installer_tree_window_close",
+            serde_json::json!({
+                "reason": reason,
+                "generation": c.grant.generation,
+                "root_pid": c.grant.root_tgid,
+                "root_start_ticks": c.grant.root_start_ticks,
+                "members_cleared": c.members_cleared,
+                "errors": c.failed,
+            }),
+            result,
+        );
+    }
+
+    /// One record of the tree window (the agent's, as the host-wide
+    /// window's close).
+    fn audit_tree(&self, op: &str, extra: serde_json::Value, result: String) {
+        let audit = self.audit.lock().clone();
+        let Some(audit) = audit else {
+            return;
+        };
+        let mut log = audit.lock();
+        let draft = AuditEntryDraft {
+            op: op.to_string(),
+            extra,
+            key_fp: "(agent)".to_string(),
+            cosigner_fps: Vec::new(),
+            result,
+            client_pid: log.self_pid(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        };
+        let appended = log.append(draft);
+        drop(log);
+        if let Err(e) = appended {
+            warn!(
+                target: "anti_tamper.trusted_installer",
+                error = %e,
+                op,
+                "appending a tree window record to the audit chain failed"
+            );
+        }
+    }
+}
+
+// ── Lot 2.3a's minimal path (lot 2.3b replaces it): the tree's kernel half ─
+
+/// How many processes the walk from the requester up to the signed root
+/// reads at most (the root included).
+pub const MAX_TREE_LINE: usize = 32;
+
+/// `PF_KTHREAD`, in `/proc/<pid>/stat`'s `flags` (field 9).
+const PF_KTHREAD: u64 = 0x0020_0000;
+
+/// What the walk reads of one process (`/proc/<pid>/stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcHop {
+    /// Its parent (field 4).
+    pub ppid: u32,
+    /// Its start (field 22, `wire::start_ticks`).
+    pub start_ticks: u64,
+    /// A kernel thread (`PF_KTHREAD` in field 9).
+    pub kthread: bool,
+}
+
+/// Lot 2.3a: where the walk and the arming read a process — `/proc`
+/// ([`ProcFs`]), or a test's fake.
+pub trait LineReader {
+    /// Its parent, start and kind (`stat`).
+    fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String>;
+    /// Its tracer and seccomp mode (`status`: `TracerPid`, `Seccomp`).
+    fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String>;
+}
+
+/// The [`LineReader`] of a `/proc` (the kernel's: `Path::new("/proc")`).
+pub struct ProcFs<'a>(pub &'a Path);
+
+impl LineReader for ProcFs<'_> {
+    fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
+        let stat = crate::state_read::read_state(self.0.join(pid.to_string()).join("stat"))
+            .map_err(|e| format!("/proc/{pid}/stat: {e}"))?;
+        parse_hop(&stat).ok_or_else(|| format!("/proc/{pid}/stat: not understood"))
+    }
+
+    fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String> {
+        let status = crate::state_read::read_state(self.0.join(pid.to_string()).join("status"))
+            .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
+        parse_guards(&status).ok_or_else(|| format!("/proc/{pid}/status: no TracerPid or Seccomp"))
+    }
+}
+
+/// `/proc/<pid>/stat`'s parent, start and kernel-thread flag, counted after
+/// the `(comm)` field (which may hold spaces or parentheses).
+fn parse_hop(stat: &str) -> Option<ProcHop> {
+    let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some(ProcHop {
+        ppid: rest.get(1)?.parse().ok()?,
+        start_ticks: rest.get(19)?.parse().ok()?,
+        kthread: rest.get(6)?.parse::<u64>().ok()? & PF_KTHREAD != 0,
+    })
+}
+
+/// `/proc/<pid>/status`'s `TracerPid` and `Seccomp` (a kernel without
+/// seccomp has no such line: not understood, the stricter side).
+fn parse_guards(status: &str) -> Option<(u32, u32)> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    };
+    Some((field("TracerPid:")?, field("Seccomp:")?))
+}
+
+/// Lot 2.3a's minimal path (lot 2.3b replaces it with pidfds and the
+/// admission policy): the line from the requester (`SO_PEERCRED` pid) up
+/// through its parents to the signed `root` (`(pid, start_ticks)`), root
+/// first, each with its start. Refused (`Err`, why): a root that is PID 1
+/// or 0, not on the line within [`MAX_TREE_LINE`] processes, or whose
+/// start differs from the signed one (another process took its pid); a
+/// line that holds a kernel thread, a traced or seccomp-filtered process,
+/// or one of the agent's own (`own`: [`TrustedInstallerOverride::own_tgids`]);
+/// a root whose parent is one of the agent's own (its worker); any
+/// process on it that cannot be read.
+pub fn line_to_root(
+    reader: &dyn LineReader,
+    requester: u32,
+    root: (u32, u64),
+    own: &[u32],
+) -> std::result::Result<Vec<(u32, u64)>, String> {
+    let (root_pid, root_start) = root;
+    if root_pid <= 1 {
+        return Err(format!(
+            "root {root_pid}: PID 1 (or 0) is never a window's root"
+        ));
+    }
+    if requester <= 1 {
+        return Err(format!(
+            "requester {requester}: PID 1 (or 0) asks for no window"
+        ));
+    }
+    let mut line = Vec::new();
+    let mut pid = requester;
+    for _ in 0..MAX_TREE_LINE {
+        let hop = reader.hop(pid)?;
+        if hop.kthread {
+            return Err(format!("process {pid} on the line is a kernel thread"));
+        }
+        if own.contains(&pid) {
+            return Err(format!(
+                "process {pid} on the line is the agent's or the watchdog's"
+            ));
+        }
+        match reader.guards(pid)? {
+            (0, 0) => {}
+            (tracer, seccomp) => {
+                return Err(format!(
+                    "process {pid} on the line is traced (TracerPid {tracer}) or filtered \
+                     (Seccomp {seccomp})"
+                ));
+            }
+        }
+        line.push((pid, hop.start_ticks));
+        if pid == root_pid {
+            if hop.start_ticks != root_start {
+                return Err(format!(
+                    "root {root_pid}: its start is {}, the signed one {root_start} (another \
+                     process)",
+                    hop.start_ticks
+                ));
+            }
+            if own.contains(&hop.ppid) {
+                return Err(format!(
+                    "root {root_pid} is a child of the agent's own process {}",
+                    hop.ppid
+                ));
+            }
+            line.reverse();
+            return Ok(line);
+        }
+        if hop.ppid <= 1 || hop.ppid == pid {
+            return Err(format!(
+                "root {root_pid} is not on the requester {requester}'s line (it reaches {pid}, \
+                 whose parent is {})",
+                hop.ppid
+            ));
+        }
+        pid = hop.ppid;
+    }
+    Err(format!(
+        "root {root_pid} is not within {MAX_TREE_LINE} processes above the requester {requester}"
+    ))
+}
+
+/// What a close did: the grant it ended, the members it took out, the
+/// writes that failed.
+struct TreeClosed {
+    grant: FsGrantV2,
+    members_cleared: usize,
+    failed: Vec<String>,
+}
+
+/// Close the open window of `tree` on `maps`, under the caller's lock: the
+/// grant zeroed first (no more lift, no new member), the members emptied,
+/// then `TREE_CLOSED` — only once the grant is gone, so a window the kernel
+/// closed is never open again in between. `None`: no window was open.
+fn close_tree_locked(
+    tree: &mut TreeState,
+    armed: &AtomicBool,
+    maps: &mut dyn TreeMaps,
+) -> Option<TreeClosed> {
+    let w = tree.open.take()?;
+    armed.store(false, Ordering::SeqCst);
+    let mut failed = Vec::new();
+    let grant_gone = match maps.write_grant(FsGrantV2::default()) {
+        Ok(()) => true,
+        Err(e) => {
+            failed.push(format!("{FS_GRANT_V2_MAP_NAME} not zeroed: {e}"));
+            false
+        }
+    };
+    let members_cleared = match maps.clear_members() {
+        Ok(n) => n,
+        Err(e) => {
+            failed.push(format!("{TREE_MEMBERS_MAP_NAME} not emptied: {e}"));
+            0
+        }
+    };
+    if grant_gone {
+        if let Err(e) = maps.zero_closed() {
+            failed.push(format!(
+                "{} not emptied: {e}",
+                super::window_tree::TREE_CLOSED_MAP_NAME
+            ));
+        }
+    }
+    Some(TreeClosed {
+        grant: w.grant,
+        members_cleared,
+        failed,
+    })
+}
+
+/// A refused arming's members taken out again; `why`, with what could not
+/// be taken out.
+fn withdrawn(maps: &mut dyn TreeMaps, why: String) -> String {
+    match maps.clear_members() {
+        Ok(_) => why,
+        Err(e) => format!("{why} (and {TREE_MEMBERS_MAP_NAME} not emptied: {e})"),
+    }
+}
+
+/// Lot 2.3a: the tree window's kernel maps as the agent writes them — the
+/// pins ([`PinnedTreeMaps`]), or a test's fake.
+trait TreeMaps {
+    /// `TREE_MEMBERS[tgid] = member`.
+    fn put_member(&mut self, tgid: u32, member: TreeMember) -> std::result::Result<(), String>;
+    /// Every entry of `TREE_MEMBERS` removed; how many.
+    fn clear_members(&mut self) -> std::result::Result<usize, String>;
+    /// `FS_GRANT_V2[0] = grant`.
+    fn write_grant(&mut self, grant: FsGrantV2) -> std::result::Result<(), String>;
+    /// `TREE_CLOSED[0]`.
+    fn read_closed(&mut self) -> std::result::Result<[u64; 2], String>;
+    /// `TREE_CLOSED[0] = [0, 0]`.
+    fn zero_closed(&mut self) -> std::result::Result<(), String>;
+}
+
+/// The pinned maps under the pin root.
+struct PinnedTreeMaps<'a>(&'a Path);
+
+impl PinnedTreeMaps<'_> {
+    fn open(&self, name: &str) -> std::result::Result<MapData, String> {
+        MapData::from_pin(self.0.join(name)).map_err(|e| format!("opening pinned {name}: {e}"))
+    }
+
+    fn members(&self) -> std::result::Result<aya::maps::HashMap<MapData, u32, PodMember>, String> {
+        aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_MEMBERS_MAP_NAME)?))
+            .map_err(|e| e.to_string())
+    }
+
+    fn closed(&self) -> std::result::Result<AyaArray<MapData, [u64; 2]>, String> {
+        let name = super::window_tree::TREE_CLOSED_MAP_NAME;
+        AyaArray::try_from(AyaMap::Array(self.open(name)?)).map_err(|e| e.to_string())
+    }
+}
+
+impl TreeMaps for PinnedTreeMaps<'_> {
+    fn put_member(&mut self, tgid: u32, member: TreeMember) -> std::result::Result<(), String> {
+        self.members()?
+            .insert(&tgid, &PodMember(member), 0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn clear_members(&mut self) -> std::result::Result<usize, String> {
+        let mut h = self.members()?;
+        let keys: Vec<u32> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in &keys {
+            h.remove(k).map_err(|e| e.to_string())?;
+        }
+        Ok(keys.len())
+    }
+
+    fn write_grant(&mut self, grant: FsGrantV2) -> std::result::Result<(), String> {
+        let mut a: AyaArray<MapData, PodGrantV2> =
+            AyaArray::try_from(AyaMap::Array(self.open(FS_GRANT_V2_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        a.set(0, &PodGrantV2(grant), 0).map_err(|e| e.to_string())
+    }
+
+    fn read_closed(&mut self) -> std::result::Result<[u64; 2], String> {
+        self.closed()?.get(&0, 0).map_err(|e| e.to_string())
+    }
+
+    fn zero_closed(&mut self) -> std::result::Result<(), String> {
+        self.closed()?
+            .set(0, &[0u64; 2], 0)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodGrantV2(FsGrantV2);
+// SAFETY: `FsGrantV2` is `repr(C)`, `bytemuck::Pod` (no padding, every bit
+// pattern valid); the wrapper is `repr(transparent)`.
+unsafe impl aya::Pod for PodGrantV2 {}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodMember(TreeMember);
+// SAFETY: as above (`TreeMember` is `bytemuck::Pod`).
+unsafe impl aya::Pod for PodMember {}
+
+/// The roles `ROLE_TGIDS` names (the watchdog's slot, the agent's), read
+/// from its pin.
+fn read_role_tgids(bpffs_root: &Path) -> std::result::Result<Vec<u32>, String> {
+    let name = antitamper_bpf::ROLE_TGIDS_MAP_NAME;
+    let md = MapData::from_pin(bpffs_root.join(name))
+        .map_err(|e| format!("opening pinned {name}: {e}"))?;
+    let a = AyaArray::<MapData, u32>::try_from(AyaMap::Array(md)).map_err(|e| e.to_string())?;
+    [
+        antitamper_bpf::ROLE_SLOT_WATCHDOG,
+        antitamper_bpf::ROLE_SLOT_AGENT,
+    ]
+    .iter()
+    .map(|s| a.get(s, 0).map_err(|e| format!("{name}[{s}]: {e}")))
+    .collect()
+}
+
+/// `CLOCK_BOOTTIME` in nanoseconds — the clock of `bpf_ktime_get_boot_ns`,
+/// the tree grant's deadline and heartbeat.
+pub fn boottime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer; CLOCK_BOOTTIME exists on every
+    // kernel the agent runs on (2.6.39+).
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 /// Lot 273d (R1): the guarded sysctls judged at a window's close, the
@@ -1015,5 +1817,500 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         crate::state_read::testing::write_non_utf8_proc(t.path(), 4301, 77, 0, 555);
         assert_eq!(stat_parent_and_start(t.path(), 4301), Some((77, 555)));
+    }
+
+    // ── Lot 2.3a's minimal path (lot 2.3b replaces it): the tree window ──
+
+    use std::collections::BTreeMap;
+
+    /// A session nonce no literal names (CodeQL
+    /// `rust/hard-coded-cryptographic-value`, as lot 2.2's `test_nonce`).
+    fn test_nonce() -> u32 {
+        let pid = std::process::id();
+        pid.rotate_left(7) ^ pid
+    }
+    const NOW: u64 = 5_000_000_000_000;
+    const SEC: u64 = 1_000_000_000;
+
+    /// The kernel's maps, each write in `ops` in its order.
+    #[derive(Default)]
+    struct FakeMaps {
+        ops: Vec<String>,
+        members: BTreeMap<u32, TreeMember>,
+        grant: FsGrantV2,
+        closed: [u64; 2],
+        refuse_grant: bool,
+    }
+
+    impl TreeMaps for FakeMaps {
+        fn put_member(&mut self, tgid: u32, m: TreeMember) -> std::result::Result<(), String> {
+            self.ops.push(format!(
+                "member {tgid} gen {} flags {}",
+                m.generation, m.flags
+            ));
+            self.members.insert(tgid, m);
+            Ok(())
+        }
+        fn clear_members(&mut self) -> std::result::Result<usize, String> {
+            self.ops.push("clear members".to_string());
+            let n = self.members.len();
+            self.members.clear();
+            Ok(n)
+        }
+        fn write_grant(&mut self, g: FsGrantV2) -> std::result::Result<(), String> {
+            if self.refuse_grant {
+                return Err("EPERM".to_string());
+            }
+            self.ops.push(format!("grant gen {}", g.generation));
+            self.grant = g;
+            Ok(())
+        }
+        fn read_closed(&mut self) -> std::result::Result<[u64; 2], String> {
+            Ok(self.closed)
+        }
+        fn zero_closed(&mut self) -> std::result::Result<(), String> {
+            self.ops.push("zero closed".to_string());
+            self.closed = [0; 2];
+            Ok(())
+        }
+    }
+
+    /// A `/proc`: per pid its parent, start, kind, tracer and seccomp mode.
+    #[derive(Default, Clone)]
+    struct FakeProc(BTreeMap<u32, (ProcHop, (u32, u32))>);
+
+    impl FakeProc {
+        fn with(mut self, pid: u32, ppid: u32, start_ticks: u64) -> Self {
+            let hop = ProcHop {
+                ppid,
+                start_ticks,
+                kthread: false,
+            };
+            self.0.insert(pid, (hop, (0, 0)));
+            self
+        }
+        fn guarded(mut self, pid: u32, tracer: u32, seccomp: u32) -> Self {
+            self.0.get_mut(&pid).unwrap().1 = (tracer, seccomp);
+            self
+        }
+    }
+
+    impl LineReader for FakeProc {
+        fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
+            self.0
+                .get(&pid)
+                .map(|e| e.0)
+                .ok_or_else(|| format!("{pid}: gone"))
+        }
+        fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String> {
+            self.0
+                .get(&pid)
+                .map(|e| e.1)
+                .ok_or_else(|| format!("{pid}: gone"))
+        }
+    }
+
+    /// install.sh (501, started at 9000) ran a shell (502) that ran
+    /// nn-admin (503); its parent is a login shell (400).
+    fn host() -> FakeProc {
+        FakeProc::default()
+            .with(400, 1, 100)
+            .with(501, 400, 9_000)
+            .with(502, 501, 9_100)
+            .with(503, 502, 9_200)
+            .with(1, 0, 1)
+    }
+
+    fn line() -> Vec<(u32, u64)> {
+        vec![(501, 9_000), (502, 9_100), (503, 9_200)]
+    }
+
+    fn tree_override() -> TrustedInstallerOverride {
+        TrustedInstallerOverride::new(None, test_nonce(), None, Duration::from_secs(600))
+    }
+
+    fn arm(
+        ov: &TrustedInstallerOverride,
+        maps: &mut FakeMaps,
+        reader: &FakeProc,
+        missing: &[String],
+    ) -> std::result::Result<u64, String> {
+        ov.arm_tree_with(Some(maps), reader, missing, NOW, 120, (501, 9_000), &line())
+    }
+
+    #[test]
+    fn the_walk_finds_the_root_on_the_requester_s_line() {
+        let line = line_to_root(&host(), 503, (501, 9_000), &[]).expect("on the line");
+        assert_eq!(line, vec![(501, 9_000), (502, 9_100), (503, 9_200)]);
+        // the requester's own parent, the hidden flag's root
+        assert_eq!(
+            line_to_root(&host(), 503, (502, 9_100), &[]).unwrap(),
+            vec![(502, 9_100), (503, 9_200)]
+        );
+        // the requester itself (lot 2.3b's `window-run`)
+        assert_eq!(
+            line_to_root(&host(), 503, (503, 9_200), &[]).unwrap(),
+            vec![(503, 9_200)]
+        );
+    }
+
+    #[test]
+    fn the_walk_refuses_a_root_not_on_the_line() {
+        let reader = host().with(777, 400, 9_050);
+        let e = line_to_root(&reader, 503, (777, 9_050), &[]).unwrap_err();
+        assert!(e.contains("not on the requester 503's line"), "{e}");
+        // a hop that cannot be read refuses too (never judged unknown-as-fine)
+        let gone = FakeProc::default().with(503, 502, 9_200);
+        assert!(line_to_root(&gone, 503, (501, 9_000), &[]).is_err());
+        // nor beyond the bound
+        let mut deep = FakeProc::default().with(2_000, 1, 1);
+        for pid in 2_001..2_000 + MAX_TREE_LINE as u32 + 2 {
+            deep = deep.with(pid, pid - 1, u64::from(pid));
+        }
+        let top = 2_000 + MAX_TREE_LINE as u32 + 1;
+        let e = line_to_root(&deep, top, (2_000, 1), &[]).unwrap_err();
+        assert!(e.contains("not within"), "{e}");
+    }
+
+    #[test]
+    fn the_walk_refuses_a_root_whose_start_differs() {
+        let e = line_to_root(&host(), 503, (501, 8_999), &[]).unwrap_err();
+        assert!(e.contains("another process"), "{e}");
+    }
+
+    #[test]
+    fn the_walk_refuses_pid_1_as_root() {
+        for root in [(1, 1), (0, 0)] {
+            let e = line_to_root(&host(), 503, root, &[]).unwrap_err();
+            assert!(e.contains("PID 1"), "{e}");
+        }
+        assert!(line_to_root(&host(), 1, (501, 9_000), &[]).is_err());
+    }
+
+    #[test]
+    fn the_walk_refuses_a_kernel_thread_a_traced_or_filtered_hop_and_the_agent_s_own() {
+        let mut kthread = host();
+        kthread.0.get_mut(&502).unwrap().0.kthread = true;
+        assert!(
+            line_to_root(&kthread, 503, (501, 9_000), &[])
+                .unwrap_err()
+                .contains("kernel thread")
+        );
+        let traced = host().guarded(502, 4242, 0);
+        assert!(
+            line_to_root(&traced, 503, (501, 9_000), &[])
+                .unwrap_err()
+                .contains("TracerPid 4242")
+        );
+        let filtered = host().guarded(501, 0, 2);
+        assert!(
+            line_to_root(&filtered, 503, (501, 9_000), &[])
+                .unwrap_err()
+                .contains("Seccomp 2")
+        );
+        // the agent (or the watchdog) on the line, or the root's parent
+        assert!(
+            line_to_root(&host(), 503, (501, 9_000), &[502])
+                .unwrap_err()
+                .contains("the agent's")
+        );
+        assert!(
+            line_to_root(&host(), 503, (501, 9_000), &[400])
+                .unwrap_err()
+                .contains("child of the agent's own")
+        );
+    }
+
+    #[test]
+    fn the_stat_and_status_lines_are_read_as_the_kernel_writes_them() {
+        let stat = "501 (a) b (c)) S 400 501 501 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 9000 0 0\n";
+        assert_eq!(
+            parse_hop(stat),
+            Some(ProcHop {
+                ppid: 400,
+                start_ticks: 9_000,
+                kthread: false
+            })
+        );
+        let kthread = "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0\n";
+        assert!(parse_hop(kthread).unwrap().kthread);
+        let status = "Name:\tTracerPid: 9\nUmask:\t0022\nTracerPid:\t0\nSeccomp:\t2\n";
+        assert_eq!(parse_guards(status), Some((0, 2)));
+        assert_eq!(parse_guards("Name:\tx\nTracerPid:\t0\n"), None);
+    }
+
+    #[test]
+    fn a_tree_grant_is_refused_while_the_host_wide_window_is_open() {
+        let ov = tree_override();
+        ov.arm(30, Instant::now());
+        let mut maps = FakeMaps::default();
+        let e = arm(&ov, &mut maps, &host(), &[]).unwrap_err();
+        assert!(e.contains("host-wide"), "{e}");
+        assert!(maps.ops.is_empty(), "{:?}", maps.ops);
+        assert!(!ov.tree_window_open());
+        ov.close("test");
+        assert!(arm(&ov, &mut maps, &host(), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_tree_grant_is_refused_while_a_tree_window_is_open() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        assert_eq!(arm(&ov, &mut maps, &host(), &[]), Ok(1));
+        let before = maps.ops.len();
+        let e = arm(&ov, &mut maps, &host(), &[]).unwrap_err();
+        assert!(e.contains("one window at a time"), "{e}");
+        assert_eq!(maps.ops.len(), before, "nothing written: {:?}", maps.ops);
+        assert_eq!(ov.tree_generation(), Some(1));
+    }
+
+    #[test]
+    fn a_tree_grant_is_refused_when_the_kernel_manifest_misses_anything() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        let missing = vec!["programs: tree_fork (sched_process_fork): EINVAL".to_string()];
+        let e = arm(&ov, &mut maps, &host(), &missing).unwrap_err();
+        assert!(
+            e.contains("window_tree_unavailable") && e.contains("tree_fork"),
+            "{e}"
+        );
+        assert!(maps.ops.is_empty());
+        // no pin root: refused as well
+        let e = ov
+            .arm_tree_with(None, &host(), &[], NOW, 120, (501, 9_000), &line())
+            .unwrap_err();
+        assert!(e.contains("no bpffs"), "{e}");
+        // no session this boot
+        let dormant = TrustedInstallerOverride::new(None, 0, None, Duration::from_secs(600));
+        assert!(arm(&dormant, &mut maps, &host(), &[]).is_err());
+        assert!(maps.ops.is_empty());
+    }
+
+    #[test]
+    fn the_members_are_written_before_the_grant() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        assert_eq!(arm(&ov, &mut maps, &host(), &[]), Ok(1));
+        assert_eq!(
+            maps.ops,
+            vec![
+                format!("member 501 gen 1 flags {TREE_MEMBER_ROOT}"),
+                "member 502 gen 1 flags 0".to_string(),
+                "member 503 gen 1 flags 0".to_string(),
+                "grant gen 1".to_string(),
+            ]
+        );
+        assert_eq!(
+            maps.grant,
+            FsGrantV2 {
+                nonce: test_nonce(),
+                root_tgid: 501,
+                generation: 1,
+                expires_boot_ns: NOW + 120 * SEC,
+                root_start_ticks: 9_000,
+                heartbeat_boot_ns: NOW,
+                first_grant_boot_ns: NOW,
+            }
+        );
+        assert_eq!(maps.members[&502].start_ticks, 9_100);
+        // the kernel's own test lifts for the members of this grant
+        assert!(maps.grant.lifts_for(
+            maps.members.get(&503),
+            9_200,
+            false,
+            NOW + SEC,
+            test_nonce()
+        ));
+        // clamped to the 600 s ceiling
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        ov.arm_tree_with(
+            Some(&mut maps),
+            &host(),
+            &[],
+            NOW,
+            99_999,
+            (501, 9_000),
+            &line(),
+        )
+        .unwrap();
+        assert_eq!(maps.grant.expires_boot_ns, NOW + 600 * SEC);
+    }
+
+    #[test]
+    fn a_tracer_found_at_the_second_read_clears_the_members_and_no_grant_is_written() {
+        let ov = tree_override();
+        for reader in [
+            host().guarded(502, 77, 0),
+            host().guarded(503, 0, 1),
+            host().with(502, 501, 9_999),
+            FakeProc::default().with(501, 400, 9_000),
+        ] {
+            let mut maps = FakeMaps::default();
+            assert!(arm(&ov, &mut maps, &reader, &[]).is_err());
+            assert_eq!(maps.ops.last().map(String::as_str), Some("clear members"));
+            assert!(
+                !maps.ops.iter().any(|o| o.starts_with("grant")),
+                "{:?}",
+                maps.ops
+            );
+            assert!(maps.members.is_empty());
+            assert!(!ov.tree_window_open());
+        }
+        // a grant that cannot be written: the members out again too
+        let mut maps = FakeMaps {
+            refuse_grant: true,
+            ..FakeMaps::default()
+        };
+        assert!(arm(&ov, &mut maps, &host(), &[]).is_err());
+        assert!(maps.members.is_empty());
+        assert!(!ov.tree_window_open());
+    }
+
+    #[test]
+    fn the_generation_rises_by_one_and_is_never_reused() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        assert_eq!(arm(&ov, &mut maps, &host(), &[]), Ok(1));
+        assert!(ov.close_tree_with(&mut maps, "test"));
+        assert_eq!(arm(&ov, &mut maps, &host(), &[]), Ok(2));
+        assert!(ov.close_tree_with(&mut maps, "test"));
+        // a refusal before any member is written spends nothing
+        assert!(arm(&ov, &mut maps, &host(), &["x".to_string()]).is_err());
+        // one refused after its members were written spends its number
+        assert!(arm(&ov, &mut maps, &host().guarded(503, 9, 0), &[]).is_err());
+        assert_eq!(arm(&ov, &mut maps, &host(), &[]), Ok(4));
+    }
+
+    #[test]
+    fn the_tick_beats_and_closes_at_the_deadline_the_kernel_s_close_or_the_root_s_end() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        // a beat: the slot as it is, the heartbeat moved
+        assert_eq!(ov.tree_tick_with(&mut maps, &host(), NOW + 5 * SEC), None);
+        assert_eq!(maps.grant.heartbeat_boot_ns, NOW + 5 * SEC);
+        assert_eq!(maps.grant.expires_boot_ns, NOW + 120 * SEC);
+        assert!(ov.tree_window_open());
+        // the deadline
+        assert_eq!(
+            ov.tree_tick_with(&mut maps, &host(), NOW + 120 * SEC),
+            Some("ttl_expired")
+        );
+        assert!(!ov.tree_window_open());
+        assert_eq!(maps.grant, FsGrantV2::default());
+        assert!(maps.members.is_empty());
+        let tail: Vec<&str> = maps
+            .ops
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(tail, ["grant gen 0", "clear members", "zero closed"]);
+        // closed by the kernel (the root died, or was evicted)
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        maps.closed = [u64::from(test_nonce()), 2];
+        assert_eq!(
+            ov.tree_tick_with(&mut maps, &host(), NOW + SEC),
+            Some("closed_by_kernel")
+        );
+        assert_eq!(maps.closed, [0; 2]);
+        // another window's close names no other generation
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        maps.closed = [u64::from(test_nonce()), 2];
+        assert_eq!(ov.tree_tick_with(&mut maps, &host(), NOW + SEC), None);
+        // the root's pid gone, or another process's now
+        assert_eq!(
+            ov.tree_tick_with(&mut maps, &host().with(501, 400, 9_500), NOW + 2 * SEC),
+            Some("root_exited")
+        );
+        assert_eq!(ov.tree_tick_with(&mut maps, &host(), NOW + 3 * SEC), None);
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        let mut gone = host();
+        gone.0.remove(&501);
+        assert_eq!(
+            ov.tree_tick_with(&mut maps, &gone, NOW + 2 * SEC),
+            Some("root_exited")
+        );
+    }
+
+    #[test]
+    fn a_close_whose_grant_was_not_zeroed_leaves_the_kernel_s_close_in_place() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        maps.closed = [u64::from(test_nonce()), 1];
+        maps.refuse_grant = true;
+        assert!(ov.close_tree_with(&mut maps, "test"));
+        assert_eq!(maps.closed, [u64::from(test_nonce()), 1], "{:?}", maps.ops);
+        assert!(maps.members.is_empty());
+        assert!(!ov.tree_window_open());
+        // and once
+        assert!(!ov.close_tree_with(&mut maps, "test"));
+    }
+
+    #[test]
+    fn a_tree_window_softens_nothing_in_the_agent() {
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        assert!(ov.tree_window_open());
+        assert!(!ov.is_window_open());
+        assert!(!ov.is_active_at(Instant::now()));
+        assert!(ov.current_grant().is_none());
+    }
+
+    #[test]
+    fn the_host_wide_grant_is_refused_while_a_tree_window_is_open() {
+        let ov = tree_override();
+        assert!(ov.legacy_arming().is_ok());
+        let mut maps = FakeMaps::default();
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        let e = ov.legacy_arming().unwrap_err();
+        assert!(e.contains("one window at a time"), "{e}");
+        ov.close_tree_with(&mut maps, "test");
+        assert!(ov.legacy_arming().is_ok());
+    }
+
+    #[test]
+    fn each_tree_grant_refusal_and_close_is_recorded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let log = AuditLog::open(&dir.path().join("audit.log"), key, [1u8; 16]).unwrap();
+        let ov = TrustedInstallerOverride::new(
+            None,
+            test_nonce(),
+            Some(Arc::new(Mutex::new(log))),
+            Duration::from_secs(600),
+        );
+        let mut maps = FakeMaps::default();
+        arm(&ov, &mut maps, &host(), &[]).unwrap();
+        assert!(arm(&ov, &mut maps, &host(), &[]).is_err());
+        ov.note_tree_refusal("root 7 is not on the line");
+        ov.tree_tick_with(&mut maps, &host(), NOW + 120 * SEC);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|r| {
+                r["op"]
+                    .as_str()
+                    .is_some_and(|o| o.starts_with("trusted_installer_tree"))
+            })
+            .collect();
+        let ops: Vec<&str> = rows.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(
+            ops,
+            [
+                "trusted_installer_tree_window_open",
+                "trusted_installer_tree_grant_refused",
+                "trusted_installer_tree_grant_refused",
+                "trusted_installer_tree_window_close",
+            ]
+        );
+        assert_eq!(rows[3]["result"], "closed: ttl_expired");
+        assert_eq!(rows[3]["extra"]["members_cleared"], 3);
     }
 }

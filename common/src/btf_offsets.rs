@@ -660,6 +660,18 @@ pub const MNT_IDMAP_UID_NR_EXTENTS_OFFSET: usize = 60;
 pub const VM_AREA_STRUCT_VM_FILE_OFFSET: usize = 88;
 pub const VM_AREA_STRUCT_VM_FLAGS_OFFSET: usize = 32;
 
+/// Lot 2.3a (stage S2): the per-lift test of the trusted-installer window
+/// per process tree reads the caller's own state at each lift (the
+/// design's section 1, "the kernel's own test"; section 8's manifest):
+/// - `task_struct.ptrace` (`unsigned int`, not 0 while the task is traced,
+///   in either mode): 48 on 6.8 and on a 6.18 build host (`flags` + 4);
+pub const TASK_STRUCT_PTRACE_OFFSET: usize = 48;
+/// - `task_struct.seccomp.mode` (`int`): absent on a kernel built without
+///   `CONFIG_SECCOMP`, where no member is lifted (a missing field of the
+///   per-lift test is a missing hook). The compiled value is a 6.18 build
+///   host's; the running kernel's is resolved at the start.
+pub const TASK_STRUCT_SECCOMP_MODE_OFFSET: usize = 2056;
+
 /// Lot 2.2 (the review of #644, D10): the fields that are one kernel
 /// object's layouts across versions — the mount's user namespace (5.12 to
 /// 6.2), its idmapping (from 6.3), and the idmapping's owner (6.3 to 6.6)
@@ -2086,6 +2098,23 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    // Lot 2.3a: appended (slots 168–169).
+    OffsetSpec {
+        name: "TASK_STRUCT_PTRACE_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["ptrace"],
+        expected: TASK_STRUCT_PTRACE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "TASK_STRUCT_SECCOMP_MODE_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["seccomp", "mode"],
+        expected: TASK_STRUCT_SECCOMP_MODE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -2298,16 +2327,20 @@ pub mod slot {
     pub const MNT_IDMAP_UID_NR_EXTENTS_OFFSET: u32 = 165;
     pub const VM_AREA_STRUCT_VM_FILE_OFFSET: u32 = 166;
     pub const VM_AREA_STRUCT_VM_FLAGS_OFFSET: u32 = 167;
-    // enum slots 168–169 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 170;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 171;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 172;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 173;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 174;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 175;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 176;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 177;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 178;
+    // Lot 2.3a: appended (slots 168–169); the slots after them moved by
+    // two.
+    pub const TASK_STRUCT_PTRACE_OFFSET: u32 = 168;
+    pub const TASK_STRUCT_SECCOMP_MODE_OFFSET: u32 = 169;
+    // enum slots 170–171 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 172;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 173;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 174;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 175;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 176;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 177;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 178;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 179;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 180;
     // Lot 322: `sys_enter_execve.envp` and `sys_enter_execveat.envp` (lab
     // PR 226, slots 140–141) are no longer read: the environment is read
     // from the exec's own registers (`PT_REGS_R10_OFFSET`).
@@ -2483,6 +2516,8 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("MNT_IDMAP_UID_NR_EXTENTS_OFFSET", 165),
     ("VM_AREA_STRUCT_VM_FILE_OFFSET", 166),
     ("VM_AREA_STRUCT_VM_FLAGS_OFFSET", 167),
+    ("TASK_STRUCT_PTRACE_OFFSET", 168),
+    ("TASK_STRUCT_SECCOMP_MODE_OFFSET", 169),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -2843,24 +2878,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 170),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 171),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 172),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 173),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 174),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 175),
-    ("TP_IOURING_CREATE_FD_OFFSET", 176),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 177),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 178),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 172),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 173),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 174),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 175),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 176),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 177),
+    ("TP_IOURING_CREATE_FD_OFFSET", 178),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 179),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 180),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 168), ("ITER_IOVEC_VALUE", 169)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 170), ("ITER_IOVEC_VALUE", 171)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 168;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 170;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 169;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 171;
 
 // ───────────────────────────────────────
 //  LSM hook prototypes (lab PR 164).
@@ -2930,20 +2965,20 @@ pub const HOOK_ARGS: &[HookArgSpec] = &[
 
 /// Hook-argument slots follow the tracepoint slots.
 pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
-    ("INODE_SETATTR_DENTRY_ARG", 179),
-    ("INODE_SETXATTR_DENTRY_ARG", 180),
-    ("INODE_REMOVEXATTR_DENTRY_ARG", 181),
+    ("INODE_SETATTR_DENTRY_ARG", 181),
+    ("INODE_SETXATTR_DENTRY_ARG", 182),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 183),
 ];
 
 /// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
 /// 6.9.
-pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 179;
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 181;
 /// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
 /// 1 from 5.12. The attribute name follows it.
-pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 180;
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 182;
 /// Slot of the position of `inode_removexattr`'s dentry (as
 /// `inode_setxattr`).
-pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 181;
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 183;
 
 /// Upper bound on a resolved position: every hook the agent attaches has
 /// at most six arguments. The eBPF reader bounds the slot value by it.
@@ -3193,13 +3228,14 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET); the re-check 2 of #567 two
     /// more (`mount.mnt_mounts`, `.mnt_child`, slots 152–153); lot 324
     /// one (`pt_regs.di`, slot 159); lot 2.1 one (`inode.i_rdev`, slot
-    /// 160).
+    /// 160); lot 2.2 seven (161–167); lot 2.3a two (`task_struct.ptrace`,
+    /// `.seccomp.mode`, 168–169).
     #[test]
     fn revalidate_table_is_complete() {
         assert_eq!(
             REVALIDATE.len(),
-            167,
-            "REVALIDATE must cover all 167 offsets"
+            169,
+            "REVALIDATE must cover all 169 offsets"
         );
         // lot 2.1: an optional entry of vmlinux's `struct inode`, after the
         // inode number it follows by its `i_nlink` union
@@ -3321,7 +3357,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 182);
+        assert_eq!(BTF_OFFSETS_SLOTS, 184);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -3389,6 +3425,10 @@ mod tests {
         assert!(absent_degrades("SUPER_BLOCK_S_USER_NS_OFFSET"));
         assert!(absent_degrades("INODE_I_RDEV_OFFSET"));
         assert_eq!(slot::VM_AREA_STRUCT_VM_FLAGS_OFFSET, 167);
+        // lot 2.3a: appended after lot 2.2's
+        assert_eq!(slot::TASK_STRUCT_PTRACE_OFFSET, 168);
+        assert_eq!(slot::TASK_STRUCT_SECCOMP_MODE_OFFSET, 169);
+        assert!(absent_degrades("TASK_STRUCT_SECCOMP_MODE_OFFSET"));
     }
 
     /// Tracepoint slots follow the enum slots and match TRACEPOINT_FIELDS
@@ -3413,9 +3453,9 @@ mod tests {
         // #567 four more (148–151), its re-check 2 two more (152–153)
         // lot 370 two more (154–155), lot 374 three more (156–158), lot
         // 324 one more (159)
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 170);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 173);
-        assert_eq!(slot::TP_IOURING_CREATE_FLAGS_OFFSET, 178);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 172);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 175);
+        assert_eq!(slot::TP_IOURING_CREATE_FLAGS_OFFSET, 180);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 
@@ -3438,14 +3478,14 @@ mod tests {
         }
         // lot 357: nine offset slots before them, the review of #567 four
         // more, its re-check 2 two more (lot 324: one more)
-        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 179);
-        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 180);
-        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 181);
-        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 179));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 180));
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 181);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 182);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 183);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 181));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 182));
         assert_eq!(
             HOOK_ARG_SLOT_TABLE[2],
-            ("INODE_REMOVEXATTR_DENTRY_ARG", 181)
+            ("INODE_REMOVEXATTR_DENTRY_ARG", 183)
         );
         // a position and the argument after it stay below the bound
         assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));

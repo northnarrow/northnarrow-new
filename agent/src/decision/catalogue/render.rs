@@ -243,7 +243,8 @@ pub struct ShippedRule {
 
 /// Every rule the agent can record, once each, in evaluation order: the
 /// production engine's rules (built as main.rs builds them, over empty
-/// operator state) and NN-L-AT-001 and NN-L-EPG-001/002 (lab PR 219), which
+/// operator state) and NN-L-AT-001, NN-L-AT-002 (lot 2.3a) and
+/// NN-L-EPG-001/002 (lab PR 219), which
 /// `process_event` issues outside the engine (the denominator of
 /// `docs/validation/v2-rules.tsv`), then NN-L-EXECQ-001 (lab PR 223) and
 /// NN-L-EXECPOL-001 / NN-L-EXECENV-001..003 (lab PR 226), which the exec
@@ -280,8 +281,10 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
         // R14a: no worker launch to know here (lot 310: nor an executor)
         Default::default(),
     );
-    let direct: [Box<dyn Rule>; 3] = [
+    let direct: [Box<dyn Rule>; 4] = [
         Box::new(rules::anti_tamper::NnLAt001AntiTamperDenial),
+        // lot 2.3a: the trusted-installer window's ring, outside the engine
+        Box::new(rules::anti_tamper::NnLAt002TreeWindowRecord),
         Box::new(rules::epg::NnLEpg001CredentialPostcondition),
         Box::new(rules::epg::NnLEpg002NamespaceRootPostcondition),
     ];

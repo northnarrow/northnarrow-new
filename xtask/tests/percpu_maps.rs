@@ -215,6 +215,9 @@ const KNOWN: &[(&str, Why)] = &[
     // still counted)
     ("WINDOW_EVENT_DROPS", Why::Counter),
     ("WINDOW_EVENT_SEQ", Why::Counter),
+    // lot 2.3a: the environment's read at `sched_process_exec` (a BTF
+    // tracepoint), its length alone used
+    ("TREE_ENV_SCRATCH", Why::PreemptOff),
     ("DENY_FAIL_OPEN", Why::Counter),
     ("EPG_COUNTERS", Why::Counter),
     ("EXECPOL_COUNTERS", Why::Counter),

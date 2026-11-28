@@ -1382,6 +1382,9 @@ pub fn event_time_ns(event: &Event) -> u64 {
         Event::NetListener(nl) => nl.timestamp_ns,
         Event::DnsAnswer(a) => a.timestamp_ns,
         Event::TlsClientHello(h) => h.timestamp_ns,
+        // Lot 2.3a: the window ring's clock is CLOCK_BOOTTIME, not the
+        // lineage's: judged as of now
+        Event::WindowRecord { .. } => 0,
     }
 }
 

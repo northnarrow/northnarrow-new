@@ -33,8 +33,16 @@
 //! it, `file_ioctl_compat` for a 32-bit caller (lab PR 174).
 //!
 //! No hook reads the LSM chain's previous verdict (see `task_kill.rs`).
-//! The [`FS_GRANT`] map is the trusted-installer window: while it is
-//! open, nothing is denied.
+//! The trusted-installer window is [`override_active`]: lot 2.3a, per
+//! process tree — while a tree grant is in force only its members are
+//! lifted (`crate::window_tree`), and the host-wide [`FS_GRANT`] answers
+//! only while none is (the flows' window until lots 2.3b and 2.4). No
+//! window lifts the key files ([`INODE_EXT`]), and while a tree window is
+//! open every refusal's record carries its class (the outsider's is High).
+//!
+//! Lot 2.3a also refuses the rename or exchange of an ancestor of the
+//! agent's paths ([`INODE_EXT`], the ancestors) and a foreign open of a block
+//! device that backs them ([`PROTECTED_BDEVS`], the block devices).
 
 use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
@@ -58,18 +66,19 @@ use aya_ebpf::{
 use northnarrow_common::cgroup_limits::same_value;
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::ptrace_read;
+use northnarrow_common::window_tree::{ancestor_rename_verdict, window_lift_kept};
 use northnarrow_common::wire::{
     fs_protect_denied_op, fs_protect_init_may, fs_protect_init_may_open, fs_protect_required,
     fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
-    InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
+    InodeKey, FS_OP_ANCESTOR_RENAME, FS_OP_CREATE, FS_OP_IOCTL, INODE_EXT_SLOTS, PROTECTED_BDEVS_MAX,
     FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE_READ, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
     FS_OP_SETATTR, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET,
-    INODE_I_MODE_OFFSET, INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT, INODE_SETATTR_DENTRY_ARG_SLOT,
-    INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
+    INODE_I_MODE_OFFSET, INODE_I_RDEV_OFFSET, INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT,
+    INODE_SETATTR_DENTRY_ARG_SLOT, INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
 };
 
 /// Linux `EPERM` — LSM hooks return `-errno` to deny.
@@ -143,6 +152,25 @@ pub static READ_PROTECTED_INOS: Array<u64> = Array::pinned(READ_PROTECTED_SLOTS,
 /// left by an older agent would fail every deny hook's verification.
 #[map]
 pub static FS_GRANT: Array<FsGrant> = Array::pinned(1, 0);
+
+/// Lot 2.3a (the ancestors, the key files): the inodes' second flag word
+/// (`northnarrow_common::wire::INODE_EXT_MAP_NAME`): the ancestors of the
+/// agent's paths (`INODE_EXT_NO_RENAME`: their own rename or exchange is
+/// refused, as it moves the agent's tree from under its paths) and the key
+/// files (`INODE_EXT_WINDOW_KEPT`: no window lifts them) with their
+/// directory and its ancestors (`INODE_EXT_DIR_KEPT`: no window lifts their
+/// own rename). Written by the agent at its start; pinned by
+/// name.
+#[map]
+pub static INODE_EXT: HashMap<InodeKey, u8> = HashMap::pinned(INODE_EXT_SLOTS, 0);
+
+/// Lot 2.3a (the block devices): the block devices that back the agent's files, by
+/// the kernel's `dev_t` (`northnarrow_common::wire::PROTECTED_BDEVS_MAP_NAME`):
+/// a foreign write-open is refused, a read-open under the kernel-read
+/// option's block-device class. Written by the agent at its start; pinned
+/// by name.
+#[map]
+pub static PROTECTED_BDEVS: HashMap<u32, u8> = HashMap::pinned(PROTECTED_BDEVS_MAX, 0);
 
 /// Audit ringbuffer for denials. 64 KiB ≈ ~1100
 /// [`FsProtectDenialRaw`] (56 B each). Denials are by definition
@@ -279,16 +307,23 @@ pub(crate) unsafe fn read_inode_key(inode: *const c_void) -> Option<InodeKey> {
 /// armed until an event reached the agent's sweep, and a host whose
 /// event path had stalled kept every protected file, the pin root and
 /// the kexec refusal open past the deadline.
+///
+/// Lot 2.3a: the same signature, and the answer is the CALLING process's
+/// (the design's "Trusted-installer window per process tree"): while a
+/// tree grant is in force, whether the caller is a member the window lifts
+/// for; otherwise the host-wide grant above
+/// (`crate::window_tree::nn_window_lift`).
 #[inline(always)]
 pub(crate) fn override_active() -> bool {
-    let session = match crate::task_kill::AGENT_SESSION.get(0) {
-        Some(v) => *v,
-        None => return false,
-    };
-    match FS_GRANT.get(0) {
-        Some(g) => g.active(unsafe { bpf_ktime_get_ns() }, session),
-        None => false,
-    }
+    crate::window_tree::opaque(crate::window_tree::nn_window_lift()) != 0
+}
+
+/// Lot 2.3a (the key files): `key`'s refusal is one no window lifts
+/// (`INODE_EXT_WINDOW_KEPT`: `admin.pub`, the agent's signing key).
+#[inline(always)]
+fn window_kept(key: &InodeKey) -> bool {
+    // SAFETY: a lookup of this program's map, the value copied out at once.
+    window_lift_kept(unsafe { INODE_EXT.get(key) }.copied())
 }
 
 /// `(caller tgid << 8) | op` → monotonic ns of the last task-denial record
@@ -459,6 +494,42 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
             ino: target_tgid as u64,
         },
     );
+}
+
+/// Lot 2.3a (lot 330 a): a signal's record — a refused one
+/// (`FS_OP_SIGNAL`) or a fatal one let through to a protected process
+/// (`FS_OP_FATAL_SIGNAL`), `target_dev` the signal, `target_ino` the
+/// target's tgid — behind the per-caller dedup by SIGNAL as well as by
+/// operation (a SIGTERM and the SIGKILL after it are two records; a loop of
+/// one signal is one a second) and the budget of its operation.
+#[inline(always)]
+pub fn emit_signal(operation: u8, sig: u32, target_tgid: u32) {
+    let key = InodeKey {
+        dev: u64::from(sig),
+        ino: u64::from(target_tgid),
+    };
+    if caller_is_self_test() {
+        emit_denial(operation, key);
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
+    let seen = (caller << 16) | (u64::from(sig & 0xff) << 8) | u64::from(operation);
+    match TASK_DENIAL_SEEN.get_ptr_mut(&seen) {
+        Some(last) => unsafe {
+            if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
+                return;
+            }
+            *last = now;
+        },
+        None => {
+            let _ = TASK_DENIAL_SEEN.insert(&seen, &now, 0);
+        }
+    }
+    if !limited_budget(operation, now) {
+        return;
+    }
+    emit_denial(operation, key);
 }
 
 /// The re-check of #567 (b): a refused read-mode ptrace access to one of
@@ -668,6 +739,9 @@ pub(crate) fn emit_sole_trace(operation: u8, key: InodeKey) -> bool {
 /// and [`emit_sysctl_record`].
 #[inline(always)]
 fn emit_denial(operation: u8, key: InodeKey) -> bool {
+    // Lot 2.3a: the refusal's class while a tree window is open (an
+    // outsider's also goes to the window's ring), before the reservation.
+    let window = crate::window_tree::nn_window_class(u64::from(operation), key.ino) as u8;
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
@@ -692,6 +766,7 @@ fn emit_denial(operation: u8, key: InodeKey) -> bool {
         (*raw_ptr).target_dev = key.dev;
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).operation = operation;
+        (*raw_ptr).window = window;
 
         // Lot 1.2: straight into the record zeroed above — no `memset`
         // subprogram (KERNEL_COMPATIBILITY "Older verifiers", rule 9).
@@ -750,7 +825,8 @@ unsafe fn protected_verdict(operation: u8, target: *const c_void, hook: u32) -> 
         if flags & required == 0 {
             return None;
         }
-        if override_active() {
+        // Lot 2.3a (the key files): the key files are lifted by no window.
+        if override_active() && !window_kept(&key) {
             return None;
         }
         // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
@@ -878,7 +954,45 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
                 return -EPERM;
             }
         }
+        // Lot 2.3a (the ancestors): the moved entry, or the one it replaces or
+        // is exchanged with, an ancestor of the agent's paths.
+        // (scalars for the global function: the hook's typed pointers are
+        // refused there)
+        let (old_s, new_s) = (crate::window_tree::raw_arg(ctx, 1), crate::window_tree::raw_arg(ctx, 3));
+        if crate::window_tree::opaque(nn_ancestor_rename(old_s)) != 0
+            || crate::window_tree::opaque(nn_ancestor_rename(new_s)) != 0
+        {
+            return -EPERM;
+        }
         0
+    }
+}
+
+/// Lot 2.3a (the ancestors): whether the rename involving `dentry` (a scalar
+/// pointer; a negative dentry is nothing) is refused because its inode is
+/// an ancestor of the agent's paths (`window_tree::ancestor_rename_verdict`:
+/// outside the agent's family, unless the window lifts it for the caller
+/// and keeps nothing), signed. 1 when refused. A global function.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_ancestor_rename(dentry: u64) -> u64 {
+    // SAFETY: the dentry and its inode are read through the helper only.
+    unsafe {
+        let Some(inode) = inode_from_dentry(dentry as *const c_void, hook::INODE_RENAME) else {
+            return 0;
+        };
+        let Some(key) = read_inode_key(inode) else {
+            return 0;
+        };
+        let Some(ext) = INODE_EXT.get(&key).copied() else {
+            return 0;
+        };
+        let family = crate::task_kill::is_exempt_pid((bpf_get_current_pid_tgid() >> 32) as u32);
+        if !ancestor_rename_verdict(Some(ext), override_active(), family) {
+            return 0;
+        }
+        emit_attempt(FS_OP_ANCESTOR_RENAME, key);
+        1
     }
 }
 
@@ -1099,6 +1213,10 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
                 return 0;
             }
         };
+        // Lot 2.3a (the block devices): a block device that backs the agent's files.
+        if crate::window_tree::opaque(nn_bdev_open(inode as u64, u64::from(f_mode & FMODE_WRITE != 0))) != 0 {
+            return -EPERM;
+        }
         if f_mode & FMODE_WRITE == 0 {
             if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode, hook::FILE_OPEN) {
                 return -EPERM;
@@ -1191,6 +1309,58 @@ unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
             return -EPERM;
         }
         0
+    }
+}
+
+/// `S_IFBLK` (include/uapi/linux/stat.h).
+const S_IFBLK: u16 = 0o060000;
+
+/// Lot 2.3a (the block devices): whether the open of `inode` (a scalar pointer),
+/// for writing when `write` is 1, is refused: a block device whose
+/// `i_rdev` is one of [`PROTECTED_BDEVS`], opened by a process outside the
+/// agent's family that the window does not lift for — a write-open always,
+/// a read-open under the kernel-read option's block-device class
+/// (`window_tree::bdev_open_refusal`), signed. 1 when refused; any other
+/// file costs one read of its mode. A global function.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_bdev_open(inode: u64, write: u64) -> u64 {
+    // SAFETY: the inode is read through the helper only.
+    unsafe {
+        let inode = inode as *const u8;
+        if inode.is_null() {
+            return 0;
+        }
+        match bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
+            Ok(m) if m & S_IFMT == S_IFBLK => {}
+            _ => return 0,
+        }
+        let Some(o) = off_opt!(INODE_I_RDEV_OFFSET) else {
+            return 0;
+        };
+        let Ok(rdev) = bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32) else {
+            crate::fail_open::bump(hook::FILE_OPEN);
+            return 0;
+        };
+        let entry = PROTECTED_BDEVS.get(&rdev).copied();
+        if entry.is_none() {
+            return 0;
+        }
+        if crate::task_kill::is_exempt_pid((bpf_get_current_pid_tgid() >> 32) as u32) {
+            return 0;
+        }
+        // the kernel-read option's classes in force (lot 2.2's array)
+        let mask = match crate::bpf_defense::KERNEL_READ_CONF.get(northnarrow_common::wire::KREAD_SLOT_MASK) {
+            Some(m) => *m,
+            None => 0,
+        };
+        let op = northnarrow_common::window_tree::bdev_open_refusal(entry, write != 0, mask, override_active());
+        if op == 0 {
+            return 0;
+        }
+        let key = read_inode_key(inode as *const c_void).unwrap_or(InodeKey { dev: u64::from(rdev), ino: 0 });
+        emit_attempt(op, key);
+        1
     }
 }
 

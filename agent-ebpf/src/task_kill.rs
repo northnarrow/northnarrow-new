@@ -24,7 +24,20 @@
 //! process only under a [`KILL_GRANT`] the agent writes for a signed
 //! trusted-installer window, or as `systemd-shutdown` at the very end of
 //! a shutdown (external audit EBPF-001).
-use northnarrow_common::wire::{InodeKey, KillGrant, FS_OP_SIGNAL};
+//!
+//! Lot 2.3a:
+//! - a process that runs the agent's or the watchdog's binary is protected
+//!   before it registers, as the ptrace and limits hooks protect it
+//!   (a new instance in the spawn-to-registration span);
+//! - while a tree window is open, its members are guarded from outsiders'
+//!   signals, PID 1's included (but `systemd-shutdown`'s), signed
+//!   (`crate::window_tree::nn_tree_target_guarded`, D7);
+//! - every signal whose default action ends or stops a protected process is
+//!   recorded: a refused one (`FS_OP_SIGNAL`), and one let through
+//!   (`FS_OP_FATAL_SIGNAL`: PID 1 under the grant or as `systemd-shutdown`,
+//!   the agent's family, the process itself) — lot 330 (a).
+use northnarrow_common::window_tree::fatal_or_stop_by_default;
+use northnarrow_common::wire::{InodeKey, KillGrant, FS_OP_FATAL_SIGNAL, FS_OP_SIGNAL};
 use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
@@ -258,20 +271,44 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         // it, so the invalidation window is irrelevant here.
         // R14a: a worker is protected as a target, as the agent and the
         // watchdog are.
-        let is_protected = is_protected_pid(target_tgid);
+        // Lot 2.3a (a new instance): and a process running the agent's or the
+        // watchdog's binary before it registered (a new instance's first
+        // moments), as `ptrace_check::target_is_protected` protects it.
+        let registered = is_protected_pid(target_tgid);
+        let is_protected = registered || crate::bpf_defense::task_runs_own_binary(target as *const u8);
+        let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         if !is_protected {
+            // Lot 2.3a (D7): a member of an open tree window, from outside
+            // its tree (PID 1 included, but `systemd-shutdown`).
+            // the target as a scalar (a global function refuses the hook's
+            // typed pointer)
+            if crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(crate::window_tree::raw_arg(ctx, 0))) != 0
+                && !(caller_tgid == 1 && pid1_is_final_shutdown())
+            {
+                crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);
+                return -EPERM;
+            }
             // Lab PR 225: a stop or kill of another security tool, reported.
             observe_defender(target_tgid, sig);
             return 0;
         }
 
-        let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         // Self-signal, or an exempt process signalling a protected one (the
         // watchdog's stuck recovery, the agent's own supervision of the
         // watchdog and of its workers). An attacker's shell is in neither set;
         // R14a: a worker is protected, not exempt — it may not signal the
         // agent, the watchdog or another worker.
         if caller_tgid == target_tgid || is_exempt_pid(caller_tgid) {
+            let_through(sig, target_tgid);
+            return 0;
+        }
+        // Lot 2.3a: a process running our binary that holds no role
+        // yet (`install.sh`'s `timeout 60 northnarrow-agent --own-dropins
+        // check`) may be signalled by a process the window lifts for — a
+        // member of the tree, or anyone under the host-wide grant — as a
+        // registered one never is.
+        if !registered && crate::inode_protect::override_active() {
+            let_through(sig, target_tgid);
             return 0;
         }
 
@@ -285,12 +322,24 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         // `systemctl stop`/`kill`/`restart` outside a window is refused like
         // a root shell's `kill`: systemd only relays root's request.
         if caller_tgid == 1 && (pid1_granted(sig) || pid1_is_final_shutdown()) {
+            let_through(sig, target_tgid);
             return 0;
         }
 
-        // Evidence: a refused signal is an attempt on the agent (rate-limited).
-        crate::inode_protect::emit_task_denial(FS_OP_SIGNAL, sig as u64, target_tgid);
+        // Evidence: a refused signal is an attempt on the agent (rate-limited
+        // by caller and signal: lot 2.3a).
+        crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);
         -EPERM
+    }
+}
+
+/// Lot 2.3a (lot 330 a): a signal let through to a protected process is
+/// recorded when its default action ends or stops it (minor: nothing was
+/// refused).
+#[inline(always)]
+fn let_through(sig: c_int, target_tgid: u32) {
+    if fatal_or_stop_by_default(sig) {
+        crate::inode_protect::emit_signal(FS_OP_FATAL_SIGNAL, sig as u32, target_tgid);
     }
 }
 
@@ -301,9 +350,8 @@ fn pid1_granted(sig: c_int) -> bool {
 
 /// The live [`KILL_GRANT`] of a signed trusted-installer window lets `sig`
 /// through: one of its stop signals, before its deadline, under this
-/// boot's session nonce. `task_kill` asks it for PID 1 only; lot 293's
-/// `file_send_sigiotask` hook (`crate::sigio_guard`), which has no sender to
-/// compare, for any delivery.
+/// boot's session nonce. `task_kill` asks it for PID 1 only (lot 2.3a: the
+/// signal through a file's owner no longer asks it, C112w).
 #[inline(always)]
 pub(crate) fn kill_grant_allows(sig: c_int) -> bool {
     let session = match AGENT_SESSION.get(0) {

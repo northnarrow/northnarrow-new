@@ -2630,11 +2630,12 @@ print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_er
     if selected C96; then
         run_case C96 "/proc/1/mem opened for writing (nothing written, no window)" denied "deny=ptrace" 0 -- nnpy file open-append /proc/1/mem
     fi
-    # C95b: inside a window a debugger attaches to PID 1 (the same seize,
-    # detached by the tracer's exit), and nothing is refused.
+    # C95b: lot 2.3a (the C95b critique): inside a window too the attach to
+    # PID 1 is refused, signed — no flow attaches to PID 1, and code placed
+    # in PID 1 would keep PID 1's exemptions after the window.
     if selected C95b; then
         grant_window 30; sleep 2
-        EV_FORBID="deny=ptrace" run_case C95b "PTRACE_SEIZE of PID 1 inside a trusted-installer window" allowed "" 0 -- python3 -I -c 'import ctypes,errno,sys
+        run_case C95b "PTRACE_SEIZE of PID 1 inside a trusted-installer window (refused from lot 2.3a)" denied "deny=ptrace" 0 -- python3 -I -c 'import ctypes,errno,sys
 libc=ctypes.CDLL(None,use_errno=True)
 r=libc.ptrace(0x4206,1,None,None)
 print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_errno(),"?"))'
@@ -3138,9 +3139,13 @@ fi
 #   C112c FIOSETOWN + FIOASYNC on a socket + SIGKILL to the agent;
 #   C112d F_SETOWN_EX(F_OWNER_PGRP), the agent's own process group, SIGKILL
 #         (refused for the agent; skipped if it leads no group of its own);
-#   C112w inside a window: F_SETSIG(SIGCONT) — a stop signal of the window's
-#         grant, harmless — let through and not recorded; C112x the plain
-#         SIGIO inside the same window, still refused.
+#   C112w inside a window: F_SETSIG(SIGCONT) — refused from lot 2.3a (the
+#         C112w critique: this path has no sender a window per process tree
+#         could scope, and no flow signals through a file's owner). A
+#         SIGCONT leaves no trace in its target and the kernel tells the
+#         writer nothing, so the writer's outcome is "allowed" and the
+#         refusal is the record it must leave (deny=sigio); C112x the plain
+#         SIGIO inside the same window, refused (the target's survival).
 # Each refusal the target's survival shows (a delivered SIGKILL or SIGIO
 # ends it) and the signed deny=sigio record names.
 sigio_case() {   # <id> <title> <agent|watchdog> <how> <SIG>
@@ -3169,8 +3174,9 @@ else
     if selected_any C112w,C112x; then
         grant_window 30; sleep 2
         P=$(agent_pid); S=$(proc_start "$P")
-        EV_FORBID="deny=sigio" POST=$(post post_proc "${P:-0}" "${S:-0}" northnarrow-age) \
-            run_case C112w "F_SETSIG(SIGCONT) through a pipe's owner inside a window (the grant's stop signal)" allowed "" 0 -- nnpy sigio "${P:-0}" northnarrow-age "${S:-0}" pipe CONT
+        # the writer sees "sent" either way: the refusal is its deny=sigio record
+        POST=$(post post_proc "${P:-0}" "${S:-0}" northnarrow-age) \
+            run_case C112w "F_SETSIG(SIGCONT) through a pipe's owner inside a window (refused in the kernel from lot 2.3a: its record)" allowed "deny=sigio" 0 -- nnpy sigio "${P:-0}" northnarrow-age "${S:-0}" pipe CONT
         sigio_case C112x "SIGIO through a pipe's owner inside a window (not the grant's)" agent pipe IO
         wait_no_window 90 || echo "C112w: its window not seen ended within 90 s" >&2
     fi

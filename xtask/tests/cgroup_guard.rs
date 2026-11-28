@@ -338,7 +338,8 @@ fn the_inode_deny_lets_only_init_remove_a_unit_cgroup_and_signs_by_effect() {
         d,
         &[
             "if flags & required == 0 {",
-            "if override_active() {",
+            // lot 2.3a: the key files are lifted by no window
+            "if override_active() && !window_kept(&key) {",
             "if crate::task_kill::is_exempt_pid(caller_tgid) {",
             "if fs_protect_init_may(operation, flags, caller_tgid) {",
             "Some((fs_protect_denied_op(operation, flags), key))",
@@ -628,14 +629,12 @@ fn the_task_settings_denies_refuse_another_processs_change() {
             "crate::task_kill::is_protected_pid(target_tgid) || crate::bpf_defense::task_runs_own_binary(target)"
         )
     );
-    in_order(
-        body(&p, "caller_may_access"),
-        &[
-            "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return true;\n    }",
-            "if init_attach && crate::inode_protect::override_active() {\n        return true;\n    }",
-        ],
-    )
-    .unwrap();
+    assert!(body(&p, "caller_may_access").contains(
+        "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return true;\n    }"
+    ));
+    // lot 2.3a (the C95b critique): no window lets a debugger attach to
+    // PID 1 any more
+    assert!(!body(&p, "caller_may_access").contains("override_active"));
     // the write deny leaves on a file that is not a regular one, before
     // its lookup
     let i = code("agent-ebpf/src/inode_protect.rs");

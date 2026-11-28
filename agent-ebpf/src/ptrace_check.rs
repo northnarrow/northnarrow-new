@@ -139,8 +139,8 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         // write back a unit's resource values and thaw a slice on the bytes
         // its `write(2)` carries; a PID 1 whose memory root could write would
         // swap them between the hook's read and the kernel's. Read-mode
-        // access (`ps`, `/proc/1/environ`) is untouched, and a window lets a
-        // debugger attach.
+        // access (`ps`, `/proc/1/environ`) is untouched; lot 2.3a: a window
+        // no longer lets a debugger attach (C95b).
         let mode: u32 = ctx.arg(1);
         let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
         if !init_attach && !target_is_protected(target_tgid, target as *const u8) {
@@ -214,9 +214,10 @@ pub(crate) fn caller_may_access(caller_tgid: u32, init_attach: bool) -> bool {
     if crate::task_kill::is_exempt_pid(caller_tgid) {
         return true;
     }
-    if init_attach && crate::inode_protect::override_active() {
-        return true;
-    }
+    // Lot 2.3a (scaffold+, the C95b critique): no window lets a debugger
+    // attach to PID 1 any more — no flow does, and code placed in PID 1
+    // keeps PID 1's exemptions after the window.
+    let _ = init_attach;
 
     // BUG-011 (PHASE 15.1): trusted-observer carve-out. The agent
     // userland registers the watchdog's verified PID here AFTER

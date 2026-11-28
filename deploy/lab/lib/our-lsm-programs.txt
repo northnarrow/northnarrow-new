@@ -75,3 +75,10 @@ task_setioprio_deny
 task_setnice_deny
 task_setrlimit_deny
 task_setscheduler_deny
+tree_bprm_check
+tree_bprm_commit
+tree_fd_receive
+tree_mmap_file
+tree_mprotect
+tree_ptrace
+tree_task_free

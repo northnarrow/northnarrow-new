@@ -444,7 +444,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    `cpu_confined` High; the review of #558: a program the content judge \
                    refuses outside a window, loaded inside one — `bpf_held_load` High, not \
                    refused — and its later runs and attaches outside a window, through any \
-                   descriptor, refused — `bpf_held_use` High). Issued by process_event outside \
+                   descriptor, refused — `bpf_held_use` High). Lot 2.3a: a rename of an \
+                   ancestor of the agent's paths, a write-open of a block device under its \
+                   files (and, under the kernel-read option, a read-open), a descriptor \
+                   received across a trusted-installer window's tree (High); a signal that \
+                   ends or stops a protected process let through to it — PID 1 under the \
+                   window's stop grant or as systemd-shutdown, the agent's family, the process \
+                   itself — `fatal_signal`, Low, not refused. Issued by process_event outside \
                    the engine.",
         false_positives: "An administrator's `systemctl stop` or `kill` of the agent, or an \
                           upgrade, outside a trusted-installer window; a debugger or \
@@ -472,6 +478,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::a_refused_sigio_names_the_path_and_not_an_arming_process",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::the_window_tree_s_refusals_are_named_and_a_fatal_signal_let_through_is_low",
             "deploy/lab/adversarial/anti-tamper.sh::case C112",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause",
@@ -488,6 +495,43 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       /proc/<pid>/mem access on the agent is the injection attempt the V2 rows \
                       TQ13 and TQ15 expect denied (T1055.008, T1055.009); a read of the \
                       signing key is T1552.004.",
+    },
+    // Lot 2.3a: the trusted-installer window's own ring
+    RuleDoc {
+        id: "NN-L-AT-002_TreeWindowRecord",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::AntiTamper],
+        data_components: &["DC0035", "DC0021", "DC0055"],
+        observes: "Every record of the trusted-installer window's own ring (WINDOW_EVENTS), \
+                   with the actor's tgid and start, the window's generation and the ring's \
+                   per-CPU sequence number: a process outside the window's tree refused while \
+                   the window is open (outsider-during-window, High, never lower — its denial is \
+                   also NN-L-AT-001's), a member the window keeps a refusal for (High), a \
+                   member that left the tree — traced, under a seccomp filter, outside the \
+                   initial namespaces, an executed or mapped file that fails the exec rule (its \
+                   verdict named), a loader or interpreter variable in its environment — or a \
+                   member's child left outside a full tree (exec-evicted, High, never lower), \
+                   and the kernel's close of the window when its root exits or leaves the tree \
+                   (Low). Issued by process_event outside the engine.",
+        false_positives: "An installer whose tree legitimately runs a step under strace, in a \
+                          container or from /tmp is evicted and recorded High: by design, the \
+                          window lifts nothing for such a step (run it outside the window). The \
+                          close at the root's exit is the expected end of every window (Low). \
+                          Log only: what the record names already happened in the kernel.",
+        how_to_test: "Open a trusted-installer window and, from a shell outside its tree, \
+                      `rm` one of the agent's protected files (an outsider refused, High); or \
+                      run `env LD_PRELOAD=/lib/x.so true` inside the tree (an eviction, High); \
+                      let the window's root exit (the close, Low).",
+        tests: &[
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_window_record_is_signed_high_by_its_class_and_the_close_low",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_window_record_of_a_never_softened_class_or_kind_is_never_below_high",
+            "crates/nn-model/src/event.rs::a_window_ring_record_becomes_a_window_record_event",
+        ],
+        attack_note: "An outsider's attempt on the agent or the installer's tree during the \
+                      window is T1685; a member evicted for being traced is the injection \
+                      T1055.008 points at, one evicted for a loader variable in its \
+                      environment T1574.006. The refusal itself is NN-L-AT-001's record.",
     },
     // ── exploit post-condition guard (lab PR 219, experimental) ─────
     RuleDoc {

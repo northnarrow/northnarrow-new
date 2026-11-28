@@ -12,8 +12,15 @@
 //! Not in the engine's rule list: `process_event` short-circuits every
 //! `FsProtectDenial` before the engine (a kernel deny is not re-evaluated)
 //! and calls this rule directly in that arm.
+//!
+//! NN-L-AT-002 (lot 2.3a) — every record of the trusted-installer window's
+//! own ring (`Event::WindowRecord`) becomes a signed detection too, its
+//! severity by its context class; outside the engine as well, called by
+//! `process_event` in that event's arm.
 
-use nn_model::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
+use nn_model::{
+    Event, FsProtectOperation, ResponseAction, Severity, Verdict, WindowClass, WindowRecordKind,
+};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{Rule, rules::build_verdict};
@@ -667,6 +674,52 @@ impl Rule for NnLAt001AntiTamperDenial {
                  — its page stores would reach the file with no further check, inside a \
                  trusted-installer window too"
             ),
+            // Lot 2.3: the ancestors of the agent's paths, the block devices
+            // under its files.
+            FsProtectOperation::AncestorRename => format!(
+                "to rename or exchange an ancestor directory of the agent's paths (inode \
+                 {target_dev}:{target_ino}) outside the agent's family and a trusted-installer \
+                 window's lift — moved, the paths its binaries, units and keys are found by \
+                 would lead to another tree"
+            ),
+            FsProtectOperation::BdevWrite => format!(
+                "to open for writing a block device that backs the agent's files (device node \
+                 inode {target_dev}:{target_ino}) — its blocks written under the filesystem, \
+                 past every inode hook"
+            ),
+            FsProtectOperation::BdevRead => format!(
+                "to open for reading a block device that backs the agent's files (device node \
+                 inode {target_dev}:{target_ino}) under the kernel-read option — the agent's \
+                 signing key read from the raw blocks, past the key's own read deny"
+            ),
+            // Lot 2.3a (lot 330 a): not refused — a fatal signal let through.
+            FsProtectOperation::FatalSignal => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) sent signal {target_dev}, whose default action ends or \
+                     stops a process, to protected pid {target_ino}; let through (not refused): \
+                     PID 1 under the trusted-installer window's stop grant or as \
+                     systemd-shutdown, the agent's own family, or the process itself. Recorded \
+                     so that every end or stop of a protected process has its record."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
+            // Lot 2.3a: the tree window's boundary, both ways.
+            FsProtectOperation::FdReceive => format!(
+                "to receive, while a trusted-installer window's tree is open, {} from across \
+                 the tree's boundary (SCM_RIGHTS, pidfd_getfd, binder) — the kernel does not \
+                 say who sent it, so the boundary is closed both ways",
+                if *target_dev == 0 && *target_ino == 0 {
+                    "a descriptor of an io_uring ring".to_string()
+                } else {
+                    format!("a descriptor of protected inode {target_dev}:{target_ino}")
+                }
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -680,6 +733,197 @@ impl Rule for NnLAt001AntiTamperDenial {
             Severity::High,
             &reasoning,
         ))
+    }
+}
+
+/// Lot 2.3a — NN-L-AT-002: every record of the trusted-installer window's
+/// own ring (`Event::WindowRecord`) becomes a signed detection, its
+/// severity by its context class (`docs/design/ANTITAMPER_TRUST_MODEL.md`,
+/// "Trusted-installer window per process tree", section 7): an outsider
+/// refused while the window is open, a member the window keeps a refusal
+/// for, a member that left the tree — High, never lower
+/// ([`window_record_severity`]); the window's close by the kernel and its
+/// other lifecycle records — Low. Log only: what the record names already
+/// happened in the kernel (the refusal, the member's lift gone, the window
+/// closed). An outsider's refusal is also its own denial record, signed by
+/// NN-L-AT-001 with the caller's name and weighed by the posture; this one
+/// is the window's account of it, never coalesced.
+///
+/// Not in the engine's rule list, as NN-L-AT-001: `process_event` calls it
+/// in the `WindowRecord` arm.
+pub struct NnLAt002TreeWindowRecord;
+
+impl Rule for NnLAt002TreeWindowRecord {
+    fn id(&self) -> &'static str {
+        "NN-L-AT-002_TreeWindowRecord"
+    }
+    fn name(&self) -> &'static str {
+        "Trusted-installer window record: outsider refused, member evicted, window closed"
+    }
+    fn category(&self) -> &'static str {
+        "anti_tamper"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            // an outsider's attempt on the agent or the installer's tree
+            AttackRef::new(Tactic::DefenseImpairment, "T1685"),
+            // a member traced, its lift taken away
+            AttackRef::new(Tactic::Stealth, "T1055.008"),
+            // a member executed with a loader variable in its environment
+            AttackRef::new(Tactic::Stealth, "T1574.006"),
+        ];
+        ATTACK
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::WindowRecord {
+            tgid,
+            start_ticks,
+            generation,
+            kind,
+            class,
+            operation,
+            detail,
+            seq,
+            cpu,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let who = format!("process {tgid} (start {start_ticks})");
+        let what = match kind {
+            WindowRecordKind::OutsiderRefused => format!(
+                "{who}, outside the tree of the open trusted-installer window (generation \
+                 {generation}), was refused {} (target {detail}: an inode number, or a \
+                 process's tgid) — what the window lifts for its tree stays refused for every \
+                 other process. The refusal is signed by NN-L-AT-001 too, with its caller's name.",
+                operation.map_or_else(|| "an operation".to_string(), |op| format!("`{op}`"))
+            ),
+            WindowRecordKind::Eviction if *detail & 0xff == common::window_tree::EVICT_FULL => {
+                format!(
+                    "{who}, a child of a member of the trusted-installer window's tree \
+                     (generation {generation}), was left outside the tree: the members' map is \
+                     full (fail closed: the window lifts nothing for it, and the installer may \
+                     fail where it needs it)."
+                )
+            }
+            WindowRecordKind::Eviction => format!(
+                "{who} left the tree of the trusted-installer window (generation {generation}): \
+                 {}. The window lifts nothing for it any more, nor for what it forks from now \
+                 on: what it does is refused as any other process's.",
+                eviction_words(*detail)
+            ),
+            WindowRecordKind::Close => format!(
+                "The kernel closed the trusted-installer window (generation {generation}): {}. \
+                 Nothing is lifted for its tree from now on.",
+                match *detail {
+                    common::window_tree::CLOSE_ROOT_EXIT => format!("its root, {who}, exited"),
+                    common::window_tree::CLOSE_ROOT_EVICTED => {
+                        format!("its root, {who}, left the tree")
+                    }
+                    d => format!("cause {d}, {who}"),
+                }
+            ),
+            other => format!(
+                "Trusted-installer window record `{other}` of {who} (generation {generation}, \
+                 detail {detail})."
+            ),
+        };
+        let reasoning = format!(
+            "{what} Context: {class}. Window ring record {seq} of CPU {cpu} (a gap in a CPU's \
+             numbers is a record the ring could not take)."
+        );
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            window_record_severity(*kind, *class),
+            &reasoning,
+        ))
+    }
+}
+
+/// Lot 2.3a: a window record's severity (the design's section 7). A class
+/// the window never softens (an outsider's refusal, a kept refusal, an
+/// eviction: `wire::window_class_never_softened`) is High; so is an
+/// outsider's refusal or an eviction whatever its class says, and a kind
+/// or a class this build does not know (never below what it may be). The
+/// window's close and its other lifecycle records (the in-tree, PID-1-lease
+/// and no-window classes) are Low.
+pub fn window_record_severity(kind: WindowRecordKind, class: WindowClass) -> Severity {
+    let never_softened = class.never_softened()
+        || matches!(
+            kind,
+            WindowRecordKind::OutsiderRefused
+                | WindowRecordKind::Eviction
+                | WindowRecordKind::Unknown(_)
+        )
+        || matches!(class, WindowClass::Unknown(_));
+    if never_softened {
+        Severity::High
+    } else {
+        Severity::Low
+    }
+}
+
+/// Lot 2.3a: why a member left the tree — the eviction record's `detail`:
+/// its low byte the reason (`common::window_tree::EVICT_*`), its second
+/// byte the file's verdict for an exec or a mapping.
+fn eviction_words(detail: u64) -> String {
+    use common::window_tree::{
+        EVICT_ENV, EVICT_EXEC, EVICT_MAP, EVICT_NAMESPACE, EVICT_SECCOMP, EVICT_TRACED,
+        EVICT_UNREAD,
+    };
+    let code = ((detail >> 8) & 0xff) as u32;
+    match detail & 0xff {
+        EVICT_TRACED => "it is traced (ptrace), by an outsider's tracer or a member's".to_string(),
+        EVICT_SECCOMP => "it runs under a seccomp filter, which can change what its calls do \
+                          (a user-notify supervisor in particular)"
+            .to_string(),
+        EVICT_NAMESPACE => "it is outside the initial user or pid namespace".to_string(),
+        EVICT_UNREAD => "a field of the per-lift test could not be read on this kernel (no lift: \
+                         a missing field is a missing hook)"
+            .to_string(),
+        EVICT_EXEC => format!(
+            "it executed a file that fails the exec rule: {}",
+            exec_code_words(code)
+        ),
+        EVICT_MAP => format!(
+            "it mapped executable code that fails the rule: {}",
+            exec_code_words(code)
+        ),
+        EVICT_ENV => "it executed with a loader or interpreter variable in its environment \
+                      (LD_PRELOAD and the like), or one the bounded read could not judge"
+            .to_string(),
+        r => format!("reason {r} (file verdict {code})"),
+    }
+}
+
+/// Lot 2.3a: an exec or mapping verdict (`common::exec_marks::CODE_*`,
+/// `common::window_tree::CODE_UNSAFE_DIR`) in words.
+fn exec_code_words(code: u32) -> String {
+    use common::exec_marks::{
+        CODE_ANONYMOUS, CODE_FOREIGN_SB, CODE_IDMAPPED, CODE_MAIN_UNMARKED, CODE_NO_NAME,
+        CODE_NOT_REGULAR, CODE_NOT_ROOT, CODE_REMOTE_FS, CODE_WRITABLE,
+    };
+    match code {
+        CODE_ANONYMOUS => "anonymous memory".to_string(),
+        CODE_MAIN_UNMARKED => "a main image without the role mark".to_string(),
+        CODE_NOT_REGULAR => "not a regular file".to_string(),
+        CODE_NOT_ROOT => "a file not owned by root of the initial user namespace".to_string(),
+        CODE_WRITABLE => "a file writable by its group or by others".to_string(),
+        CODE_NO_NAME => {
+            "a file with no name (a memfd, an O_TMPFILE, a file deleted before its use)".to_string()
+        }
+        CODE_REMOTE_FS => "a file on FUSE or a network filesystem".to_string(),
+        CODE_FOREIGN_SB => "a file on a filesystem of another user namespace".to_string(),
+        CODE_IDMAPPED => "a file reached through an idmapped mount".to_string(),
+        common::window_tree::CODE_UNSAFE_DIR => {
+            "a file in a directory writable by others or sticky (/tmp, /var/tmp, /dev/shm), or \
+             one whose directory could not be read"
+                .to_string()
+        }
+        c => format!("verdict {c}"),
     }
 }
 
@@ -1521,6 +1765,11 @@ mod tests {
             FsProtectOperation::KernelRead,
             FsProtectOperation::PerfEvent,
             FsProtectOperation::SharedMap,
+            // lot 2.3a
+            FsProtectOperation::AncestorRename,
+            FsProtectOperation::BdevWrite,
+            FsProtectOperation::BdevRead,
+            FsProtectOperation::FdReceive,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -2038,6 +2287,229 @@ mod tests {
         let p = r(FsProtectOperation::SysctlRootProg);
         assert!(p.contains("(id 709)") && p.contains("Not refused"), "{p}");
         assert!(!p.contains("refused it"), "{p}");
+    }
+
+    /// Lot 2.3a (named): the lot's refusals are named by what they would
+    /// have done — an ancestor of the agent's paths moved, a block device
+    /// under its files opened, a descriptor taken across a tree window's
+    /// boundary (an io_uring ring said as such) — High; a fatal signal let
+    /// through to a protected process refuses nothing and is Low.
+    #[test]
+    fn the_window_tree_s_refusals_are_named_and_a_fatal_signal_let_through_is_low() {
+        let r = |e: &Event| NnLAt001AntiTamperDenial.evaluate(e).expect("verdict");
+        for (op, words) in [
+            (FsProtectOperation::AncestorRename, "an ancestor directory"),
+            (FsProtectOperation::BdevWrite, "block device"),
+            (FsProtectOperation::BdevRead, "kernel-read option"),
+            (FsProtectOperation::FdReceive, "protected inode 9:709"),
+        ] {
+            let v = r(&denial(op));
+            assert_eq!(v.severity, Severity::High, "{op}");
+            assert!(
+                v.reasoning.contains(words) && v.reasoning.contains("the kernel refused it"),
+                "{op}: {}",
+                v.reasoning
+            );
+        }
+        let mut ring = denial(FsProtectOperation::FdReceive);
+        if let Event::FsProtectDenial {
+            target_dev,
+            target_ino,
+            ..
+        } = &mut ring
+        {
+            (*target_dev, *target_ino) = (0, 0);
+        }
+        assert!(r(&ring).reasoning.contains("an io_uring ring"));
+        let v = r(&denial(FsProtectOperation::FatalSignal));
+        assert_eq!(v.severity, Severity::Low);
+        assert!(matches!(v.action, ResponseAction::Log));
+        assert!(
+            v.reasoning.contains("sent signal 9")
+                && v.reasoning.contains("protected pid 709")
+                && v.reasoning.contains("let through (not refused)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    fn window_record(kind: WindowRecordKind, class: WindowClass, detail: u64) -> Event {
+        Event::WindowRecord {
+            tgid: 4242,
+            start_ticks: 77,
+            generation: 7,
+            kind,
+            class,
+            operation: (kind == WindowRecordKind::OutsiderRefused)
+                .then_some(FsProtectOperation::Unlink),
+            detail,
+            seq: 12,
+            cpu: 1,
+            boot_ns: 5,
+        }
+    }
+
+    /// Lot 2.3a (named): NN-L-AT-002 signs every window ring record, its
+    /// severity by its class — an outsider refused, a kept refusal, a
+    /// member evicted (the reason and the file's verdict named) or a child
+    /// left outside a full tree High; the kernel's close of the window Low.
+    /// It judges nothing else, and NN-L-AT-001 judges no window record.
+    #[test]
+    fn a_window_record_is_signed_high_by_its_class_and_the_close_low() {
+        use common::window_tree::{
+            CLOSE_ROOT_EVICTED, CLOSE_ROOT_EXIT, CODE_UNSAFE_DIR, EVICT_ENV, EVICT_EXEC,
+            EVICT_FULL, EVICT_TRACED,
+        };
+        let rule = NnLAt002TreeWindowRecord;
+        let v = |e: &Event| rule.evaluate(e).expect("verdict");
+        let out = v(&window_record(
+            WindowRecordKind::OutsiderRefused,
+            WindowClass::Outsider,
+            709,
+        ));
+        assert_eq!(out.rule_id, "NN-L-AT-002_TreeWindowRecord");
+        assert_eq!(out.severity, Severity::High);
+        assert!(matches!(out.action, ResponseAction::Log));
+        for words in [
+            "process 4242 (start 77), outside the tree",
+            "generation 7",
+            "was refused `unlink` (target 709",
+            "Context: outsider-during-window.",
+            "Window ring record 12 of CPU 1",
+        ] {
+            assert!(out.reasoning.contains(words), "{words}: {}", out.reasoning);
+        }
+        let exec = v(&window_record(
+            WindowRecordKind::Eviction,
+            WindowClass::ExecEvicted,
+            EVICT_EXEC | (u64::from(CODE_UNSAFE_DIR) << 8),
+        ));
+        assert_eq!(exec.severity, Severity::High);
+        assert!(
+            exec.reasoning.contains("left the tree")
+                && exec.reasoning.contains("fails the exec rule")
+                && exec.reasoning.contains("writable by others or sticky")
+                && exec.reasoning.contains("Context: exec-evicted."),
+            "{}",
+            exec.reasoning
+        );
+        let env = v(&window_record(
+            WindowRecordKind::Eviction,
+            WindowClass::ExecEvicted,
+            EVICT_ENV,
+        ));
+        assert!(env.reasoning.contains("LD_PRELOAD"), "{}", env.reasoning);
+        let traced = v(&window_record(
+            WindowRecordKind::Eviction,
+            WindowClass::ExecEvicted,
+            EVICT_TRACED,
+        ));
+        assert!(traced.reasoning.contains("traced (ptrace)"));
+        let full = v(&window_record(
+            WindowRecordKind::Eviction,
+            WindowClass::Outsider,
+            EVICT_FULL,
+        ));
+        assert_eq!(full.severity, Severity::High);
+        assert!(
+            full.reasoning.contains("left outside the tree")
+                && full.reasoning.contains("members' map is full"),
+            "{}",
+            full.reasoning
+        );
+        for (detail, words) in [
+            (CLOSE_ROOT_EXIT, "its root, process 4242 (start 77), exited"),
+            (
+                CLOSE_ROOT_EVICTED,
+                "its root, process 4242 (start 77), left the tree",
+            ),
+        ] {
+            let c = v(&window_record(
+                WindowRecordKind::Close,
+                WindowClass::NoWindow,
+                detail,
+            ));
+            assert_eq!(c.severity, Severity::Low);
+            assert!(
+                c.reasoning
+                    .contains("The kernel closed the trusted-installer window")
+                    && c.reasoning.contains(words),
+                "{}",
+                c.reasoning
+            );
+        }
+        // a kept refusal stays High whatever its kind
+        let kept = v(&window_record(
+            WindowRecordKind::Close,
+            WindowClass::Kept,
+            CLOSE_ROOT_EXIT,
+        ));
+        assert_eq!(kept.severity, Severity::High);
+        // each rule its own events
+        assert!(rule.evaluate(&denial(FsProtectOperation::Unlink)).is_none());
+        assert!(
+            NnLAt001AntiTamperDenial
+                .evaluate(&window_record(
+                    WindowRecordKind::OutsiderRefused,
+                    WindowClass::Outsider,
+                    709
+                ))
+                .is_none()
+        );
+        assert!(!rule.attack().is_empty());
+    }
+
+    /// Lot 2.3a: the window never softens an outsider's record, a kept
+    /// refusal or an eviction — High for every pairing of such a class or
+    /// kind, and for a kind or class this build does not know; Low only for
+    /// the lifecycle's records of the in-tree, PID-1-lease and no-window
+    /// classes.
+    #[test]
+    fn a_window_record_of_a_never_softened_class_or_kind_is_never_below_high() {
+        let kinds = [
+            WindowRecordKind::Grant,
+            WindowRecordKind::Renewal,
+            WindowRecordKind::Close,
+            WindowRecordKind::ControlledStop,
+            WindowRecordKind::LeaseArmed,
+            WindowRecordKind::LeaseUsed,
+            WindowRecordKind::Eviction,
+            WindowRecordKind::GraceClose,
+            WindowRecordKind::OutsiderRefused,
+            WindowRecordKind::Unknown(200),
+        ];
+        let classes = [
+            WindowClass::NoWindow,
+            WindowClass::Outsider,
+            WindowClass::Kept,
+            WindowClass::InTree,
+            WindowClass::Pid1Lease,
+            WindowClass::ExecEvicted,
+            WindowClass::Unknown(200),
+        ];
+        for kind in kinds {
+            for class in classes {
+                let high = matches!(
+                    class,
+                    WindowClass::Outsider
+                        | WindowClass::Kept
+                        | WindowClass::ExecEvicted
+                        | WindowClass::Unknown(_)
+                ) || matches!(
+                    kind,
+                    WindowRecordKind::OutsiderRefused
+                        | WindowRecordKind::Eviction
+                        | WindowRecordKind::Unknown(_)
+                );
+                let want = if high { Severity::High } else { Severity::Low };
+                assert_eq!(window_record_severity(kind, class), want, "{kind} {class}");
+                let v = NnLAt002TreeWindowRecord
+                    .evaluate(&window_record(kind, class, 1))
+                    .expect("verdict");
+                assert_eq!(v.severity, want, "{kind} {class}");
+            }
+        }
     }
 
     /// Lot 386 (named, the rc12 soak's R18: networkd's monitor re-attached

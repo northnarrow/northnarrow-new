@@ -694,6 +694,21 @@ impl FallbackDir {
 /// deny hooks until the next start's stale-pid scan. No pinned map: nothing
 /// to withdraw.
 pub(crate) fn withdraw_registration(bpffs_root: &Path) {
+    // Lot 2.3a: the enablement links this start registered first, while its
+    // pid is still a protected one (`filesystem::withdraw_enablement_links`:
+    // a refused start leaves `systemctl disable` and a reboot as the way out).
+    match northnarrow_agent::anti_tamper::filesystem::withdraw_enablement_links(bpffs_root) {
+        Ok(0) => {}
+        Ok(n) => info!(
+            links = n,
+            "anti-tamper: the refused start's enablement links withdrawn"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper: the refused start's enablement links NOT withdrawn — `systemctl \
+             disable` of the units stays refused until a reboot"
+        ),
+    }
     if !bpffs_root
         .join(northnarrow_agent::anti_tamper::PROTECTED_PIDS_MAP_NAME)
         .exists()
@@ -1834,5 +1849,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         withdraw_registration(dir.path());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Lot 2.3a: every refusal's tail withdraws the enablement links the
+    /// start registered, and before its own pid (after it, the start's
+    /// handle on the pinned map is no longer its family's).
+    #[test]
+    fn a_refused_start_withdraws_its_enablement_links_before_its_pid() {
+        let src = include_str!("refusal.rs");
+        let body = &src[src.find("pub(crate) fn withdraw_registration").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let links = body
+            .find("filesystem::withdraw_enablement_links(bpffs_root)")
+            .expect("the refused start withdraws its enablement links");
+        let pid = body.find("evict_protected_pid(").expect("and its pid");
+        assert!(
+            links < pid,
+            "the links first, while the pid is a protected one"
+        );
     }
 }

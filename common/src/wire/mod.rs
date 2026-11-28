@@ -1108,6 +1108,7 @@ impl FsGrantV2 {
     /// agent's heartbeat younger than [`WINDOW_AGENT_GRACE_NS`] (a
     /// heartbeat from the future — a slot written by hand — is no
     /// heartbeat).
+    #[inline(always)]
     pub fn active(&self, now_boot_ns: u64, session: u32) -> bool {
         self.nonce != 0
             && self.nonce == session
@@ -1124,6 +1125,7 @@ impl FsGrantV2 {
     /// no io_uring worker (`io_worker`: a kernel thread that runs another
     /// process's queued requests), and the window is open. The kernel
     /// hooks' test (lot 2.3), kept here so that it is unit-tested once.
+    #[inline(always)]
     pub fn lifts_for(
         &self,
         member: Option<&TreeMember>,
@@ -1341,6 +1343,13 @@ pub const INODE_EXT_NO_RENAME: u8 = 0b01;
 /// window lifts its write, rename, removal or read (the key's) for anyone
 /// but the agent's family, whose own path the key rotation is.
 pub const INODE_EXT_WINDOW_KEPT: u8 = 0b10;
+
+/// Lot 2.3a: the inode is the key files' directory or one of its ancestors
+/// (`/etc/northnarrow`, `/etc`): its own rename, exchange or removal is
+/// kept by any window, members included (the agent loads `admin.pub` by
+/// its path). Not [`INODE_EXT_WINDOW_KEPT`]: the entries inside the
+/// directory stay the window's to lift (an installer writes there).
+pub const INODE_EXT_DIR_KEPT: u8 = 0b100;
 
 /// Whether the rename or exchange of an inode whose second word is `ext`
 /// is refused for its own sake (an ancestor), outside a window.
@@ -1970,7 +1979,7 @@ pub const FS_OP_SYSRQ: u8 = 53;
 pub const FS_OP_SYSRQ_WINDOW: u8 = 54;
 
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SHARED_MAP;
+pub const FS_OP_LAST: u8 = FS_OP_FD_RECEIVE;
 
 // Lot 2.1 (S2 scaffold): the denial codes stage S2's lots will emit,
 // reserved here in their lots' order, so that two lots never take the same
@@ -2002,10 +2011,34 @@ pub const FS_OP_BDEV_WRITE: u8 = 61;
 /// Lot 2.3: a read-open of such a block device, refused under the
 /// kernel-read option ([`KERNEL_READ_BLOCK_DEVICE`]).
 pub const FS_OP_BDEV_READ: u8 = 62;
+/// Lot 2.3a (lot 330 a): NOT a refusal — a signal whose default action
+/// ends or stops a process (`window_tree::fatal_or_stop_by_default`), let
+/// through to a protected process (PID 1 under the window's stop grant or
+/// as `systemd-shutdown`, the agent's family, the process itself):
+/// `target_dev` the signal, `target_ino` the target's tgid. Minor; the
+/// refused ones are [`FS_OP_SIGNAL`].
+pub const FS_OP_FATAL_SIGNAL: u8 = 63;
+/// Lot 2.3a (the design's section 4, "Descriptors"): while a tree window is
+/// open, a descriptor of an io_uring ring or of a protected inode received
+/// (`file_receive`: `SCM_RIGHTS`, `pidfd_getfd`, binder) by a process
+/// outside the agent's family, refused — the kernel does not say who sent
+/// it, so the tree's boundary is closed both ways. The target the inode
+/// (0:0 for a ring).
+pub const FS_OP_FD_RECEIVE: u8 = 64;
+
+/// Lot 2.3a: the pinned map of the block devices that back the agent's
+/// files, keyed by the kernel's `dev_t` (`MKDEV`: major << 20 | minor), as
+/// a device node's `i_rdev` holds it; the value
+/// `window_tree::BDEV_BACKS_PROTECTED`. Written by the agent at its start.
+pub const PROTECTED_BDEVS_MAP_NAME: &str = "PROTECTED_BDEVS";
+/// Its capacity: a filesystem's device, the disk it is a partition of, and
+/// the devices under a device-mapper or md stack, for the few filesystems
+/// the agent's paths live on.
+pub const PROTECTED_BDEVS_MAX: u32 = 32;
 
 /// The S2 codes, with the name their records carry and the lot that emits
 /// them; those of a lot that has landed are at or below [`FS_OP_LAST`].
-pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 8] = [
+pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 10] = [
     (FS_OP_ROLE_UNMARKED, "role_unmarked", "2.2"),
     (FS_OP_BPF_CGROUP_ATTACH, "bpf_cgroup_attach", "2.2"),
     (FS_OP_KERNEL_READ, "kernel_read", "2.2"),
@@ -2014,6 +2047,8 @@ pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 8] = [
     (FS_OP_ANCESTOR_RENAME, "ancestor_rename", "2.3"),
     (FS_OP_BDEV_WRITE, "bdev_write", "2.3"),
     (FS_OP_BDEV_READ, "bdev_read", "2.3"),
+    (FS_OP_FATAL_SIGNAL, "fatal_signal", "2.3"),
+    (FS_OP_FD_RECEIVE, "fd_receive", "2.3"),
 ];
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
@@ -2086,6 +2121,12 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             // tool's loop meets them)
             | FS_OP_BPF_CGROUP_ATTACH
             | FS_OP_KERNEL_READ
+            // lot 2.3a: a block device's read-open refused under the
+            // kernel-read option (a backup tool's loop meets it), as the
+            // key's read; a fatal signal let through (a record of what was
+            // allowed, not a refusal)
+            | FS_OP_BDEV_READ
+            | FS_OP_FATAL_SIGNAL
             | FS_OP_PERF_EVENT
     )
 }
@@ -3481,13 +3522,8 @@ mod tests {
                 "{name}"
             );
             assert!(*lot == "2.2" || *lot == "2.3", "{name}");
-            // lot 2.2's codes are emitted (named, classed); 2.3's are not yet
-            if *lot == "2.2" {
-                assert!(*code <= FS_OP_LAST, "{name}");
-            } else {
-                assert!(*code > FS_OP_LAST, "{name}");
-                assert!(!is_minor_denial(*code) && !is_sole_trace(*code), "{name}");
-            }
+            // lot 2.2's and lot 2.3a's codes are emitted (named, classed)
+            assert!(*code <= FS_OP_LAST, "{name}");
             assert_eq!(
                 S2_RESERVED_FS_OPS
                     .iter()
@@ -3497,8 +3533,14 @@ mod tests {
                 "{name}"
             );
         }
-        // the last code emitted is lot 2.2's last
-        assert_eq!(FS_OP_LAST, FS_OP_SHARED_MAP);
+        // the last code emitted is lot 2.3a's last
+        assert_eq!(FS_OP_LAST, FS_OP_FD_RECEIVE);
+        // lot 2.3a: what refuses nothing, and the read under the option, are
+        // minor; the refusals that move or write the agent's files are not
+        assert!(is_minor_denial(FS_OP_FATAL_SIGNAL) && is_minor_denial(FS_OP_BDEV_READ));
+        for c in [FS_OP_ANCESTOR_RENAME, FS_OP_BDEV_WRITE, FS_OP_FD_RECEIVE] {
+            assert!(!is_minor_denial(c) && !is_sole_trace(c), "{c}");
+        }
     }
 
     /// Lot 2.1: the window's byte is the first of the old padding — the
@@ -4039,6 +4081,12 @@ mod tests {
             FS_OP_KERNEL_READ,
             FS_OP_PERF_EVENT,
             FS_OP_SHARED_MAP,
+            // lot 2.3a
+            FS_OP_ANCESTOR_RENAME,
+            FS_OP_BDEV_WRITE,
+            FS_OP_BDEV_READ,
+            FS_OP_FATAL_SIGNAL,
+            FS_OP_FD_RECEIVE,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

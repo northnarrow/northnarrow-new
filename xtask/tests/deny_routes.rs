@@ -367,6 +367,14 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ),
     (
         "inode_protect.rs",
+        "try_inode_rename",
+        1,
+        Enforced(
+            "the rename or exchange of an ancestor of the agent's paths (/etc, /var/lib, the binaries' and the units' directories): it moves the agent's tree from under the paths it is read by; the key files' directory and its ancestors are kept by any window (lot 2.3a)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
         "try_inode_setattr",
         1,
         Enforced(OWN_FILES),
@@ -391,6 +399,14 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         "try_protected_open_deny",
         1,
         Delegated("refuse_write("),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Enforced(
+            "a foreign write-open of a block device that backs the agent's files (its key's blocks under the page cache), a read-open under the kernel-read option (lot 2.3a)",
+        ),
     ),
     (
         "inode_protect.rs",
@@ -477,6 +493,14 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         Enforced("the sysctl guard's value judge: the values refuse_sysctl guards"),
     ),
     ("task_kill.rs", "try_task_kill", 1, Enforced(AGENT)),
+    (
+        "task_kill.rs",
+        "try_task_kill",
+        1,
+        Enforced(
+            "a signal to a member of an open trusted-installer window from outside its tree, PID 1's included (lot 2.3a, D7)",
+        ),
+    ),
     ("task_limits.rs", "task_setrlimit_deny", 1, Enforced(AGENT)),
     (
         "task_limits.rs",
@@ -486,6 +510,22 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ),
     ("task_limits.rs", "task_setnice_deny", 1, Enforced(AGENT)),
     ("task_limits.rs", "task_setioprio_deny", 1, Enforced(AGENT)),
+    (
+        "window_tree.rs",
+        "tree_ptrace",
+        1,
+        Enforced(
+            "a ptrace check of a member of an open trusted-installer window from outside its tree, in either mode (a debugger, /proc/<pid>/mem, fd, environ, maps, process_vm_*, pidfd_getfd, kcmp, a perf event on its pid): what the tree runs is not changed from outside (lot 2.3a, D7)",
+        ),
+    ),
+    (
+        "window_tree.rs",
+        "tree_fd_receive",
+        1,
+        Enforced(
+            "while a tree window is open, an io_uring ring's or a protected inode's descriptor received outside the agent's family: no descriptor crosses the tree's boundary (lot 2.3a, D7)",
+        ),
+    ),
 ];
 
 /// The eBPF object's sources (all of each file: the scans read its

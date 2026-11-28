@@ -55,14 +55,16 @@ pub static WINDOW_EVENT_SEQ: PerCpuArray<u64> = PerCpuArray::pinned(1, 0);
 #[map]
 pub static WINDOW_EVENT_DROPS: PerCpuArray<u64> = PerCpuArray::pinned(1, 0);
 
-/// Write one window record (`ev`'s `seq`, `cpu` and `boot_ns` are filled
-/// here): the CPU's next sequence number, or, when the ring is full, a drop
-/// counted on this CPU (the number is spent all the same, so the gap is
-/// visible). The caller's decision never depends on the record (a refusal
-/// whose record is lost is still a refusal). Lot 2.3's hooks call it.
-#[allow(dead_code)]
+/// Write one window record: its fields, with the CPU's next sequence
+/// number, the CPU and the time filled here, straight into the ring's
+/// reservation (lot 2.3a: no copy of the record on the stack — every byte of
+/// the global functions that call it counts in the hooks' 512-byte chains),
+/// or, when the ring is full, a drop counted on this CPU (the number is
+/// spent all the same, so the gap is visible). The caller's decision never
+/// depends on the record (a refusal whose record is lost is still a
+/// refusal). Lot 2.3's hooks call it (`crate::window_tree`).
 #[inline(always)]
-pub fn emit_window_event(mut ev: WindowEventRaw) {
+pub fn emit_window_event(kind: u8, class: u8, operation: u8, generation: u64, tgid: u32, start_ticks: u64, detail: u64) {
     let seq = match WINDOW_EVENT_SEQ.get_ptr_mut(0) {
         // SAFETY: this CPU's slot of a per-CPU array, written by this
         // program alone while it runs (no preemption inside a BPF program).
@@ -72,13 +74,31 @@ pub fn emit_window_event(mut ev: WindowEventRaw) {
         },
         None => 0,
     };
-    ev.seq = seq;
-    ev.cpu = unsafe { bpf_get_smp_processor_id() };
-    ev.boot_ns = unsafe { bpf_ktime_get_boot_ns() };
-    if WINDOW_EVENTS.output(&ev, 0).is_err() {
-        if let Some(p) = WINDOW_EVENT_DROPS.get_ptr_mut(0) {
-            // SAFETY: as above.
-            unsafe { *p += 1 };
+    match WINDOW_EVENTS.reserve::<WindowEventRaw>(0) {
+        Some(mut entry) => {
+            let ev = entry.as_mut_ptr();
+            // SAFETY: the reservation is this program's, aligned and the
+            // record's size; every field is written before the submit.
+            unsafe {
+                (*ev).seq = seq;
+                (*ev).boot_ns = bpf_ktime_get_boot_ns();
+                (*ev).generation = generation;
+                (*ev).start_ticks = start_ticks;
+                (*ev).detail = detail;
+                (*ev).tgid = tgid;
+                (*ev).cpu = bpf_get_smp_processor_id();
+                (*ev).kind = kind;
+                (*ev).class = class;
+                (*ev).operation = operation;
+                (*ev)._pad = [0; 5];
+            }
+            entry.submit(0);
+        }
+        None => {
+            if let Some(p) = WINDOW_EVENT_DROPS.get_ptr_mut(0) {
+                // SAFETY: as above.
+                unsafe { *p += 1 };
+            }
         }
     }
 }

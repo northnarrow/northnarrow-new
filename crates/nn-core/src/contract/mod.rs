@@ -116,6 +116,8 @@ event_kinds! {
     TlsClientHello => Some(EventClass::Network),
     /// A canary token tripped (made by the canary detector, not a source).
     CanaryTripped => None,
+    /// Lot 2.3a: a record of the trusted-installer window's own ring.
+    WindowRecord => Some(EventClass::Tamper),
 }
 
 impl EventKind {
@@ -144,6 +146,7 @@ impl EventKind {
             Event::DnsAnswer(_) => EventKind::DnsAnswer,
             Event::TlsClientHello(_) => EventKind::TlsClientHello,
             Event::CanaryTripped { .. } => EventKind::CanaryTripped,
+            Event::WindowRecord { .. } => EventKind::WindowRecord,
         }
     }
 }

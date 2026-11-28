@@ -94,7 +94,11 @@ pub(crate) fn start(
             // lot 353 (re-check 1 of #563): the close reads the pins and the
             // units' drop-ins by path — off the runtime's worker
             nn_linux::runtime::off_the_runtime(|| {
-                installer_ticker.close_if_expired(Instant::now())
+                installer_ticker.close_if_expired(Instant::now());
+                // lot 2.3a's minimal path (lot 2.3b replaces it): the tree
+                // window's heartbeat, and its close at its deadline, at the
+                // kernel's close or at its root's end
+                installer_ticker.tree_tick(nn_linux::anti_tamper::trusted_installer::boottime_ns());
             });
         }
     });

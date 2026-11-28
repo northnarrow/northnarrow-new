@@ -462,18 +462,30 @@ unsafe fn link_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
     }
 }
 
-/// Lot 349 (the review of #558, F1): the id of the BPF program `fd` names
-/// in the caller's file table (`private_data->aux->id`). As
-/// [`link_id_of_fd`]: the file is not checked to be a program — a
-/// descriptor of anything else fails in the kernel whatever is read here.
+
+/// Lot 2.3a (scaffold+): the id of the BPF program `fd` names in the
+/// caller's file table (`private_data->aux->id`; the file is not checked to be a
+/// program — a descriptor of anything else fails in the kernel whatever is
+/// read here), as one number whose every bit is
+/// defined — [`PROG_ID_NONE`], [`PROG_ID_UNREAD`], or the id. The
+/// `Result<Option<u32>>`'s payload, undefined on its `None` path, was read
+/// after `override_active()`'s global call had clobbered its register, and
+/// every program that asks [`nn_held_use`] was refused on 5.15 to 7.0
+/// (`R4 !read_ok`).
+const PROG_ID_NONE: u64 = 1 << 32;
+const PROG_ID_UNREAD: u64 = 2 << 32;
 #[inline(always)]
-unsafe fn prog_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
+unsafe fn prog_id_word(fd: u32) -> u64 {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
-        let Some(prog) = private_of_fd(fd)? else {
-            return Ok(None);
-        };
-        prog_id_of(prog as *const c_void).map(Some).ok_or(())
+        match private_of_fd(fd) {
+            Err(()) => PROG_ID_UNREAD,
+            Ok(None) => PROG_ID_NONE,
+            Ok(Some(prog)) => match prog_id_of(prog as *const c_void) {
+                Some(id) => u64::from(id),
+                None => PROG_ID_UNREAD,
+            },
+        }
     }
 }
 
@@ -491,7 +503,7 @@ pub extern "C" fn nn_prog_tag_of_fd(fd: u64) -> u64 {
 
 /// Lot 386: the tag (`prog->tag`, the kernel's digest of the program's
 /// instructions, its maps' descriptors left out) of the BPF program `fd`
-/// names in the caller's file table. As [`prog_id_of_fd`]: the file is not
+/// names in the caller's file table. As [`prog_id_word`]: the file is not
 /// checked to be a program — what another file's data reads as is a tag no
 /// known program has.
 #[inline(always)]
@@ -523,7 +535,7 @@ unsafe fn map_of_fd(fd: u32) -> Result<Option<(u32, u32)>, ()> {
 }
 
 /// External audit EBPF-010 (lot 349: shared by [`link_id_of_fd`],
-/// [`prog_id_of_fd`] and [`map_of_fd`]): `fd`'s file's `private_data` in
+/// [`prog_id_word`] and [`map_of_fd`]): `fd`'s file's `private_data` in
 /// the caller's file table (`task->files->fdt->fd[fd]->private_data`) —
 /// `Ok(None)` for an fd out of range or closed, or a file with none.
 #[inline(always)]
@@ -589,13 +601,13 @@ pub extern "C" fn nn_held_use(fd: u64, how: u64) -> u64 {
     if caller_is_exempt() || crate::inode_protect::override_active() {
         return HELD_PASS;
     }
-    let id = match unsafe { prog_id_of_fd(fd as u32) } {
-        Ok(Some(id)) => id,
-        Ok(None) => return HELD_PASS,
-        Err(()) => {
+    let id = match unsafe { prog_id_word(fd as u32) } {
+        PROG_ID_NONE => return HELD_PASS,
+        PROG_ID_UNREAD => {
             crate::fail_open::bump(fail_open_hook::BPF);
             return HELD_PASS;
         }
+        id => id as u32,
     };
     let verdict = match unsafe { PROG_CONTENT_HELD.get(&id) } {
         Some(v) => *v,

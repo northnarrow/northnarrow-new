@@ -61,6 +61,9 @@ pub mod role_watch;
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
 /// stub the recon flagged).
 pub mod trusted_installer;
+/// Lot 2.3a: the programs of the trusted-installer window per process tree
+/// and what a tree window needs of the kernel.
+pub mod window_tree;
 
 /// Test-only mint of an [`network_isolate::UnlockToken`] for unit
 /// tests that exercise code paths consuming the capability (e.g.
@@ -746,6 +749,15 @@ fn attach_reporting(
                 .degraded
                 .push(format!("window maps not emptied at the start: {e}"));
         }
+    }
+    // Lot 2.3a: the programs of the trusted-installer window per process
+    // tree (pinned before the pin root is protected below). Without them no
+    // tree window opens (a tree grant is refused); the host-wide grant the
+    // flows use until lots 2.3b and 2.4 does not need them.
+    if let Err(why) = window_tree::attach(ebpf, &btf, pin_root) {
+        report.degraded.push(format!(
+            "tree window: not available, tree grants refused ({why})"
+        ));
     }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.

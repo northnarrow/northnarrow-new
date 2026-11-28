@@ -257,14 +257,16 @@ fn every_kind_is_listed_once_with_its_class() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), n);
-    // lot 275: NetInbound, DnsAnswer, TlsClientHello
-    assert_eq!(n, 22);
+    // lot 275: NetInbound, DnsAnswer, TlsClientHello; lot 2.3a: WindowRecord
+    assert_eq!(n, 23);
     for k in EventKind::ALL {
         assert_eq!(k.class().is_none(), DERIVED_KINDS.contains(k), "{k:?}");
     }
     assert_eq!(EventKind::FileBurst.class(), Some(EventClass::File));
     assert_eq!(EventKind::DnsFlood.class(), Some(EventClass::Network));
     assert_eq!(EventKind::SensorFlood.class(), Some(EventClass::Tamper));
+    // lot 2.3a: the window ring's records wait at P0 with the denials
+    assert_eq!(EventKind::WindowRecord.class(), Some(EventClass::Tamper));
 }
 
 /// One contract per class, in the bus's order, with the bus's queue, its

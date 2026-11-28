@@ -381,9 +381,9 @@ pub(super) fn emit_audit_for(
             )
         }
         // Lot 2.1 (S2 scaffold): the grant for one process tree — its row
-        // names the root the signed scope gives, whatever the outcome (the
-        // window is armed from lot 2.3; until then a verified request is
-        // `unknown_operation`).
+        // names the root the signed scope gives, whatever the outcome. Lot
+        // 2.3a's minimal path arms it: `success`, or `failure` with
+        // `ActionFailed` when it is refused (the reason in its own row).
         (
             AdminMessage::TrustedInstallerTreeGrantRequest(req),
             AdminMessage::TrustedInstallerGrantResult(r),

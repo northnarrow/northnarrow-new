@@ -883,6 +883,11 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // review of #567) an unmount let through and recorded.
             // Lot 2.0: nor a write of the SysRq trigger the signed window
             // let through (recorded Low).
+            // Lot 2.3a (lot 330 a): nor a fatal signal let through to a
+            // protected process (PID 1 under the window's stop grant or as
+            // systemd-shutdown, the agent's family, the process itself):
+            // recorded Low, nothing refused — PID 1's must not become a
+            // relayed attempt either.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if *operation == nn_model::FsProtectOperation::PtraceRead {
@@ -904,6 +909,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::MountWindow
                     | nn_model::FsProtectOperation::MountNoted
                     | nn_model::FsProtectOperation::SysrqWindow
+                    | nn_model::FsProtectOperation::FatalSignal
             ) && !operation.is_sole_trace()
             {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
@@ -946,6 +952,11 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         // a reach for the agent's keys in memory, which a
                         // profiling tool meets too
                         | nn_model::FsProtectOperation::KernelRead
+                        // lot 2.3a: a read-open of a block device that backs
+                        // the agent's files under the kernel-read option — a
+                        // reach for its key on the raw blocks, which a backup
+                        // or a disk tool meets too
+                        | nn_model::FsProtectOperation::BdevRead
                 ) {
                     // External audit EVD-001: a refused read of the agent's
                     // signing key is a credential reach (ALERTED), not a
@@ -1215,6 +1226,7 @@ pub fn event_kind(event: &Event) -> &'static str {
         Event::DnsFlood { .. } => "DnsFlood",
         Event::SensorFlood { .. } => "SensorFlood",
         Event::ExploitPostcondition { .. } => "ExploitPostcondition",
+        Event::WindowRecord { .. } => "WindowRecord",
     }
 }
 
@@ -1377,6 +1389,19 @@ pub fn event_subject(event: &Event) -> EventSubject {
             | Event::NetInbound(_)
             | Event::DnsAnswer(_)
             | Event::TlsClientHello(_) => (event_owner_pid(event), None, None, None),
+            // lot 2.3a: the window ring names its actor by tgid only
+            Event::WindowRecord {
+                tgid,
+                kind,
+                class,
+                generation,
+                ..
+            } => (
+                Some(*tgid),
+                None,
+                None,
+                Some(format!("window {kind} ({class}), generation {generation}")),
+            ),
         };
     let is_path = matches!(
         event,
@@ -5249,8 +5274,10 @@ mod tests {
         // ptrace access refused, one more; lot 2.0: the SysRq trigger
         // refused, and a window's write of it, two more; lot 2.2: a cgroup
         // BPF attach on our cgroups, the kernel-read option's lockdown and
-        // perf refusals, three more
-        assert_eq!((minor, sole), (25, 7));
+        // perf refusals, three more; lot 2.3a: a block device's read-open
+        // under the kernel-read option, and a fatal signal let through, two
+        // more
+        assert_eq!((minor, sole), (27, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -5278,6 +5305,12 @@ mod tests {
             // writable mapping of a protected file
             w::FS_OP_ROLE_UNMARKED,
             w::FS_OP_SHARED_MAP,
+            // lot 2.3a: an ancestor of the agent's paths renamed, a block
+            // device under its files opened for writing, a descriptor
+            // received across a tree window's boundary
+            w::FS_OP_ANCESTOR_RENAME,
+            w::FS_OP_BDEV_WRITE,
+            w::FS_OP_FD_RECEIVE,
         ] {
             assert!(!w::is_minor_denial(decisive), "{decisive}");
         }
@@ -5299,6 +5332,9 @@ mod tests {
             w::FS_OP_BPF_CGROUP_ATTACH,
             w::FS_OP_KERNEL_READ,
             w::FS_OP_PERF_EVENT,
+            // lot 2.3a
+            w::FS_OP_BDEV_READ,
+            w::FS_OP_FATAL_SIGNAL,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }
@@ -5496,6 +5532,66 @@ mod tests {
                 "{op}"
             );
         }
+    }
+
+    /// Lot 2.3a (named): the lot's records reach the posture by their
+    /// weight — a renamed ancestor of the agent's paths, a write-open of a
+    /// block device under its files and a descriptor received across a
+    /// tree window's boundary are decisive (`AntiTamperDenial`; PID 1's a
+    /// relayed attempt, as every decisive refusal); a block device's
+    /// read-open under the kernel-read option is a reach for the key
+    /// (`SensitiveFileAccess`, as a refused read of it); a fatal signal let
+    /// through refuses nothing and raises nothing, PID 1's included; a
+    /// window ring's record raises nothing (its refusal is its own denial
+    /// record).
+    #[test]
+    fn the_window_tree_s_records_reach_the_posture_by_their_weight() {
+        use nn_model::FsProtectOperation as Op;
+        let det = TriggerDetector::new();
+        let ev = |pid, operation| Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "x".into(),
+            target_dev: 7,
+            target_ino: 8,
+            operation,
+            timestamp_ns: 1,
+        };
+        for op in [Op::AncestorRename, Op::BdevWrite, Op::FdReceive] {
+            assert_eq!(
+                det.detect(&ev(9999, op), &[]),
+                vec![TriggerType::AntiTamperDenial],
+                "{op}"
+            );
+            assert_eq!(
+                det.detect(&ev(1, op), &[]),
+                vec![TriggerType::RelayedTamperAttempt],
+                "{op}"
+            );
+        }
+        assert_eq!(
+            det.detect(&ev(9999, Op::BdevRead), &[]),
+            vec![TriggerType::SensitiveFileAccess]
+        );
+        for pid in [1, 9999] {
+            assert!(
+                det.detect(&ev(pid, Op::FatalSignal), &[]).is_empty(),
+                "{pid}"
+            );
+        }
+        let record = Event::WindowRecord {
+            tgid: 9999,
+            start_ticks: 5,
+            generation: 3,
+            kind: nn_model::WindowRecordKind::OutsiderRefused,
+            class: nn_model::WindowClass::Outsider,
+            operation: Some(Op::Unlink),
+            detail: 8,
+            seq: 1,
+            cpu: 0,
+            boot_ns: 1,
+        };
+        assert!(det.detect(&record, &[]).is_empty());
     }
 
     /// Lot 386 (named, the rc12 soak's R18): networkd's sysctl monitor

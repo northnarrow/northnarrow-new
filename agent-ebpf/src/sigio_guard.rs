@@ -22,13 +22,15 @@
 //! by the agent's own write to it). The agent and the watchdog never arm
 //! `O_ASYNC` themselves (`xtask/tests/self_defense.rs` reads the tree).
 //!
-//! The one exception is the signed trusted-installer window's signal grant
-//! (`KILL_GRANT`, the stop signals SIGTERM, SIGCONT and SIGKILL until the
-//! window ends, under this boot's session nonce): inside it root may already
-//! stop the agent with `systemctl kill`, which PID 1 relays, so letting the
-//! same signals through this path widens nothing. The plain SIGIO, SIGURG
-//! and every other signal stay refused inside a window too. PID 1 is not
-//! asked for: this path has no sender to compare.
+//! Lot 2.3a (D7): while a tree window is open, its members are guarded
+//! here too — every such signal to a member is refused, whoever raised it.
+//!
+//! Lot 2.3a (scaffold+, the C112w critique): no exception any more. The
+//! signed trusted-installer window's signal grant (`KILL_GRANT`) let its
+//! stop signals through here, which "widened nothing" only while the window
+//! was host-wide: this path has no sender, so a window per process tree
+//! cannot scope it. No flow signals through a file's owner; every such
+//! signal is refused inside a window too.
 //!
 //! A refusal is signed (`FS_OP_SIGIO`: the target tgid, the signal as it
 //! would have been delivered), rate-limited like a refused `kill`. The
@@ -77,14 +79,15 @@ unsafe fn try_file_send_sigiotask(ctx: &LsmContext) -> i32 {
                 return 0;
             }
         };
-        if !crate::task_kill::is_protected_pid(tgid) {
+        // Lot 2.3a (D7): and a member of an open tree window (no sender to
+        // tell an outsider by: refused whoever raised it)
+        if !crate::task_kill::is_protected_pid(tgid)
+            && crate::window_tree::opaque(crate::window_tree::nn_tree_member_target(crate::window_tree::raw_arg(ctx, 0))) == 0
+        {
             return 0;
         }
         let sig: c_int = ctx.arg(2);
         let delivered = sigio_signal(sig);
-        if crate::task_kill::kill_grant_allows(delivered) {
-            return 0;
-        }
         crate::inode_protect::emit_task_denial(FS_OP_SIGIO, delivered as u32 as u64, tgid);
         -EPERM
     }

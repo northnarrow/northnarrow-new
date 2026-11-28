@@ -71,6 +71,11 @@ pub mod ptrace_read;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 pub mod sysctl_judge;
+/// Lot 2.3a (stage S2): the decisions of the trusted-installer window per
+/// process tree as the eBPF programs take them (the lift test, the exec
+/// and mapping rule, the block devices, the ancestors and the key files,
+/// a refusal's class, the fatal signals), tested here. NOT `std`-gated.
+pub mod window_tree;
 
 // Wave 4 restructure, R03 (lab PR 240): the admin protocol
 // (`wire::admin_protocol`), the signed payloads

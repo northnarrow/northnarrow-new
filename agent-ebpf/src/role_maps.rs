@@ -318,8 +318,11 @@ pub extern "C" fn nn_role_map(file: u64, vma: u64) -> u64 {
 /// (no file judged). A field this kernel does not have is read as passing
 /// (`i_nlink`, the superblock's user namespace, the mount's idmapping:
 /// before 5.12 no mount is idmapped), counted as a fail-open.
+///
+/// Lot 2.3a (scaffold+): shared with the window's exec and mapping rule
+/// (`crate::window_tree`), which judges a member's code by the same test.
 #[inline(always)]
-unsafe fn code_facts(file: *const u8, inode: *const u8) -> Option<CodeFacts> {
+pub(crate) unsafe fn code_facts(file: *const u8, inode: *const u8) -> Option<CodeFacts> {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
         let mode = bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16).ok()?;

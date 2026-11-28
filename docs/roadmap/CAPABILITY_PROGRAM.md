@@ -15417,3 +15417,12 @@ no level changed.
     stopped and started again inside a 20 s window), a held
     `watchdog_gone`, not seen on 22.04.
   - Host: the full gates, all green.
+- **Lot 2.3a — the trusted-installer window per process tree, the kernel
+  side (stage S2, lane K; no level change).** The kernel holds the window
+  per process tree: only the processes the window's root forked are
+  lifted, an outsider is refused and signed High (NN-L-AT-002), and
+  `admin.pub` and the signing key are lifted by no window. Ten new
+  programs: the eBPF object holds 144. The install, upgrade and uninstall
+  flows keep the host-wide window until lots 2.3b and 2.4. The lot's full
+  note, its lab and its gates are in its PR, for the stage's documents
+  lot.

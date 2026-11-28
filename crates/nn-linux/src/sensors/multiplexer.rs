@@ -36,7 +36,8 @@ use aya::{
 use bytemuck::Pod;
 use common::wire::{
     BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw,
-    ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw, dns_flags,
+    ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw, WINDOW_EVENTS_MAP_NAME, WindowEventRaw,
+    dns_flags,
 };
 use nn_model::Event;
 use parking_lot::Mutex;
@@ -66,6 +67,12 @@ pub const BUS_LOSSES_LABEL: &str = "event_bus_losses";
 
 /// The anti-tamper denials' ring (`agent-ebpf/src/inode_protect.rs`).
 pub const FS_PROTECT_RING: &str = "FS_PROTECT_EVENTS";
+/// Lot 2.3a: the trusted-installer window's own ring
+/// (`agent-ebpf/src/window_maps.rs`): the window closed by the kernel, the
+/// members evicted, the outsiders refused while it is open. Its pump is a
+/// second pump of the `fs_protect` source (the same deny hooks write it,
+/// the same contract), each record an `Event::WindowRecord`.
+pub const WINDOW_RING: &str = WINDOW_EVENTS_MAP_NAME;
 /// The re-check of #582 (N1, N5): the degradation's source when the
 /// kernel's record of the roles' exits (`ROLE_MARKS`, `ROLE_EXITS`) is not
 /// frozen, or not read, at a start that needs it.
@@ -672,6 +679,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let tcp_connect_rb = take_ringbuf(&mut ebpf, "TCP_CONNECT_EVENTS")?;
         let dns_query_rb = take_ringbuf(&mut ebpf, "DNS_QUERY_EVENTS")?;
         let fs_protect_rb = take_ringbuf(&mut ebpf, FS_PROTECT_RING)?;
+        // Lot 2.3a: the window's records (NN-L-AT-002).
+        let window_rb = take_ringbuf(&mut ebpf, WINDOW_RING)?;
         // BUG-034: module-load observations → Event::ModuleLoad → R018.
         // Maps exist at load time (before attach), so taking it here is safe.
         let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
@@ -789,6 +798,19 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     &rt,
                     // the review of #552 (F5a): a known probe is marked after
                     // the bus's lineage barrier ([`mark_known_probe_on_host`])
+                    no_carry,
+                )?),
+            ),
+            // Lot 2.3a: the trusted-installer window's own ring, a second
+            // pump of the same source (its records are the deny hooks'),
+            // each record signed by NN-L-AT-002; never coalesced.
+            (
+                "fs_protect",
+                Pump::Thread(spawn_ring_pump::<WindowEventRaw>(
+                    "fs_protect",
+                    window_rb,
+                    &tx,
+                    &rt,
                     no_carry,
                 )?),
             ),
@@ -3909,6 +3931,8 @@ mod tests {
             "OPEN_SENSOR_EVENTS",
             "DNS_QUERY_EVENTS",
             "EVENTS",
+            // lot 2.3a: the trusted-installer window's own ring
+            WINDOW_RING,
         ] {
             assert!(
                 rings.iter().any(|r| r == ring),
@@ -3916,6 +3940,77 @@ mod tests {
             );
         }
         assert!(rings.iter().all(|r| r.ends_with("EVENTS")), "{rings:?}");
+    }
+
+    /// Lot 2.3a (named): the trusted-installer window's ring is taken by the
+    /// object's own name for it and pumped, as a pump of the `fs_protect`
+    /// source, into `Event::WindowRecord`s — read from the production code
+    /// — and a record of it, as the kernel writes it, decodes to its event
+    /// whole (a record of the wrong size does not).
+    #[test]
+    fn the_window_ring_is_pumped_into_window_records() {
+        let text = include_str!("multiplexer.rs");
+        let code = &text[..text.find("#[cfg(test)]").expect("the tests")];
+        assert!(
+            code.contains("let window_rb = take_ringbuf(&mut ebpf, WINDOW_RING)?;"),
+            "the window ring is taken"
+        );
+        let pump = code
+            .find("spawn_ring_pump::<WindowEventRaw>(")
+            .expect("its pump");
+        let args = &code[pump..pump + 200];
+        assert!(
+            args.contains("\"fs_protect\",") && args.contains("window_rb,"),
+            "{args}"
+        );
+        // the object declares it under that name
+        let maps = std::fs::read_to_string(
+            std::path::Path::new(env!("NN_REPO_ROOT")).join("agent-ebpf/src/window_maps.rs"),
+        )
+        .unwrap();
+        assert!(
+            maps.contains(&format!("pub static {WINDOW_RING}: RingBuf =")),
+            "{WINDOW_RING} not in window_maps.rs"
+        );
+        // the contract says the source sends them
+        assert!(
+            crate::sensors::contract::source("fs_protect")
+                .unwrap()
+                .events
+                .contains(&nn_core::contract::EventKind::WindowRecord)
+        );
+        // a record, as the ring hands it over
+        let raw = WindowEventRaw {
+            seq: 3,
+            boot_ns: 11,
+            generation: 2,
+            start_ticks: 99,
+            detail: common::window_tree::CLOSE_ROOT_EXIT,
+            tgid: 4242,
+            cpu: 1,
+            kind: common::wire::WINDOW_EVENT_CLOSE,
+            class: common::wire::DENIAL_WINDOW_NONE,
+            operation: 0,
+            _pad: [0; 5],
+        };
+        let bytes = bytemuck::bytes_of(&raw);
+        let decoded = bytemuck::try_from_bytes::<WindowEventRaw>(bytes).expect("decodes");
+        let (e, carried) = no_carry(decoded, Event::from(decoded));
+        assert!(carried.iter().all(Option::is_none));
+        assert!(
+            matches!(
+                e,
+                Event::WindowRecord {
+                    tgid: 4242,
+                    generation: 2,
+                    kind: nn_model::WindowRecordKind::Close,
+                    seq: 3,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(bytemuck::try_from_bytes::<WindowEventRaw>(&bytes[..bytes.len() - 1]).is_err());
     }
 
     /// Lot 269 (R12b-1): the denials' ring is loaded at four times the
