@@ -1393,15 +1393,18 @@ lists the known false positives of each rule.
   module loaded on demand once the agent runs, outside a trusted-installer
   window (`RULE_POLICY.md` §2.4: an `init_module` buffer is never trusted).
   COMBAT's isolation needs netfilter modules that a host with no firewall
-  running has not loaded since its boot — on 5.14 el9 at least
-  `nft_counter`, for every rule `iptables-restore` writes — and without
-  them it fails: `isolation NOT in place`, the host not isolated, signed,
-  the ladder retrying. *For you:* on such a host load them at boot, before
-  the agent starts (`/etc/modules-load.d/`; a running `firewalld` loads
-  them too). *Evidence:* lot M9 (the AlmaLinux 9 lab: after a cold boot
-  with only `nf_tables` loaded, `e2e_force_combat_then_unlock_via_cli`
-  never reached ISOLATE on `v0.1.1-alpha`'s tree and on the lot's; with
-  `nft_counter` loaded beforehand it passed).
+  running has not loaded since its boot — on 5.14 el9 `nf_tables` and
+  `nft_counter` for IPv4 (iptables-nft gives each rule a counter),
+  and `ip6_tables` and `nft_compat` too for IPv6 (the rules that keep NDP
+  and MLD match `icmp6`) — and without them it fails: `isolation NOT in
+  place`, the host not isolated, signed, the ladder retrying. *For you:* on
+  such a host load the four at boot, before the agent starts (a file in
+  `/etc/modules-load.d/` naming them; a running `firewalld` loads them
+  too). *Evidence:* lot M9 (the AlmaLinux 9 lab: after a cold boot with
+  only `nf_tables` loaded, `e2e_force_combat_then_unlock_via_cli` never
+  reached ISOLATE, on `v0.1.1-alpha`'s tree and on the lot's; with the
+  modules loaded beforehand it passed; the four modules measured by
+  applying the rules with no agent running, to a chain nothing jumps to).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
   active LSM list, bpffs at `/sys/fs/bpf`, systemd, `nft`. Without the BPF
   LSM the agent refuses to start. Only the override
