@@ -1373,15 +1373,13 @@ impl TrustedInstallerOverride {
         let live = |l: &WindowLease| {
             l.used == 0 && l.generation == generation && now_boot_ns < l.expires_boot_ns
         };
-        let armed_this_window = leases.iter().filter(|l| l.generation == generation).count();
-        if armed_this_window >= WINDOW_LEASES_MAX as usize {
-            return Err(format!(
-                "this window armed {armed_this_window} leases already (at most {WINDOW_LEASES_MAX})"
-            ));
-        }
+        // a slot of this window is never taken again, used or expired: at
+        // most WINDOW_LEASES_MAX leases a window
         let Some(slot) = leases.iter().position(|l| !live(l) && l.generation != generation)
         else {
-            return Err("no lease slot is free".to_string());
+            return Err(format!(
+                "no lease slot is free: this window armed its {WINDOW_LEASES_MAX} already"
+            ));
         };
         let lease = WindowLease {
             generation,
@@ -3863,6 +3861,8 @@ mod tests {
         let stat = |p: &Path| -> Option<InodeKey> {
             match p.to_str()? {
                 "/usr/bin" | "/bin" => Some(key(10)),
+                // one inode under two reaches (a link): both kept
+                "/usr/local/lib" | "/usr/local" => Some(key(40)),
                 "/usr" => Some(key(2)),
                 "/etc" => Some(key(3)),
                 "/etc/ld.so.preload" => None,
@@ -3883,6 +3883,7 @@ mod tests {
         assert!(inodes.contains(&(key(10), FROZEN_SUBTREE)));
         assert!(inodes.contains(&(key(2), FROZEN_SELF)));
         assert!(inodes.contains(&(key(30), FROZEN_SUBTREE)));
+        assert!(inodes.contains(&(key(40), FROZEN_SUBTREE | FROZEN_SELF)), "{inodes:?}");
         let name = |dir, n: &str| common::wire::FrozenName {
             dir,
             name: common::window_tree::name_words4(n.as_bytes()),
@@ -4112,6 +4113,12 @@ mod tests {
             armed += 1;
         }
         assert_eq!(armed, WINDOW_LEASES_MAX as usize);
+        // a slot this window used (or let expire) is not armed again
+        maps.leases[0].used = 1;
+        let e = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap_err();
+        assert!(e.contains("no lease slot is free"), "{e}");
+        let late = NOW + 2 * common::wire::WINDOW_LEASE_TTL_NS;
+        assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, late, (700, 7_000), g, LINK).is_err());
     }
 
     /// Lot 2.3b (D5, refinement 2): PID 1's environment changed since the
