@@ -3,13 +3,14 @@
 //! and what the kernel needs for a tree window (the design's section 8,
 //! "Kernel manifest").
 //!
-//! [`attach`] loads and attaches the ten programs ([`PROGRAMS`]), each pinned
+//! [`attach`] loads and attaches the twelve programs ([`PROGRAMS`]), each pinned
 //! under its own name in the pin root (`prog_<program>`, `link_<program>`:
 //! several share their hook with another program of the agent, and a deny
 //! hook's pin is named by its hook), the fresh one attached before the prior
 //! boot's pin goes. [`manifest_missing`] names what this kernel or this
 //! start lacks for a tree window — a program not attached, a field of the
-//! per-lift test the kernel does not have — and a tree grant is refused
+//! per-lift test the kernel does not have, a key file `INODE_EXT` does not
+//! keep (lot 2.3a, K4) — and a tree grant is refused
 //! while it names anything: the window never falls back to host-wide.
 //!
 //! Not a deny hook of the start's count: without them no tree window opens
@@ -35,9 +36,10 @@ pub enum Kind {
 
 /// The tree's programs: `(program, how, hook or tracepoint)`, in the order
 /// a start attaches them — the removal first (an entry never outlives its
-/// process), the judges, the guards, then the fork (a child joins only once
-/// what judges it runs).
-pub const PROGRAMS: [(&str, Kind, &str); 10] = [
+/// process), the judges, the guards, then the fork's two halves (a child
+/// joins only once what judges it runs; lot 2.3a's review of #647: its
+/// `task_alloc` half before the confirmation at `sched_process_fork`).
+pub const PROGRAMS: [(&str, Kind, &str); 12] = [
     ("tree_exit", Kind::TpBtf, "sched_process_exit"),
     ("tree_task_free", Kind::Lsm, "task_free"),
     ("tree_bprm_check", Kind::Lsm, "bprm_check_security"),
@@ -45,15 +47,21 @@ pub const PROGRAMS: [(&str, Kind, &str); 10] = [
     ("tree_exec_env", Kind::TpBtf, "sched_process_exec"),
     ("tree_mmap_file", Kind::Lsm, "mmap_file"),
     ("tree_mprotect", Kind::Lsm, "file_mprotect"),
+    ("tree_shmat", Kind::Lsm, "shm_shmat"),
     ("tree_ptrace", Kind::Lsm, "ptrace_access_check"),
     ("tree_fd_receive", Kind::Lsm, "file_receive"),
+    ("tree_task_alloc", Kind::Lsm, "task_alloc"),
     ("tree_fork", Kind::TpBtf, "sched_process_fork"),
 ];
 
 /// The fields the kernel reads for the lift test and the tree's judges
 /// (`common::btf_offsets`), each one a missing hook when this kernel does
 /// not have it: no lift, and no tree window.
-pub const REQUIRED_FIELDS: [&str; 13] = [
+/// Lot 2.3a (the review of #647): the task's `__state` (the fork span's
+/// `TASK_NEW` guard) and its `real_parent` (a member's child), and the
+/// vma's flags and file (the `mprotect` judge: without them every
+/// executable `mprotect` would be judged anonymous) are among them.
+pub const REQUIRED_FIELDS: [&str; 17] = [
     "TASK_STRUCT_START_BOOTTIME_OFFSET",
     "TASK_STRUCT_PTRACE_OFFSET",
     "TASK_STRUCT_SECCOMP_MODE_OFFSET",
@@ -67,6 +75,10 @@ pub const REQUIRED_FIELDS: [&str; 13] = [
     "SIGNAL_STRUCT_LIVE_OFFSET",
     "MM_STRUCT_ENV_START_OFFSET",
     "MM_STRUCT_ENV_END_OFFSET",
+    "TASK_STRUCT_STATE_OFFSET",
+    "TASK_STRUCT_REAL_PARENT_OFFSET",
+    "VM_AREA_STRUCT_VM_FLAGS_OFFSET",
+    "VM_AREA_STRUCT_VM_FILE_OFFSET",
 ];
 
 /// The pinned slot of the window the kernel closed
@@ -205,12 +217,20 @@ pub fn missing_from(attached: Option<&Result<(), String>>, absent: &[&str]) -> V
     out
 }
 
-/// [`missing_from`] for this start.
-pub fn manifest_missing() -> Vec<String> {
+/// [`missing_from`] for this start, and (lot 2.3a, K4, the review of
+/// #647: fail-closed) the key files the pinned `INODE_EXT` under
+/// `pin_root` does not keep now (`filesystem::key_files_not_kept`: a key
+/// rotated or bootstrapped since the start is registered first). No pin
+/// root: the arming refuses on its own.
+pub fn manifest_missing(pin_root: Option<&Path>) -> Vec<String> {
     let absent: Vec<&str> = super::btf_revalidate::resolved()
         .map(|r| r.absent.iter().map(|m| m.name).collect())
         .unwrap_or_default();
-    missing_from(ATTACHED.get(), &absent)
+    let mut out = missing_from(ATTACHED.get(), &absent);
+    if let Some(root) = pin_root {
+        out.extend(super::filesystem::key_files_not_kept(root));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -894,6 +894,16 @@ impl<H: DecisionHost> TriggerDetector<H> {
                 // the re-check of #567 (b): a read-mode access refused,
                 // recorded Low; no trigger (journald's reads of the agent's
                 // /proc/<pid>/exe meet it all day)
+            } else if matches!(
+                operation,
+                nn_model::FsProtectOperation::BdevWriteNoted
+                    | nn_model::FsProtectOperation::BdevPassthroughNoted
+            ) {
+                // lot 2.3a (the review of #647): a block device's raw write
+                // or passthrough command let through and recorded, signed
+                // High by NN-L-AT-001; nothing refused, no trigger —
+                // grub-install, LVM, cryptsetup, a disk tool meet it (the
+                // refused ones, under the kernel-read option, are decisive)
             } else if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
@@ -5276,8 +5286,10 @@ mod tests {
         // BPF attach on our cgroups, the kernel-read option's lockdown and
         // perf refusals, three more; lot 2.3a: a block device's read-open
         // under the kernel-read option, and a fatal signal let through, two
-        // more
-        assert_eq!((minor, sole), (27, 7));
+        // more; the review of #647: a block device's raw write and command
+        // let through and recorded, two more (the command refused under the
+        // option is decisive)
+        assert_eq!((minor, sole), (29, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -5311,6 +5323,9 @@ mod tests {
             w::FS_OP_ANCESTOR_RENAME,
             w::FS_OP_BDEV_WRITE,
             w::FS_OP_FD_RECEIVE,
+            // the review of #647: a passthrough command refused under the
+            // kernel-read option
+            w::FS_OP_BDEV_PASSTHROUGH,
         ] {
             assert!(!w::is_minor_denial(decisive), "{decisive}");
         }
@@ -5335,8 +5350,12 @@ mod tests {
             // lot 2.3a
             w::FS_OP_BDEV_READ,
             w::FS_OP_FATAL_SIGNAL,
+            // the review of #647: let through and recorded, not sole traces
+            w::FS_OP_BDEV_WRITE_NOTED,
+            w::FS_OP_BDEV_PASSTHROUGH_NOTED,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
+            assert!(!w::is_sole_trace(minor), "{minor}");
         }
         // lot 356: the only trace of what was let through — no budget
         for sole in [
@@ -5536,14 +5555,16 @@ mod tests {
 
     /// Lot 2.3a (named): the lot's records reach the posture by their
     /// weight — a renamed ancestor of the agent's paths, a write-open of a
-    /// block device under its files and a descriptor received across a
+    /// block device under its files or a passthrough command to it refused
+    /// under the kernel-read option, and a descriptor received across a
     /// tree window's boundary are decisive (`AntiTamperDenial`; PID 1's a
     /// relayed attempt, as every decisive refusal); a block device's
     /// read-open under the kernel-read option is a reach for the key
     /// (`SensitiveFileAccess`, as a refused read of it); a fatal signal let
-    /// through refuses nothing and raises nothing, PID 1's included; a
-    /// window ring's record raises nothing (its refusal is its own denial
-    /// record).
+    /// through, and (the review of #647) a block device's raw write or
+    /// command let through and recorded, refuse nothing and raise nothing,
+    /// PID 1's included; a window ring's record raises nothing (its refusal
+    /// is its own denial record).
     #[test]
     fn the_window_tree_s_records_reach_the_posture_by_their_weight() {
         use nn_model::FsProtectOperation as Op;
@@ -5557,7 +5578,14 @@ mod tests {
             operation,
             timestamp_ns: 1,
         };
-        for op in [Op::AncestorRename, Op::BdevWrite, Op::FdReceive] {
+        for op in [
+            Op::AncestorRename,
+            Op::BdevWrite,
+            Op::FdReceive,
+            // the review of #647: a passthrough command refused under the
+            // kernel-read option
+            Op::BdevPassthrough,
+        ] {
             assert_eq!(
                 det.detect(&ev(9999, op), &[]),
                 vec![TriggerType::AntiTamperDenial],
@@ -5574,10 +5602,15 @@ mod tests {
             vec![TriggerType::SensitiveFileAccess]
         );
         for pid in [1, 9999] {
-            assert!(
-                det.detect(&ev(pid, Op::FatalSignal), &[]).is_empty(),
-                "{pid}"
-            );
+            // the review of #647: nor a block device's raw write or command
+            // let through and recorded (High by its rule)
+            for op in [
+                Op::FatalSignal,
+                Op::BdevWriteNoted,
+                Op::BdevPassthroughNoted,
+            ] {
+                assert!(det.detect(&ev(pid, op), &[]).is_empty(), "{op} {pid}");
+            }
         }
         let record = Event::WindowRecord {
             tgid: 9999,

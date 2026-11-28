@@ -65,7 +65,7 @@ use aya_ebpf::{
         bpf_probe_read_kernel, generated,
     },
     macros::{btf_tracepoint, lsm, map},
-    maps::{Array, HashMap, PerCpuArray},
+    maps::{Array, PerCpuArray},
     programs::{BtfTracePointContext, LsmContext},
 };
 use northnarrow_common::exec_marks::CODE_ANONYMOUS;
@@ -93,7 +93,7 @@ use crate::btf_offsets::{
     TASK_STRUCT_TGID_OFFSET, USER_NAMESPACE_INUM_OFFSET,
     VM_AREA_STRUCT_VM_FILE_OFFSET, VM_AREA_STRUCT_VM_FLAGS_OFFSET,
 };
-use crate::window_maps::{emit_window_event, FS_GRANT_V2, TREE_MEMBERS};
+use crate::window_maps::{emit_window_event, FS_GRANT_V2, TREE_CGROUP_FILES, TREE_MEMBERS, TREE_PENDING};
 
 const EPERM: c_int = 1;
 /// `PROT_EXEC`, `VM_EXEC`.
@@ -118,20 +118,8 @@ const IO_URING_HI_MASK: u64 = 0xff_ffff;
 #[map]
 pub static TREE_CLOSED: Array<[u64; 2]> = Array::pinned(1, 0);
 
-/// The fork span: a member's child from `task_alloc` to `sched_process_fork`,
-/// keyed by its `task_struct` (it has no pid nor start yet), the value the
-/// generation it joins. Written by [`tree_task_alloc`], removed by
-/// [`tree_fork`] (the child's entry written in its place) or by
-/// [`tree_task_free`] (a fork that failed after `task_alloc`). A guard only:
-/// the child has not run, so nothing is lifted by it. Not pinned: only this
-/// object's programs read it, and a start's programs replace the prior
-/// boot's; a stale value is another generation's, ignored.
-#[map]
-static TREE_PENDING: HashMap<u64, u64> = HashMap::with_max_entries(TREE_PENDING_MAX, 0);
-
-/// [`TREE_PENDING`]'s room: the forks in flight at once in the tree. A full
-/// map leaves the child to the `TASK_NEW` and parent guards.
-const TREE_PENDING_MAX: u32 = 1024;
+/// `SHM_EXEC` (include/uapi/linux/shm.h).
+const SHM_EXEC: u64 = 0o100000;
 
 /// `CLONE_THREAD` (include/uapi/linux/sched.h).
 const CLONE_THREAD: u64 = 0x0001_0000;
@@ -1002,6 +990,26 @@ pub fn tree_mmap_file(ctx: LsmContext) -> i32 {
     0
 }
 
+/// `shm_shmat(struct kern_ipc_perm *perm, char __user *shmaddr, int
+/// shmflg)`: a System V segment attached executable (`SHM_EXEC`) by a
+/// member — `do_shmat` maps it through `do_mmap`, past `mmap_file`, with
+/// `VM_EXEC` from its birth (no `mprotect` follows): judged as anonymous
+/// memory, as an executable mapping of no trusted file is (the review of
+/// #647).
+#[lsm(hook = "shm_shmat")]
+pub fn tree_shmat(ctx: LsmContext) -> i32 {
+    unsafe {
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if TREE_MEMBERS.get(&tgid).is_none() {
+            return 0;
+        }
+        if raw_arg(&ctx, 2) & SHM_EXEC != 0 {
+            let _ = nn_tree_judge_file(0, EVICT_MAP);
+        }
+    }
+    0
+}
+
 /// `file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 /// unsigned long prot)`: an `mprotect` that makes a mapping executable,
 /// judged on its file (a mapping already executable was judged at its
@@ -1060,6 +1068,46 @@ pub fn tree_ptrace(ctx: LsmContext) -> i32 {
             }
         }
         -EPERM
+    }
+}
+
+/// Lot 2.3a (D7, the review of #647): whether the write-open of `inode` (a
+/// scalar pointer) is refused: a `cgroup.kill` or `cgroup.freeze` of the
+/// window root's cgroup or of one above it ([`TREE_CGROUP_FILES`], of this
+/// generation — the agent writes them when it arms the window), while the
+/// window is open, by a caller outside the tree and outside the agent's
+/// family: a member killed or frozen with its cgroup, which no `task_kill`
+/// sees. Signed (`FS_OP_CGROUP_KILL`, `FS_OP_CGROUP_FREEZE`). 1 when
+/// refused. A global function: an array read for any other open while no
+/// tree grant is armed.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_tree_cgroup_file(inode: u64) -> u64 {
+    // SAFETY: the inode is read through the helper only; the maps are this
+    // object's.
+    unsafe {
+        let Some(g) = grant_now() else {
+            return 0;
+        };
+        if g.generation == 0 || inode == 0 {
+            return 0;
+        }
+        let Some(key) = crate::inode_protect::read_inode_key(inode as *const c_void) else {
+            return 0;
+        };
+        let Some(v) = TREE_CGROUP_FILES.get(&key) else {
+            return 0;
+        };
+        let (generation, op) = (v[0], v[1]);
+        if generation != g.generation || !tree_open(g, bpf_ktime_get_boot_ns(), session()) {
+            return 0;
+        }
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if crate::task_kill::is_exempt_pid(caller) || member_now() == MEMBER_LIFT {
+            return 0;
+        }
+        crate::inode_protect::emit_attempt(op as u8, key);
+        1
     }
 }
 

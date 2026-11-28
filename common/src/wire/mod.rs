@@ -1162,6 +1162,26 @@ pub const TREE_MEMBERS_MAP_NAME: &str = "TREE_MEMBERS";
 /// the refusal says why (lot 2.3).
 pub const TREE_MEMBERS_MAX: u32 = 4096;
 
+/// Lot 2.3a (the review of #647, the fork span): the pinned map of a
+/// member's children between `task_alloc` and `sched_process_fork`, keyed
+/// by the child's `task_struct` address, the value the generation it
+/// joins (`agent-ebpf/src/window_maps.rs`). Emptied at the agent's start.
+pub const TREE_PENDING_MAP_NAME: &str = "TREE_PENDING";
+/// Its capacity: the forks in flight at once in the tree (a full map
+/// leaves the child to the `TASK_NEW` and parent guards).
+pub const TREE_PENDING_MAX: u32 = 1024;
+
+/// Lot 2.3a (D7, the review of #647): the pinned map of the `cgroup.kill`
+/// and `cgroup.freeze` files of the window root's cgroup and of its
+/// ancestors, written by the agent when it arms a tree window: key the
+/// file's inode, value `[generation, operation]` (`FS_OP_CGROUP_KILL` or
+/// `FS_OP_CGROUP_FREEZE`). While that window is open an outsider's
+/// write-open of one is refused. Emptied at the agent's start and when the
+/// window closes; an entry of another generation is nothing.
+pub const TREE_CGROUP_FILES_MAP_NAME: &str = "TREE_CGROUP_FILES";
+/// Its capacity: two files per level of a deep cgroup path.
+pub const TREE_CGROUP_FILES_MAX: u32 = 64;
+
 /// A member of the window's tree: written for the root at the grant (by
 /// the agent), and for each child a member forks while its grant is
 /// active (by the kernel's fork program); removed at the process's exit.
@@ -2061,8 +2081,9 @@ pub const FS_OP_BDEV_PASSTHROUGH_NOTED: u8 = 67;
 pub const PROTECTED_BDEVS_MAP_NAME: &str = "PROTECTED_BDEVS";
 /// Its capacity: a filesystem's device, the disk it is a partition of, and
 /// the devices under a device-mapper or md stack, for the few filesystems
-/// the agent's paths live on.
-pub const PROTECTED_BDEVS_MAX: u32 = 32;
+/// the agent's paths live on — and their disks' passthrough nodes (sg,
+/// bsg, NVMe generic and controller: the review of #647).
+pub const PROTECTED_BDEVS_MAX: u32 = 64;
 
 /// The S2 codes, with the name their records carry and the lot that emits
 /// them; those of a lot that has landed are at or below [`FS_OP_LAST`].
@@ -3594,13 +3615,44 @@ mod tests {
                 "{name}"
             );
         }
-        // the last code emitted is lot 2.3a's last
-        assert_eq!(FS_OP_LAST, FS_OP_FD_RECEIVE);
+        // the last code emitted is lot 2.3a's last (the review of #647: a
+        // block device's passthrough command let through and recorded)
+        assert_eq!(FS_OP_LAST, FS_OP_BDEV_PASSTHROUGH_NOTED);
         // lot 2.3a: what refuses nothing, and the read under the option, are
         // minor; the refusals that move or write the agent's files are not
-        assert!(is_minor_denial(FS_OP_FATAL_SIGNAL) && is_minor_denial(FS_OP_BDEV_READ));
-        for c in [FS_OP_ANCESTOR_RENAME, FS_OP_BDEV_WRITE, FS_OP_FD_RECEIVE] {
+        for c in [
+            FS_OP_FATAL_SIGNAL,
+            FS_OP_BDEV_READ,
+            FS_OP_BDEV_WRITE_NOTED,
+            FS_OP_BDEV_PASSTHROUGH_NOTED,
+        ] {
+            assert!(is_minor_denial(c) && !is_sole_trace(c), "{c}");
+        }
+        for c in [
+            FS_OP_ANCESTOR_RENAME,
+            FS_OP_BDEV_WRITE,
+            FS_OP_FD_RECEIVE,
+            FS_OP_BDEV_PASSTHROUGH,
+        ] {
             assert!(!is_minor_denial(c) && !is_sole_trace(c), "{c}");
+        }
+        // the review of #647: the records of a block device's raw write or
+        // command let through are let through; the refused ones are not
+        for c in [
+            FS_OP_FATAL_SIGNAL,
+            FS_OP_BDEV_WRITE_NOTED,
+            FS_OP_BDEV_PASSTHROUGH_NOTED,
+        ] {
+            assert!(is_let_through(c), "{c}");
+        }
+        for c in [
+            FS_OP_BDEV_WRITE,
+            FS_OP_BDEV_READ,
+            FS_OP_BDEV_PASSTHROUGH,
+            FS_OP_ANCESTOR_RENAME,
+            FS_OP_FD_RECEIVE,
+        ] {
+            assert!(!is_let_through(c), "{c}");
         }
     }
 
@@ -4148,6 +4200,10 @@ mod tests {
             FS_OP_BDEV_READ,
             FS_OP_FATAL_SIGNAL,
             FS_OP_FD_RECEIVE,
+            // the review of #647
+            FS_OP_BDEV_WRITE_NOTED,
+            FS_OP_BDEV_PASSTHROUGH,
+            FS_OP_BDEV_PASSTHROUGH_NOTED,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

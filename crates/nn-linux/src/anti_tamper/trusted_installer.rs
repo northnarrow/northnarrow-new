@@ -108,7 +108,7 @@ use super::{
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
 use common::wire::{
-    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, KillGrant, TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME,
+    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME,
     TreeMember, WINDOW_MAX_NS,
 };
 
@@ -740,7 +740,7 @@ impl TrustedInstallerOverride {
         self.arm_tree_with(
             pinned.as_mut().map(|m| m as &mut dyn TreeMaps),
             &ProcFs(Path::new("/proc")),
-            &super::window_tree::manifest_missing(),
+            &super::window_tree::manifest_missing(self.bpffs_root.as_deref()),
             boottime_ns(),
             window_secs,
             root,
@@ -875,6 +875,16 @@ impl TrustedInstallerOverride {
                 return Err(withdrawn(
                     maps,
                     format!("member {pid} not written to {TREE_MEMBERS_MAP_NAME}: {e}"),
+                ));
+            }
+        }
+        // 1b. (lot 2.3a, D7) the root's cgroup files: an outsider's
+        // `cgroup.kill` / `cgroup.freeze` of the members' cgroup refused
+        for (key, op) in reader.cgroup_files(root.0) {
+            if let Err(e) = maps.put_cgroup_file(key, [generation, u64::from(op)]) {
+                return Err(withdrawn(
+                    maps,
+                    format!("cgroup file {}:{} not written to {TREE_CGROUP_FILES_MAP_NAME}: {e}", key.dev, key.ino),
                 ));
             }
         }
@@ -1124,6 +1134,42 @@ pub trait LineReader {
     fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String>;
     /// Its tracer and seccomp mode (`status`: `TracerPid`, `Seccomp`).
     fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String>;
+    /// Lot 2.3a (D7, the review of #647): the `cgroup.kill` and
+    /// `cgroup.freeze` of its cgroup of the unified hierarchy and of every
+    /// cgroup above it but the root ([`cgroup_file_plan`]), by inode, each
+    /// with its operation (`FS_OP_CGROUP_KILL`, `FS_OP_CGROUP_FREEZE`); a
+    /// file this kernel does not have is skipped.
+    fn cgroup_files(&self, _pid: u32) -> Vec<(InodeKey, u8)> {
+        Vec::new()
+    }
+}
+
+/// Lot 2.3a (D7, the review of #647): the files of `cgroup` (a path of the
+/// unified hierarchy, `/proc/<pid>/cgroup`'s `0::` line) and of every
+/// cgroup above it under `root` (`/sys/fs/cgroup`, its own root excluded:
+/// it has neither file) through which a member is killed or frozen with
+/// its cgroup, each with the operation its refusal is signed as.
+pub fn cgroup_file_plan(root: &Path, cgroup: &str) -> Vec<(PathBuf, u8)> {
+    let mut out = Vec::new();
+    let mut cur = Path::new(cgroup.trim().trim_start_matches('/'));
+    loop {
+        if cur.as_os_str().is_empty() {
+            break;
+        }
+        let dir = root.join(cur);
+        out.push((dir.join("cgroup.kill"), common::wire::FS_OP_CGROUP_KILL));
+        out.push((dir.join("cgroup.freeze"), common::wire::FS_OP_CGROUP_FREEZE));
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    out
+}
+
+/// `/proc/<pid>/cgroup`'s path in the unified hierarchy (its `0::` line).
+fn unified_cgroup(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| l.strip_prefix("0::"))
 }
 
 /// The [`LineReader`] of a `/proc` (the kernel's: `Path::new("/proc")`).
@@ -1140,6 +1186,28 @@ impl LineReader for ProcFs<'_> {
         let status = crate::state_read::read_state(self.0.join(pid.to_string()).join("status"))
             .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
         parse_guards(&status).ok_or_else(|| format!("/proc/{pid}/status: no TracerPid or Seccomp"))
+    }
+
+    fn cgroup_files(&self, pid: u32) -> Vec<(InodeKey, u8)> {
+        let Ok(text) = crate::state_read::read_state(self.0.join(pid.to_string()).join("cgroup")) else {
+            return Vec::new();
+        };
+        let Some(cg) = unified_cgroup(&text) else {
+            return Vec::new();
+        };
+        cgroup_file_plan(Path::new("/sys/fs/cgroup"), cg)
+            .into_iter()
+            .filter_map(|(p, op)| {
+                let m = antitamper_bpf::kernel_roots::metadata(&p).ok()?;
+                Some((
+                    InodeKey {
+                        dev: super::filesystem::stat_dev_to_kernel_dev(std::os::unix::fs::MetadataExt::dev(&m)),
+                        ino: std::os::unix::fs::MetadataExt::ino(&m),
+                    },
+                    op,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -1317,6 +1385,11 @@ trait TreeMaps {
     fn read_closed(&mut self) -> std::result::Result<[u64; 2], String>;
     /// `TREE_CLOSED[0] = [0, 0]`.
     fn zero_closed(&mut self) -> std::result::Result<(), String>;
+    /// Lot 2.3a (D7): `TREE_CGROUP_FILES[key] = value` (`[generation,
+    /// operation]`). Emptied with the members ([`Self::clear_members`]).
+    fn put_cgroup_file(&mut self, _key: InodeKey, _value: [u64; 2]) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The pinned maps under the pin root.
@@ -1351,7 +1424,23 @@ impl TreeMaps for PinnedTreeMaps<'_> {
         for k in &keys {
             h.remove(k).map_err(|e| e.to_string())?;
         }
+        // lot 2.3a (D7): and the root's cgroup files
+        let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        let files: Vec<super::filesystem::AyaInodeKey> = c.keys().filter_map(std::result::Result::ok).collect();
+        for k in &files {
+            c.remove(k).map_err(|e| e.to_string())?;
+        }
         Ok(keys.len())
+    }
+
+    fn put_cgroup_file(&mut self, key: InodeKey, value: [u64; 2]) -> std::result::Result<(), String> {
+        let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        c.insert(&super::filesystem::AyaInodeKey(key), &value, 0)
+            .map_err(|e| e.to_string())
     }
 
     fn write_grant(&mut self, grant: FsGrantV2) -> std::result::Result<(), String> {

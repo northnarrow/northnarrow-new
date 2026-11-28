@@ -47,6 +47,18 @@ fn reregister_admin_pub_after_rotate(
              FAILED — admin.pub is UNPROTECTED against tamper until the next agent restart"
         );
     }
+    // Lot 2.3a (K4, the review of #647): and kept by any window (INODE_EXT);
+    // a failure here refuses every tree window until it is registered (the
+    // arming's manifest re-checks the key files, fail-closed).
+    if let Err(e) =
+        crate::anti_tamper::filesystem::reregister_kept_file(pin_root, config_path, old_inode_key)
+    {
+        warn!(
+            error = ?e,
+            "rotate-keys: re-registering rotated admin.pub inode in INODE_EXT FAILED — tree \
+             windows are refused until it is kept"
+        );
+    }
 }
 
 /// Tappa 8 A13 — handle one [`RotateKeysAddRequest`] (design

@@ -6,7 +6,10 @@
 //! * [`FS_GRANT_V2`]: the grant slot (`northnarrow_common::wire::FsGrantV2`:
 //!   the 64-bit generation, the `CLOCK_BOOTTIME` deadline, the agent's
 //!   heartbeat).
-//! * [`TREE_MEMBERS`]: the members, by tgid.
+//! * [`TREE_MEMBERS`]: the members, by tgid; [`TREE_PENDING`], a member's
+//!   child before it has a tgid entry (lot 2.3a, the fork span);
+//!   [`TREE_CGROUP_FILES`], the root's cgroup files an outsider may not
+//!   write (lot 2.3a, D7).
 //! * [`WINDOW_LEASES`]: the single-use leases of PID 1's link actions.
 //! * [`WINDOW_EVENTS`]: the window's own ring, with its pinned per-CPU
 //!   sequence ([`WINDOW_EVENT_SEQ`]) and drop counters
@@ -23,8 +26,8 @@ use aya_ebpf::{
     maps::{Array, HashMap, PerCpuArray, RingBuf},
 };
 use northnarrow_common::wire::{
-    FsGrantV2, TreeMember, WindowEventRaw, WindowLease, TREE_MEMBERS_MAX, WINDOW_EVENTS_RING_BYTES,
-    WINDOW_LEASES_MAX,
+    FsGrantV2, InodeKey, TreeMember, WindowEventRaw, WindowLease, TREE_CGROUP_FILES_MAX, TREE_MEMBERS_MAX,
+    TREE_PENDING_MAX, WINDOW_EVENTS_RING_BYTES, WINDOW_LEASES_MAX,
 };
 
 /// The grant slot (one).
@@ -34,6 +37,18 @@ pub static FS_GRANT_V2: Array<FsGrantV2> = Array::pinned(1, 0);
 /// The window's members.
 #[map]
 pub static TREE_MEMBERS: HashMap<u32, TreeMember> = HashMap::pinned(TREE_MEMBERS_MAX, 0);
+
+/// Lot 2.3a (the fork span): a member's child from `task_alloc` to
+/// `sched_process_fork`, by its `task_struct` address, the value the
+/// generation it joins (`crate::window_tree::tree_task_alloc`).
+#[map]
+pub static TREE_PENDING: HashMap<u64, u64> = HashMap::pinned(TREE_PENDING_MAX, 0);
+
+/// Lot 2.3a (D7): the window root's cgroup's and its ancestors'
+/// `cgroup.kill` and `cgroup.freeze`, `[generation, operation]`
+/// (`crate::window_tree::nn_tree_cgroup_file`).
+#[map]
+pub static TREE_CGROUP_FILES: HashMap<InodeKey, [u64; 2]> = HashMap::pinned(TREE_CGROUP_FILES_MAX, 0);
 
 /// The single-use leases.
 #[map]

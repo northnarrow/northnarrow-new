@@ -43,7 +43,7 @@ use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
     BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, CONF_PROPAGATED, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG,
-    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB,
+    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_KEPT, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB,
     MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE, SYSFS_MAGIC,
     TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root, held_under,
 };
@@ -240,6 +240,9 @@ pub fn protected_points(
     for d in &own {
         add(d, MG_OWN | MG_HOLD, &mut out);
     }
+    // Lot 2.3a (K4, the review of #647): the key files' directory — a mount
+    // on, over or below it is refused inside a window too
+    add(CONFIG_DIR, MG_KEPT, &mut out);
     for p in BINARY_AND_UNIT_PATHS.iter().filter(|p| exists(p)) {
         add(p, MG_ON | MG_HOLD, &mut out);
     }

@@ -1488,9 +1488,12 @@ pub enum FsProtectOperation {
     /// directory's inode.
     AncestorRename,
     /// Lot 2.3: a write-open of a block device that backs the agent's
-    /// files (`wire::PROTECTED_BDEVS_MAP_NAME`), refused — its blocks
-    /// written under the filesystem, past every inode hook. The target the
-    /// device node's inode.
+    /// files (`wire::PROTECTED_BDEVS_MAP_NAME`), or of its disk's SCSI
+    /// generic node, refused under the kernel-read option's block-device
+    /// class (`kernel-read-refuse`; lot 2.3a, the review of #647: let
+    /// through and recorded otherwise, [`Self::BdevWriteNoted`]) — its
+    /// blocks written under the filesystem, past every inode hook. The
+    /// target the device node's inode.
     BdevWrite,
     /// Lot 2.3: a read-open of such a block device, refused under the
     /// kernel-read option (`wire::KERNEL_READ_BLOCK_DEVICE`): the agent's
@@ -1507,6 +1510,23 @@ pub enum FsProtectOperation {
     /// binder) by a process outside the agent's family, refused. The target
     /// the inode (0:0 for a ring).
     FdReceive,
+    /// Lot 2.3a (the review of #647): NOT a refusal — what
+    /// [`Self::BdevWrite`] refuses under the kernel-read option, let
+    /// through and recorded by default (grub-install, LVM, cryptsetup,
+    /// tune2fs meet it). The target the device node's inode.
+    BdevWriteNoted,
+    /// Lot 2.3a (the review of #647): a passthrough command (`SG_IO`,
+    /// `SCSI_IOCTL_SEND_COMMAND`, an NVMe command ioctl) to a block device
+    /// that backs the agent's files or to one of its disk's passthrough
+    /// nodes (sg, bsg, NVMe generic or controller), refused under the
+    /// kernel-read option's block-device class. `target_dev` the device's
+    /// number (the kernel's `MKDEV`: major << 20 | minor), `target_ino` the
+    /// ioctl's command.
+    BdevPassthrough,
+    /// Lot 2.3a (the review of #647): NOT a refusal — such a command let
+    /// through and recorded by default; the fields as
+    /// [`Self::BdevPassthrough`]'s.
+    BdevPassthroughNoted,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1579,6 +1599,9 @@ impl FsProtectOperation {
             crate::wire::FS_OP_BDEV_READ => Self::BdevRead,
             crate::wire::FS_OP_FATAL_SIGNAL => Self::FatalSignal,
             crate::wire::FS_OP_FD_RECEIVE => Self::FdReceive,
+            crate::wire::FS_OP_BDEV_WRITE_NOTED => Self::BdevWriteNoted,
+            crate::wire::FS_OP_BDEV_PASSTHROUGH => Self::BdevPassthrough,
+            crate::wire::FS_OP_BDEV_PASSTHROUGH_NOTED => Self::BdevPassthroughNoted,
             other => Self::Unknown(other),
         }
     }
@@ -1649,6 +1672,9 @@ impl FsProtectOperation {
             Self::BdevRead => "bdev_read",
             Self::FatalSignal => "fatal_signal",
             Self::FdReceive => "fd_receive",
+            Self::BdevWriteNoted => "bdev_write_noted",
+            Self::BdevPassthrough => "bdev_passthrough",
+            Self::BdevPassthroughNoted => "bdev_passthrough_noted",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2641,6 +2667,24 @@ mod tests {
                 FsProtectOperation::FdReceive,
                 "fd_receive",
             ),
+            // the review of #647: a block device's raw write let through and
+            // recorded; a passthrough command refused, or let through and
+            // recorded
+            (
+                crate::wire::FS_OP_BDEV_WRITE_NOTED,
+                FsProtectOperation::BdevWriteNoted,
+                "bdev_write_noted",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_PASSTHROUGH,
+                FsProtectOperation::BdevPassthrough,
+                "bdev_passthrough",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_PASSTHROUGH_NOTED,
+                FsProtectOperation::BdevPassthroughNoted,
+                "bdev_passthrough_noted",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -2668,8 +2712,9 @@ mod tests {
             assert!(!matches!(op, FsProtectOperation::Unknown(_)), "{code}");
             assert_eq!(op.as_str(), name, "{code}");
         }
-        // lot 2.2's five and lot 2.3a's five
-        assert_eq!(landed, 10);
+        // lot 2.2's five and lot 2.3a's eight (the review of #647: three
+        // more, the block devices' records let through and their commands)
+        assert_eq!(landed, 13);
     }
 
     /// Lot 2.3a: the window record's kinds and classes are the wire's, byte
