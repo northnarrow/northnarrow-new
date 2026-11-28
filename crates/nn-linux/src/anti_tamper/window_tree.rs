@@ -58,10 +58,10 @@ pub const PROGRAMS: [(&str, Kind, &str); 12] = [
 /// (`common::btf_offsets`), each one a missing hook when this kernel does
 /// not have it: no lift, and no tree window.
 /// Lot 2.3a (the review of #647): the task's `__state` (the fork span's
-/// `TASK_NEW` guard) and its `real_parent` (a member's child), and the
-/// vma's flags and file (the `mprotect` judge: without them every
+/// `TASK_NEW` guard; its `real_parent` is a field every start needs), and
+/// the vma's flags and file (the `mprotect` judge: without them every
 /// executable `mprotect` would be judged anonymous) are among them.
-pub const REQUIRED_FIELDS: [&str; 17] = [
+pub const REQUIRED_FIELDS: [&str; 16] = [
     "TASK_STRUCT_START_BOOTTIME_OFFSET",
     "TASK_STRUCT_PTRACE_OFFSET",
     "TASK_STRUCT_SECCOMP_MODE_OFFSET",
@@ -76,7 +76,6 @@ pub const REQUIRED_FIELDS: [&str; 17] = [
     "MM_STRUCT_ENV_START_OFFSET",
     "MM_STRUCT_ENV_END_OFFSET",
     "TASK_STRUCT_STATE_OFFSET",
-    "TASK_STRUCT_REAL_PARENT_OFFSET",
     "VM_AREA_STRUCT_VM_FLAGS_OFFSET",
     "VM_AREA_STRUCT_VM_FILE_OFFSET",
 ];

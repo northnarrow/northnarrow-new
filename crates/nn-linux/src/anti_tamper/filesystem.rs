@@ -2131,13 +2131,31 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
         .filter_map(std::result::Result::ok)
         .map(|(k, v)| (k.0, v))
         .collect();
-    let get = |k: &InodeKey| snapshot.iter().find(|(q, _)| q == k).map(|(_, v)| *v);
+    // the lab's fault (a debug-trigger build only): the registration fails,
+    // as a full or unwritable map would — every key file unkept
+    let fail = cfg!(feature = "debug-trigger") && Path::new(DEBUG_KEY_KEPT_FAIL).exists();
+    let get = |k: &InodeKey| {
+        if fail {
+            return None;
+        }
+        snapshot.iter().find(|(q, _)| q == k).map(|(_, v)| *v)
+    };
     let mut insert = |k: &InodeKey, v: u8| {
+        if fail {
+            return Err(anyhow!(
+                "{DEBUG_KEY_KEPT_FAIL}: the registration's failure simulated"
+            ));
+        }
         map.insert(&AyaInodeKey(*k), &v, 0)
             .map_err(anyhow::Error::from)
     };
     key_files_not_kept_with(Path::new(CONFIG_DIR), &key_of, &get, &mut insert)
 }
+
+/// A debug-trigger build's lab fault for [`key_files_not_kept`]: while this
+/// file exists the key files' registration fails (the lab's check that a
+/// tree window is then refused, signed).
+pub const DEBUG_KEY_KEPT_FAIL: &str = "/run/nn-debug-key-kept-fail";
 
 /// Lot 2.3a (K4, the review of #647): after a rotation's rewrite of a key
 /// file (a new inode), the new inode kept by any window in the pinned
