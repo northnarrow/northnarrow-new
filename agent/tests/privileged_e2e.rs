@@ -3345,10 +3345,10 @@ fn sigio_denials(log: &Path, pid: u32, sig: i32) -> usize {
 /// nothing recorded it. Now: the plain SIGIO, an `F_SETSIG` SIGKILL, the
 /// `F_SETOWN_EX` thread owner and a socket's `FIOSETOWN` are refused — the
 /// agent lives and each refusal is signed (`op=sigio`) — and a pidfd's
-/// SIGKILL is refused by `task_kill` (EPERM). Inside a signed
-/// trusted-installer window the window's signal grant applies: a stop
-/// signal of its mask (SIGCONT, harmless) passes and is not recorded, the
-/// plain SIGIO is still refused.
+/// SIGKILL is refused by `task_kill` (EPERM). Lot 2.3a (C112w): a signal
+/// through a file's owner has no sender to tell, so no window lifts it —
+/// inside a signed trusted-installer window the SIGCONT of the window's
+/// stop mask is refused and signed as well as the plain SIGIO.
 #[cfg(feature = "debug-trigger")]
 #[test]
 fn signals_through_a_file_s_owner_are_refused_and_signed() {
@@ -3420,8 +3420,9 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
         "the agent is gone after the pidfd's SIGKILL"
     );
 
-    // 2. Inside a window: the grant's stop signals pass (SIGCONT is one of
-    //    them, and harmless), the plain SIGIO does not.
+    // 2. Inside a window: no exception through a file's owner (C112w) —
+    //    the SIGCONT of the grant's stop mask is refused and signed, and so
+    //    is the plain SIGIO.
     const WINDOW_SECS: u32 = 8;
     fx.grant_window("sigio", WINDOW_SECS)
         .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
@@ -3429,6 +3430,15 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
     let cont_before = sigio_denials(&log, pid, libc::SIGCONT);
     let io_before = sigio_denials(&log, pid, libc::SIGIO);
     fire(Owner::Pid, pid, libc::SIGCONT).expect("SIGCONT armed inside the window");
+    let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
+    while sigio_denials(&log, pid, libc::SIGCONT) <= cont_before {
+        assert!(
+            Instant::now() < deadline,
+            "inside the window SIGCONT through the file's owner was not refused and signed\n{}",
+            log_tail(&log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     std::thread::sleep(Duration::from_millis(1200));
     fire(Owner::Pid, pid, 0).expect("SIGIO armed inside the window");
     let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
@@ -3441,13 +3451,9 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(alive(&mut fx), "the agent is gone after the window's SIGIO");
-    assert_eq!(
-        sigio_denials(&log, pid, libc::SIGCONT),
-        cont_before,
-        "inside the window the grant's SIGCONT was refused"
-    );
     // the window's end
     std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 1));
+    let cont_before = sigio_denials(&log, pid, libc::SIGCONT);
     fire(Owner::Pid, pid, libc::SIGCONT).expect("SIGCONT armed after the window");
     let deadline = Instant::now() + GUARD_LOG_TIMEOUT;
     while sigio_denials(&log, pid, libc::SIGCONT) <= cont_before {
