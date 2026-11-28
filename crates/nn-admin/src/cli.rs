@@ -546,17 +546,20 @@ enum Cmd {
         sub: ExportCmd,
     },
 
-    // FIM-009 self-upgrade (§15.1).
-    /// Open a trusted-installer window, for an upgrade, an uninstall or a
-    /// restart of the agent. Submits a grant signed by one key; the
-    /// admin.pub line for `--key` MUST carry the `trusted-installer`
+    // FIM-009 self-upgrade (§15.1). Lot 2.3b: deprecated, kept for the
+    // installer flows that have not moved to the window per process tree
+    // (lot 2.4 moves them).
+    /// Deprecated: open the host-wide trusted-installer window. Use
+    /// `nn-admin window-run -- <command>` instead, whose window is for that
+    /// command's processes only. Kept for the install, upgrade and removal
+    /// scripts that still ask for it. Submits a grant signed by one key;
+    /// the admin.pub line for `--key` MUST carry the `trusted-installer`
     /// role. While the window is open the agent's file protection is
-    /// suspended (so install.sh can replace the protected binaries), the
-    /// units may be stopped, and a write to the agent's own systemd units
-    /// is recorded, not answered with a kill. The window is bounded
-    /// by --window-secs (clamped to the agent's 600 s ceiling) and by
-    /// the next agent restart. Operator flow: grant → install.sh →
-    /// `systemctl restart` → signed `fim baseline`.
+    /// suspended for every process of the host, the units may be stopped,
+    /// and a write to the agent's own systemd units is recorded, not
+    /// answered with a kill. The window is bounded by --window-secs
+    /// (clamped to the agent's 600 s ceiling) and by the next agent
+    /// restart.
     TrustedInstallerGrant {
         /// Path to the operator's `trusted-installer`-role admin
         /// private key.
@@ -581,15 +584,122 @@ enum Cmd {
         /// names no installer. install.sh and uninstall.sh pass it.
         #[arg(long = "for-installer")]
         for_installer: bool,
-        // Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
-        // replaces it with `window-run`): the grant for one process tree,
-        // rooted at this command's parent (its pid and its start, signed).
-        // Never falls back to the host-wide grant.
-        /// Lab only: the window is for the process tree of this command's
-        /// parent, not the whole host. A refusal is final: no other grant
-        /// is asked for.
-        #[arg(long = "tree", hide = true, conflicts_with = "for_installer")]
-        tree: bool,
+    },
+
+    // Lot 2.3b (D2): the manual window, for one command's process tree.
+    /// Run a command inside a trusted-installer window for its own process
+    /// tree: the agent's protections are lifted for this command and every
+    /// process it starts, and for nothing else on the host. The grant is
+    /// signed by --key (its admin.pub line MUST carry the
+    /// `trusted-installer` role). The command reads /dev/null as its input
+    /// and gets a minimal environment: the system PATH, the locale, the
+    /// terminal, HOME, USER, LOGNAME, NN_GRANT_KEY, the package tools'
+    /// non-interactive switches, and NN_WINDOW_GENERATION (the window's
+    /// number, for `window-stop` and `window-lease`). While the window is
+    /// open, a process outside it cannot change the system's programs,
+    /// libraries, the loader's configuration or the package managers'
+    /// hooks. The window is refused when such a hook or configuration file
+    /// is owned by no package or differs from the package database (the
+    /// refusal names each with its SHA-256). It ends when the command
+    /// exits, at --window-secs (600 s at most), or at the agent's next
+    /// start. The exit status is the command's.
+    WindowRun {
+        /// Path to the operator's `trusted-installer`-role admin private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// The window's longest span, in seconds (600 at most).
+        #[arg(long = "window-secs", default_value_t = DEFAULT_TRUSTED_INSTALLER_WINDOW_SECS)]
+        window_secs: u32,
+        /// Path to the agent's per-install UUID file.
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// Give the command this terminal as its input. Refused where any
+        /// process may type into a terminal (dev.tty.legacy_tiocsti is 1,
+        /// or a kernel without it); elsewhere the window is recorded as
+        /// degraded, since the terminal's other end is outside the window.
+        #[arg(long)]
+        interactive: bool,
+        /// Accept a hook or loader configuration file no package vouches
+        /// for, by the SHA-256 the refusal printed for it, once you have
+        /// checked it (repeatable).
+        #[arg(long = "accept-foreign", value_name = "SHA256")]
+        accept_foreign: Vec<String>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+
+    // Lot 2.3b (D3): the window for our install.sh or a package scriptlet.
+    /// Open a trusted-installer window for the process tree of the script
+    /// that runs this command (`--script`, the script's own path: the
+    /// agent checks the script is what this command's parent runs), or of
+    /// the package manager that runs this package's maintainer script
+    /// (`--for-package`). The install and removal scripts call it; an
+    /// operator uses `window-run`. Prints NN_WINDOW_GENERATION=<number> on
+    /// success. A refusal is final: the host-wide window is not asked for
+    /// instead.
+    InstallerWindow {
+        /// Path to the `trusted-installer`-role admin private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// The window's longest span, in seconds (600 at most).
+        #[arg(long = "window-secs", default_value_t = DEFAULT_TRUSTED_INSTALLER_WINDOW_SECS)]
+        window_secs: u32,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// The script this command's parent runs.
+        #[arg(long, value_name = "PATH", conflicts_with = "for_package", required_unless_present = "for_package")]
+        script: Option<PathBuf>,
+        /// The window is for the package manager's process that runs this
+        /// package's maintainer script.
+        #[arg(long = "for-package")]
+        for_package: bool,
+        /// Accept a hook or loader configuration file no package vouches
+        /// for, by its SHA-256 (repeatable).
+        #[arg(long = "accept-foreign", value_name = "SHA256")]
+        accept_foreign: Vec<String>,
+    },
+
+    // Lot 2.3b (D1): the controlled stop, asked by a member of the window.
+    /// Inside a trusted-installer window for a process tree: stop the agent
+    /// and the watchdog (they stand down and are not restarted), or with
+    /// --restart restart the agent (the watchdog starts it again). Only a
+    /// process inside the window may ask; systemd's stop signals stay
+    /// refused. The agent signs the request's record before it stops.
+    WindowStop {
+        /// Restart the agent instead of stopping both.
+        #[arg(long)]
+        restart: bool,
+        /// The window's number (default: NN_WINDOW_GENERATION).
+        #[arg(long)]
+        generation: Option<u64>,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    // Lot 2.3b: the single-use leases for PID 1's link removals.
+    /// Inside a trusted-installer window for a process tree: let systemd
+    /// remove one of the units' enablement links (`--link`, its path in a
+    /// `*.wants` or `*.requires` directory), once, within a few seconds —
+    /// what `systemctl disable` needs while the agent's protection is
+    /// live. Run it just before the `systemctl disable`, once per link.
+    /// Only a process inside the window may ask; each use is signed.
+    WindowLease {
+        /// The enablement link's path.
+        #[arg(long, value_name = "PATH")]
+        link: PathBuf,
+        /// The link's creation instead (never refused: nothing is armed).
+        #[arg(long)]
+        create: bool,
+        /// The window's number (default: NN_WINDOW_GENERATION).
+        #[arg(long)]
+        generation: Option<u64>,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 
     // External audit CMB-016.
@@ -2331,8 +2441,12 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             agent_id_file,
             socket,
             for_installer,
-            tree,
         } => {
+            // lot 2.3b: the host-wide window is deprecated
+            eprintln!(
+                "trusted-installer-grant: deprecated — this opens the host-wide window; use \
+                 `nn-admin window-run -- <command>`, whose window is for that command only"
+            );
             // Clamp client-side to the agent's ceiling (the agent also
             // clamps; this gives the operator a clear message instead
             // of a silent server-side reduction).
@@ -2343,11 +2457,6 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     "trusted-installer-grant: --window-secs {window_secs} clamped to {clamped} \
                      (agent ceiling)"
                 );
-            }
-            // lot 2.3a's minimal path (lot 2.3b replaces it): the tree
-            // grant, rooted at this command's parent; never the plain one
-            if tree {
-                return run_tree_grant_cmd(&socket, &key, &agent_id_file, clamped);
             }
             let run = if for_installer {
                 run_trusted_installer_grant_for_installer
@@ -2366,6 +2475,63 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 Err(e) => exit_from_request_error("trusted-installer-grant", &e),
             }
         }
+
+        Cmd::WindowRun {
+            key,
+            window_secs,
+            agent_id_file,
+            socket,
+            interactive,
+            accept_foreign,
+            command,
+        } => run_window_run_cmd(
+            &socket,
+            &key,
+            &agent_id_file,
+            window_secs,
+            interactive,
+            &accept_foreign,
+            &command,
+        ),
+        Cmd::InstallerWindow {
+            key,
+            window_secs,
+            agent_id_file,
+            socket,
+            script,
+            for_package,
+            accept_foreign,
+        } => run_installer_window_cmd(
+            &socket,
+            &key,
+            &agent_id_file,
+            window_secs,
+            script.as_deref().filter(|_| !for_package),
+            &accept_foreign,
+        ),
+        Cmd::WindowStop {
+            restart,
+            generation,
+            socket,
+        } => match window_generation(generation) {
+            Ok(g) => window_member_reply(
+                "window-stop",
+                crate::admin_cli::run_window_control(&socket, g, restart),
+            ),
+            Err(code) => code,
+        },
+        Cmd::WindowLease {
+            link,
+            create,
+            generation,
+            socket,
+        } => match window_generation(generation) {
+            Ok(g) => window_member_reply(
+                "window-lease",
+                crate::admin_cli::run_window_lease(&socket, g, &link.to_string_lossy(), create),
+            ),
+            Err(code) => code,
+        },
 
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
@@ -5640,49 +5806,215 @@ fn warn_harmful_dropins(
     }
 }
 
-/// Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
-/// replaces it with `window-run`): `trusted-installer-grant --tree` — the
-/// grant for this command's parent's process tree (its pid and its start,
-/// read from `/proc`, inside the signed scope). A refusal is final: the
-/// plain grant is never asked for instead (the design's section 5).
-fn run_tree_grant_cmd(
+/// Lot 2.3b: the window's number a member names — `--generation`, or
+/// `NN_WINDOW_GENERATION` (what `window-run` gives its command and
+/// `installer-window` prints).
+fn window_generation(given: Option<u64>) -> std::result::Result<u64, ExitCode> {
+    if let Some(g) = given {
+        return Ok(g);
+    }
+    match std::env::var("NN_WINDOW_GENERATION").ok().and_then(|v| v.trim().parse().ok()) {
+        Some(g) => Ok(g),
+        None => {
+            eprintln!(
+                "nn-admin: no window number: give --generation, or run inside `nn-admin \
+                 window-run` (NN_WINDOW_GENERATION)"
+            );
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Lot 2.3b: a window member's request answered: its detail, and exit 0 on
+/// `Success`, 5 when refused (the agent's reason printed).
+fn window_member_reply(
+    what: &str,
+    reply: anyhow::Result<nn_proto::admin_protocol::WindowReply>,
+) -> ExitCode {
+    match reply {
+        Ok(r) if matches!(r.result, nn_proto::admin_protocol::AdminResult::Success) => {
+            println!("{what}: {}", r.detail);
+            ExitCode::SUCCESS
+        }
+        Ok(r) => {
+            eprintln!("{what}: refused ({:?}): {}", r.result, r.detail);
+            ExitCode::from(5)
+        }
+        Err(e) => exit_from_request_error(what, &e),
+    }
+}
+
+/// Lot 2.3b: the digests `--accept-foreign` gives, each 64 hex characters.
+fn accepted_digests(what: &str, given: &[String]) -> std::result::Result<Vec<[u8; 32]>, ExitCode> {
+    let max = nn_proto::admin_signed_payload::MAX_ACCEPTED_FOREIGN;
+    if given.len() > max {
+        eprintln!("{what}: at most {max} --accept-foreign digests");
+        return Err(ExitCode::from(1));
+    }
+    given
+        .iter()
+        .map(|h| crate::admin_cli::parse_sha256(h))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| {
+            eprintln!("{what}: {e:#}");
+            ExitCode::from(1)
+        })
+}
+
+/// Lot 2.3b: a tree grant asked: the agent's reply printed — its detail on
+/// success, its reason on a refusal (exit 5) — and the window's number.
+fn tree_grant_reply(
+    what: &str,
+    socket: &std::path::Path,
+    key: &std::path::Path,
+    agent_id_file: &std::path::Path,
+    extra: nn_proto::admin_signed_payload::TrustedInstallerTreeGrantExtra,
+) -> std::result::Result<u64, ExitCode> {
+    match crate::admin_cli::run_trusted_installer_tree_grant(socket, key, agent_id_file, extra) {
+        Ok(r) if matches!(r.result, nn_proto::admin_protocol::AdminResult::Success) => {
+            eprintln!("{what}: {}", r.detail);
+            Ok(r.generation)
+        }
+        Ok(r) => {
+            eprintln!(
+                "{what}: the agent refused the window ({:?}), nothing armed: {}",
+                r.result, r.detail
+            );
+            Err(ExitCode::from(5))
+        }
+        Err(e) => Err(exit_from_request_error(what, &e)),
+    }
+}
+
+/// Lot 2.3b (D2): `nn-admin window-run -- <command>` — this process is the
+/// window's root: the grant for its own tree (signed, with its pid and its
+/// start), then the command run as its child with a sanitised environment
+/// (`nn_core`'s `window_run_env` and `NN_WINDOW_GENERATION`), stdin from
+/// `/dev/null` unless `--interactive`; this process waits for it and exits
+/// with its status, which ends the window.
+fn run_window_run_cmd(
     socket: &std::path::Path,
     key: &std::path::Path,
     agent_id_file: &std::path::Path,
     window_secs: u32,
+    interactive: bool,
+    accept_foreign: &[String],
+    command: &[String],
 ) -> ExitCode {
-    let (root_pid, root_start_ticks) = match crate::admin_cli::parent_root() {
-        Ok(root) => root,
+    use nn_proto::admin_signed_payload::{TreeRootKind, TrustedInstallerTreeGrantExtra};
+    let Some((program, args)) = command.split_first() else {
+        eprintln!("window-run: no command given after `--`");
+        return ExitCode::from(1);
+    };
+    let accepted = match accepted_digests("window-run", accept_foreign) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    let (root_pid, root_start_ticks) = match crate::admin_cli::self_root() {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("trusted-installer-grant: the window's root (this command's parent): {e:#}");
+            eprintln!("window-run: this process's start: {e:#}");
             return ExitCode::from(1);
         }
     };
-    match crate::admin_cli::run_trusted_installer_tree_grant(
-        socket,
-        key,
-        agent_id_file,
-        window_secs,
+    let max = nn_core::anti_tamper::trusted_installer::MAX_TRUSTED_INSTALLER_WINDOW_SECS;
+    let extra = TrustedInstallerTreeGrantExtra {
+        window_secs: window_secs.clamp(1, max),
         root_pid,
         root_start_ticks,
-    ) {
-        Ok(TrustedInstallerGrantOutcome::Success) => {
-            let tty = colour_on(std::io::stdout().is_terminal());
-            println!(
-                "{}",
-                colorize(
-                    &format!(
-                        "trusted-installer-grant: window armed for {window_secs}s for the \
-                         process tree of {root_pid} (this command's parent) only"
-                    ),
-                    "32",
-                    tty
-                )
-            );
+        root_kind: TreeRootKind::WindowRun,
+        interactive,
+        script_sha256: [0; 32],
+        accepted_foreign: accepted,
+    };
+    let generation = match tree_grant_reply("window-run", socket, key, agent_id_file, extra) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
+    let env = nn_core::anti_tamper::trusted_installer::window_run_env(
+        std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .envs(env)
+        .env("NN_WINDOW_GENERATION", generation.to_string());
+    if !interactive {
+        cmd.stdin(std::process::Stdio::null());
+    }
+    match cmd.status() {
+        Ok(status) => {
+            use std::os::unix::process::ExitStatusExt;
+            match (status.code(), status.signal()) {
+                (Some(c), _) => ExitCode::from(u8::try_from(c).unwrap_or(1)),
+                (None, Some(sig)) => ExitCode::from(u8::try_from(128 + sig).unwrap_or(1)),
+                (None, None) => ExitCode::from(1),
+            }
+        }
+        Err(e) => {
+            eprintln!("window-run: running {program}: {e}");
+            ExitCode::from(if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 })
+        }
+    }
+}
+
+/// Lot 2.3b (D3): `nn-admin installer-window` — the window for the script
+/// that runs this command (`script`: its path, whose SHA-256 is signed) or
+/// for the package manager running our scriptlet (`script` `None`). Prints
+/// `NN_WINDOW_GENERATION=<n>` on success.
+fn run_installer_window_cmd(
+    socket: &std::path::Path,
+    key: &std::path::Path,
+    agent_id_file: &std::path::Path,
+    window_secs: u32,
+    script: Option<&std::path::Path>,
+    accept_foreign: &[String],
+) -> ExitCode {
+    use nn_proto::admin_signed_payload::{TreeRootKind, TrustedInstallerTreeGrantExtra};
+    let accepted = match accepted_digests("installer-window", accept_foreign) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    let (root, kind, digest) = match script {
+        Some(path) => {
+            let digest = match crate::admin_cli::script_digest(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("installer-window: {e:#}");
+                    return ExitCode::from(1);
+                }
+            };
+            (crate::admin_cli::parent_root(), TreeRootKind::InstallScript, digest)
+        }
+        None => (
+            crate::admin_cli::package_manager_root(),
+            TreeRootKind::PackageManager,
+            [0; 32],
+        ),
+    };
+    let (root_pid, root_start_ticks) = match root {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("installer-window: the window's root: {e:#}");
+            return ExitCode::from(1);
+        }
+    };
+    let max = nn_core::anti_tamper::trusted_installer::MAX_TRUSTED_INSTALLER_WINDOW_SECS;
+    let extra = TrustedInstallerTreeGrantExtra {
+        window_secs: window_secs.clamp(1, max),
+        root_pid,
+        root_start_ticks,
+        root_kind: kind,
+        interactive: false,
+        script_sha256: digest,
+        accepted_foreign: accepted,
+    };
+    match tree_grant_reply("installer-window", socket, key, agent_id_file, extra) {
+        Ok(g) => {
+            println!("NN_WINDOW_GENERATION={g}");
             ExitCode::SUCCESS
         }
-        Ok(outcome) => exit_from_trusted_installer_grant(outcome, window_secs),
-        Err(e) => exit_from_request_error("trusted-installer-grant", &e),
+        Err(code) => code,
     }
 }
 
@@ -7855,57 +8187,66 @@ mod audit_verify_source_tests {
     }
 }
 
-/// Lot 2.3a's minimal path (lot 2.3b replaces it): `trusted-installer-grant
-/// --tree`, the lab's grant for one process tree, is hidden from the help
-/// and never combined with `--for-installer`.
+/// Lot 2.3b: the window verbs parse as documented — `window-run` needs its
+/// command after `--`, `installer-window` exactly one of `--script` and
+/// `--for-package`, the member verbs a window's number — and the host-wide
+/// grant no longer takes 2.3a's hidden `--tree` (its path is `window-run`'s).
 #[cfg(test)]
-mod tree_flag_tests {
-    use super::{Cli, Cmd, command};
+mod window_verb_tests {
+    use super::{Cli, Cmd};
     use clap::Parser as _;
 
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("nn-admin").chain(args.iter().copied()))
+    }
+
     #[test]
-    fn the_tree_flag_parses_is_hidden_and_excludes_for_installer() {
-        let cli = Cli::try_parse_from([
-            "nn-admin",
-            "trusted-installer-grant",
+    fn the_window_verbs_parse_as_documented() {
+        let cli = parse(&[
+            "window-run",
             "--key",
             "/k",
-            "--tree",
+            "--accept-foreign",
+            &"ab".repeat(32),
+            "--",
+            "/usr/bin/apt-get",
+            "-y",
+            "upgrade",
         ])
         .expect("parses");
+        match cli.cmd {
+            Cmd::WindowRun {
+                command,
+                interactive,
+                accept_foreign,
+                ..
+            } => {
+                assert_eq!(command, ["/usr/bin/apt-get", "-y", "upgrade"]);
+                assert!(!interactive);
+                assert_eq!(accept_foreign.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&["window-run", "--key", "/k"]).is_err(), "no command");
+        assert!(parse(&["installer-window", "--key", "/k"]).is_err(), "neither root");
         assert!(
-            matches!(
-                cli.cmd,
-                Cmd::TrustedInstallerGrant {
-                    tree: true,
-                    for_installer: false,
-                    ..
-                }
-            ),
-            "{cli:?}"
+            parse(&["installer-window", "--key", "/k", "--script", "/s", "--for-package"]).is_err(),
+            "both roots"
         );
+        assert!(parse(&["installer-window", "--key", "/k", "--for-package"]).is_ok());
+        assert!(parse(&["window-stop", "--restart", "--generation", "3"]).is_ok());
+        assert!(parse(&["window-lease", "--link", "/x", "--generation", "3"]).is_ok());
+        assert!(parse(&["window-lease"]).is_err(), "no link");
         assert!(
-            Cli::try_parse_from([
-                "nn-admin",
-                "trusted-installer-grant",
-                "--key",
-                "/k",
-                "--tree",
-                "--for-installer",
-            ])
-            .is_err()
+            parse(&["trusted-installer-grant", "--key", "/k", "--tree"]).is_err(),
+            "the hidden --tree is gone"
         );
-        let mut cmd = command();
-        let sub = cmd
-            .find_subcommand_mut("trusted-installer-grant")
-            .expect("trusted-installer-grant");
-        let tree = sub
-            .get_arguments()
-            .find(|a| a.get_id() == "tree")
-            .expect("--tree");
-        assert!(tree.is_hide_set());
-        let help = sub.render_long_help().to_string();
-        assert!(!help.contains("--tree"), "{help}");
-        assert!(help.contains("--for-installer"), "{help}");
+    }
+
+    #[test]
+    fn a_digest_to_accept_is_64_hex_characters() {
+        assert_eq!(crate::admin_cli::parse_sha256(&"0f".repeat(32)).unwrap(), [0x0f; 32]);
+        assert!(crate::admin_cli::parse_sha256("0f").is_err());
+        assert!(crate::admin_cli::parse_sha256(&"zz".repeat(32)).is_err());
     }
 }

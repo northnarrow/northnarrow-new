@@ -30,7 +30,7 @@ use nn_model::posture_types::PostureKind;
 use nn_proto::admin_protocol::{
     AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest, CanaryListRequest,
     CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature, ShutdownRequest,
-    StatusRequest, decode_frame, encode_frame,
+    StatusRequest, WindowReply, decode_frame, encode_frame,
 };
 use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload, sign};
 
@@ -3072,34 +3072,28 @@ pub fn run_trusted_installer_grant_for_installer(
     }
 }
 
-/// Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
-/// replaces it with `window-run`): the grant for the process tree of
-/// `root_pid` started at `root_start_ticks` (both inside the signed scope,
-/// `OperationCode::TrustedInstallerTreeGrant`). Never falls back: an agent
-/// that cannot decode it closes the connection, and that is the error
-/// returned — the host-wide grant is not asked for instead.
+/// Lot 2.3b (the window per process tree; lot 2.3a's `--tree` path, now
+/// `window-run`'s and `installer-window`'s): the signed grant for the
+/// process tree `extra` names (its root's pid, start and kind, the
+/// interactive mark, the script's digest, the accepted foreign files, all
+/// inside the signed scope, `OperationCode::TrustedInstallerTreeGrant`),
+/// and the agent's [`WindowReply`]: its result, the window's generation and
+/// what it found. Never falls back: an agent that cannot decode it closes
+/// the connection, and that is the error returned — the host-wide grant is
+/// not asked for instead.
 pub fn run_trusted_installer_tree_grant(
     socket: &Path,
     key_path: &Path,
     agent_id_path: &Path,
-    window_secs: u32,
-    root_pid: u32,
-    root_start_ticks: u64,
-) -> Result<TrustedInstallerGrantOutcome> {
+    extra: nn_proto::admin_signed_payload::TrustedInstallerTreeGrantExtra,
+) -> Result<WindowReply> {
     use nn_proto::admin_protocol::TrustedInstallerTreeGrantRequest;
-    exchange_grant(
+    let reply = signed_request_waiting(
         socket,
         key_path,
         agent_id_path,
         |nonce, now, agent_id| {
-            SignedPayload::new_trusted_installer_tree_grant(
-                nonce,
-                now,
-                agent_id,
-                window_secs,
-                root_pid,
-                root_start_ticks,
-            )
+            SignedPayload::new_trusted_installer_tree_grant_for(nonce, now, agent_id, extra)
         },
         |payload, signatures| {
             AdminMessage::TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest {
@@ -3107,7 +3101,137 @@ pub fn run_trusted_installer_tree_grant(
                 signatures,
             })
         },
+        // the pre-grant check hashes the hook directories first
+        Some(Duration::from_secs(60)),
+    )?;
+    match reply {
+        AdminMessage::WindowReply(r) => Ok(r),
+        other => bail!("unexpected reply to the tree grant: {other:?}"),
+    }
+}
+
+/// Lot 2.3b: one request of a window's member (`msg`: a controlled stop or
+/// restart, a lease), not signed — the agent authenticates the peer — and
+/// its [`WindowReply`].
+fn member_request(socket: &Path, msg: AdminMessage) -> Result<WindowReply> {
+    let mut stream = connect_socket(socket)?;
+    write_frame(&mut stream, &msg)?;
+    match read_frame(&mut stream)? {
+        AdminMessage::WindowReply(r) => Ok(r),
+        other => bail!("unexpected reply to a window member's request: {other:?}"),
+    }
+}
+
+/// Lot 2.3b (D1): `nn-admin window-stop` — the controlled stop (both roles
+/// stand down) or restart of the agent, asked by a member of the window
+/// `generation`.
+pub fn run_window_control(
+    socket: &Path,
+    generation: u64,
+    restart: bool,
+) -> Result<WindowReply> {
+    use nn_proto::admin_protocol::{WindowAction, WindowControlRequest};
+    member_request(
+        socket,
+        AdminMessage::WindowControlRequest(WindowControlRequest {
+            generation,
+            action: if restart {
+                WindowAction::Restart
+            } else {
+                WindowAction::Stop
+            },
+        }),
     )
+}
+
+/// Lot 2.3b: `nn-admin window-lease` — a single-use lease for PID 1's
+/// removal (or, `create`, the creation: never refused) of one of our units'
+/// enablement links, asked by a member of the window `generation`.
+pub fn run_window_lease(
+    socket: &Path,
+    generation: u64,
+    link: &str,
+    create: bool,
+) -> Result<WindowReply> {
+    use nn_proto::admin_protocol::{LeaseAction, WindowLeaseRequest};
+    member_request(
+        socket,
+        AdminMessage::WindowLeaseRequest(WindowLeaseRequest {
+            generation,
+            link: link.to_string(),
+            action: if create {
+                LeaseAction::Create
+            } else {
+                LeaseAction::Remove
+            },
+        }),
+    )
+}
+
+/// Lot 2.3b: this process (`window-run`'s root): its pid and its start.
+pub fn self_root() -> Result<(u32, u64)> {
+    let pid = std::process::id();
+    Ok((pid, proc_start(pid)?))
+}
+
+/// `/proc/<pid>/stat`'s start (field 22).
+fn proc_start(pid: u32) -> Result<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    stat_start_ticks(&String::from_utf8_lossy(&bytes)).ok_or_else(|| anyhow!("{path}: no start"))
+}
+
+/// `/proc/<pid>/stat`'s parent (field 4).
+fn proc_parent(pid: u32) -> Result<u32> {
+    let path = format!("/proc/{pid}/stat");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    String::from_utf8_lossy(&bytes)
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
+        .ok_or_else(|| anyhow!("{path}: no parent"))
+}
+
+/// Lot 2.3b (`installer-window --for-package`): the package manager's
+/// process above this command — the nearest ancestor (within 8) running a
+/// package manager's packaged program — its pid and start. The agent
+/// checks it again, and that our package's scriptlet is on the line.
+pub fn package_manager_root() -> Result<(u32, u64)> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..8 {
+        if pid <= 1 {
+            break;
+        }
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cmdline: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if nn_core::anti_tamper::trusted_installer::package_manager(&exe, &cmdline).is_some() {
+            return Ok((pid, proc_start(pid)?));
+        }
+        pid = proc_parent(pid)?;
+    }
+    bail!("no package manager's process above this command: no window is rooted there")
+}
+
+/// Lot 2.3b: the SHA-256 of `path` (`installer-window --script`).
+pub fn script_digest(path: &Path) -> Result<[u8; 32]> {
+    use sha2::Digest;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(sha2::Sha256::digest(&bytes).into())
+}
+
+/// Lot 2.3b: a digest given on the command line (`--accept-foreign`), 64
+/// hex characters.
+pub fn parse_sha256(hex_digest: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_digest.trim())
+        .map_err(|e| anyhow!("--accept-foreign {hex_digest}: not hex: {e}"))?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("--accept-foreign {hex_digest}: not a SHA-256 (64 hex characters)"))
 }
 
 /// Lot 2.3a's minimal path: the root of `--tree`, this process's parent —
@@ -4069,10 +4193,11 @@ mod tests {
         std::array::from_fn(|i| seed[i % seed.len()] ^ i as u8)
     }
 
-    /// Lot 2.3a's minimal path (lot 2.3b replaces it): `--tree` sends the
-    /// grant for one tree, its root (pid and start) inside the signed
-    /// scope; the agent's refusal is `Refused`; an agent that cannot decode
-    /// it closes the connection, and no other grant is asked for.
+    /// Lot 2.3a, lot 2.3b (`window-run`, `installer-window`): the grant
+    /// for one tree, its root (pid, start, kind), the interactive mark and
+    /// the accepted digests inside the signed scope; the agent's reply
+    /// (`WindowReply`) comes back whole; an agent that cannot decode it
+    /// closes the connection, and no other grant is asked for.
     #[test]
     fn cli_trusted_installer_tree_grant_sends_its_signed_root_and_never_falls_back() {
         use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, signing_digest};
@@ -4095,10 +4220,17 @@ mod tests {
                 }),
             );
         };
-        for (reply, want) in [
-            (AdminResult::Success, "Success"),
-            (AdminResult::ActionFailed, "Refused"),
-        ] {
+        let extra = nn_proto::admin_signed_payload::TrustedInstallerTreeGrantExtra {
+            window_secs: 120,
+            root_pid: 4242,
+            root_start_ticks: 777,
+            root_kind: nn_proto::admin_signed_payload::TreeRootKind::WindowRun,
+            interactive: true,
+            script_sha256: [0; 32],
+            accepted_foreign: vec![[0x0f; 32]],
+        };
+        for (reply, generation) in [(AdminResult::Success, 3), (AdminResult::ActionFailed, 0)] {
+            let want = extra.clone();
             let _ = std::fs::remove_file(&socket);
             let server = spawn_mock_server(&socket, move |stream| {
                 challenge(stream);
@@ -4109,30 +4241,22 @@ mod tests {
                 assert_eq!(req.payload.op, OperationCode::TrustedInstallerTreeGrant);
                 assert_eq!(req.payload.nonce, tree_test_nonce());
                 match &req.payload.extra {
-                    OperationExtra::TrustedInstallerTreeGrant(e) => {
-                        assert_eq!(
-                            (e.window_secs, e.root_pid, e.root_start_ticks),
-                            (120, 4242, 777)
-                        );
-                    }
+                    OperationExtra::TrustedInstallerTreeGrant(e) => assert_eq!(e, &want),
                     other => panic!("expected the tree grant's extra, got {other:?}"),
                 }
                 let digest = signing_digest(&req.payload).expect("digest");
                 let sig = ed25519_dalek::Signature::from_bytes(&req.signatures[0].signature);
                 vk.verify_strict(&digest, &sig)
                     .expect("the root is inside the signed scope");
-                server_write_frame(stream, &AdminMessage::TrustedInstallerGrantResult(reply));
+                server_write_frame(
+                    stream,
+                    &AdminMessage::WindowReply(WindowReply::new(reply, generation, "why")),
+                );
             });
-            let outcome = run_trusted_installer_tree_grant(
-                &socket,
-                &priv_path,
-                &agent_id_path,
-                120,
-                4242,
-                777,
-            )
-            .expect("tree grant");
-            assert_eq!(format!("{outcome:?}"), want);
+            let outcome =
+                run_trusted_installer_tree_grant(&socket, &priv_path, &agent_id_path, extra.clone())
+                    .expect("tree grant");
+            assert_eq!(outcome, WindowReply::new(reply, generation, "why"));
             server.join().unwrap();
         }
         // an agent that cannot decode it: an error, and no second request
@@ -4146,8 +4270,7 @@ mod tests {
             drop(first);
             listener
         });
-        let e =
-            run_trusted_installer_tree_grant(&socket, &priv_path, &agent_id_path, 120, 4242, 777);
+        let e = run_trusted_installer_tree_grant(&socket, &priv_path, &agent_id_path, extra);
         assert!(e.is_err(), "{e:?}");
         let listener = server.join().unwrap();
         listener.set_nonblocking(true).unwrap();
