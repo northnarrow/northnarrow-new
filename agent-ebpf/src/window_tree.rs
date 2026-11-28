@@ -75,8 +75,10 @@ use northnarrow_common::window_tree::{
     CODE_UNSAFE_DIR, ENV_HEAD, ENV_MAX_BYTES, ENV_MAX_VARS, ENV_VAR_MAX, EVICT_ENV, EVICT_EXEC,
     EVICT_FULL, EVICT_MAP, EVICT_TRACED, MEMBER_LIFT, MEMBER_NONE,
 };
+use northnarrow_common::window_tree::{frozen_verdict, lease_applies, FREEZE_WALK};
 use northnarrow_common::wire::{
-    start_ticks, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED, FS_OP_CGROUP_FREEZE,
+    start_ticks, FrozenName, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED, DENIAL_WINDOW_PID1_LEASE,
+    FS_OP_CGROUP_FREEZE, FS_OP_MOUNT, LEASE_REMOVE, WINDOW_EVENT_LEASE_USED, WINDOW_LEASES_MAX,
     FS_OP_CGROUP_KILL,
     DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, FS_OP_FD_RECEIVE, FS_OP_PTRACE,
     WINDOW_EVENT_CLOSE, WINDOW_EVENT_EVICTION, WINDOW_EVENT_OUTSIDER_REFUSED,
@@ -94,7 +96,10 @@ use crate::btf_offsets::{
     TASK_STRUCT_TGID_OFFSET, USER_NAMESPACE_INUM_OFFSET,
     VM_AREA_STRUCT_VM_FILE_OFFSET, VM_AREA_STRUCT_VM_FLAGS_OFFSET,
 };
-use crate::window_maps::{emit_window_event, FS_GRANT_V2, TREE_CGROUP_FILES, TREE_MEMBERS, TREE_PENDING};
+use crate::window_maps::{
+    emit_window_event, FROZEN_INODES, FROZEN_NAMES, FS_GRANT_V2, TREE_CGROUP_FILES, TREE_MEMBERS, TREE_PENDING,
+    WINDOW_LEASES,
+};
 
 const EPERM: c_int = 1;
 /// `PROT_EXEC`, `VM_EXEC`.
@@ -495,6 +500,204 @@ pub extern "C" fn nn_window_class(operation: u64, detail: u64) -> u64 {
             );
         }
         u64::from(class)
+    }
+}
+
+// ── lot 2.3b: the freeze of the system code (D5) ────────────────────────
+
+/// The directory key of `parent` (a dentry) and whether `dentry`'s name in
+/// it is frozen by `generation` ([`FROZEN_NAMES`]): its key when it is.
+#[inline(always)]
+unsafe fn name_frozen(dentry: *const u8, parent: *const u8, generation: u64) -> Option<InodeKey> {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let pinode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)))?;
+        let dir = crate::inode_protect::read_inode_key(pinode as *const c_void)?;
+        let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)))?;
+        let mut key = FrozenName { dir, name: [0u64; 4] };
+        if generated::bpf_probe_read_kernel_str(key.name.as_mut_ptr() as *mut c_void, 32, name as *const c_void) <= 0 {
+            return None;
+        }
+        if frozen_verdict(FROZEN_NAMES.get(&key), generation, 0) {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+}
+
+/// Lot 2.3b (D5, the design's section 3, "The system's code is frozen"):
+/// whether the change `operation` (an `FS_OP_*`) of `dentry` (a scalar
+/// pointer; a negative dentry — a name about to be made — included) by the
+/// calling process is refused while a window per process tree is open: a
+/// caller outside the tree and outside the agent's family (a member the
+/// window lifts for changes what it needs) changing a frozen object — the
+/// dentry's name frozen in its directory ([`FROZEN_NAMES`]: a loader
+/// configuration file that does not exist yet), the object itself or one of
+/// its first [`FREEZE_WALK`] directories frozen by inode
+/// ([`FROZEN_INODES`]: `/usr/bin`, the loader's directories, the package
+/// managers' hook directories …), each mark of the window's generation
+/// only. Signed (outsider class). 1 when refused. One grant lookup on a
+/// host with no tree window; a global function: the hooks call it with
+/// scalars.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_tree_frozen(dentry: u64, operation: u64) -> u64 {
+    // SAFETY: the dentries and inodes are read through the helper only; the
+    // maps are this object's.
+    unsafe {
+        let d0 = dentry as *const u8;
+        if d0.is_null() {
+            return 0;
+        }
+        let s = session();
+        if s == 0 {
+            return 0;
+        }
+        let Some(g) = grant_now() else {
+            return 0;
+        };
+        if !tree_open(g, bpf_ktime_get_boot_ns(), s) {
+            return 0;
+        }
+        let generation = g.generation;
+        if crate::task_kill::is_exempt_pid((bpf_get_current_pid_tgid() >> 32) as u32) {
+            return 0;
+        }
+        if member_now() == MEMBER_LIFT {
+            return 0;
+        }
+        let op = operation as u8;
+        if let Some(parent) = read_ptr(d0.add(off!(DENTRY_D_PARENT_OFFSET))) {
+            if let Some(dir) = name_frozen(d0, parent, generation) {
+                crate::inode_protect::emit_attempt(op, dir);
+                return 1;
+            }
+        }
+        let mut d = d0;
+        let mut level: u32 = 0;
+        while level < FREEZE_WALK {
+            if let Some(inode) = read_ptr(d.add(off!(DENTRY_D_INODE_OFFSET))) {
+                if let Some(key) = crate::inode_protect::read_inode_key(inode as *const c_void) {
+                    if frozen_verdict(FROZEN_INODES.get(&key), generation, level) {
+                        crate::inode_protect::emit_attempt(op, key);
+                        return 1;
+                    }
+                }
+            }
+            let Some(p) = read_ptr(d.add(off!(DENTRY_D_PARENT_OFFSET))) else {
+                break;
+            };
+            if p == d {
+                break;
+            }
+            d = p;
+            level += 1;
+        }
+        0
+    }
+}
+
+/// Lot 2.3b (D5): a mount on or over a frozen object by an outsider while
+/// a window is open — `sb_mount`'s target path (argument 1). Its own
+/// program beside the mount guard's (whose stages are tail calls).
+#[lsm(hook = "sb_mount")]
+pub fn tree_frz_mount(ctx: LsmContext) -> i32 {
+    // SAFETY: the path is read through the helper only.
+    unsafe { frozen_path(raw_arg(&ctx, 1)) }
+}
+
+/// Lot 2.3b (D5): `move_mount`'s target (argument 1).
+#[lsm(hook = "move_mount")]
+pub fn tree_frz_move(ctx: LsmContext) -> i32 {
+    // SAFETY: as above.
+    unsafe { frozen_path(raw_arg(&ctx, 1)) }
+}
+
+/// The mount freeze of a `struct path *` (`path`, a scalar): its dentry.
+#[inline(always)]
+unsafe fn frozen_path(path: u64) -> i32 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let p = path as *const u8;
+        if p.is_null() {
+            return 0;
+        }
+        let Some(dentry) = read_ptr(p.add(off!(PATH_DENTRY_OFFSET))) else {
+            return 0;
+        };
+        if opaque(nn_tree_frozen(dentry as u64, u64::from(FS_OP_MOUNT))) != 0 {
+            -EPERM
+        } else {
+            0
+        }
+    }
+}
+
+// ── lot 2.3b: the single-use leases (the design's section 2) ────────────
+
+/// Lot 2.3b: whether PID 1's removal of the entry `dentry` (a scalar) of
+/// the directory `dir` (a scalar inode) is let through by a lease: the
+/// directory one of our units' enablement links' (`INODE_EXT`'s
+/// `INODE_EXT_UNIT_LINKS`), the entry named after one of our units, and a
+/// lease of the window in force for that very directory, name and removal,
+/// unused and before its deadline (`WindowLease::usable_for`). The lease is
+/// consumed (a plain store: only PID 1 uses a lease, from its one manager
+/// thread) and its use signed (PID-1-lease class, with the member that
+/// armed it). 1 when let through. A global function.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_tree_lease(dir: u64, dentry: u64) -> u64 {
+    // SAFETY: the directory, the entry and its name are read through the
+    // helper only; the maps are this object's.
+    unsafe {
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if caller != 1 || dir == 0 || dentry == 0 {
+            return 0;
+        }
+        let s = session();
+        let Some(g) = grant_now() else {
+            return 0;
+        };
+        let now = bpf_ktime_get_boot_ns();
+        if !tree_open(g, now, s) {
+            return 0;
+        }
+        let Some(key) = crate::inode_protect::read_inode_key(dir as *const c_void) else {
+            return 0;
+        };
+        let ext = crate::inode_protect::INODE_EXT.get(&key).copied();
+        let Some(name) = read_ptr((dentry as *const u8).add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) else {
+            return 0;
+        };
+        let mut w = [0u64; 4];
+        if generated::bpf_probe_read_kernel_str(w.as_mut_ptr() as *mut c_void, 32, name as *const c_void) <= 0 {
+            return 0;
+        }
+        let Some(hash) = lease_applies(caller, ext, &w) else {
+            return 0;
+        };
+        let mut i: u32 = 0;
+        while i < WINDOW_LEASES_MAX {
+            if let Some(l) = WINDOW_LEASES.get_ptr_mut(i) {
+                if (*l).usable_for(g, key, hash, LEASE_REMOVE, now, s) {
+                    (*l).used = 1;
+                    let start = process_start(bpf_get_current_task() as *const u8).unwrap_or(0);
+                    record(
+                        WINDOW_EVENT_LEASE_USED,
+                        DENIAL_WINDOW_PID1_LEASE,
+                        0,
+                        g.generation,
+                        caller,
+                        start,
+                        (u64::from((*l).member_tgid) << 32) | u64::from(i),
+                    );
+                    return 1;
+                }
+            }
+            i += 1;
+        }
+        0
     }
 }
 

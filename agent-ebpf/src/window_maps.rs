@@ -11,6 +11,8 @@
 //!   [`TREE_CGROUP_FILES`], the root's cgroup files an outsider may not
 //!   write (lot 2.3a, D7).
 //! * [`WINDOW_LEASES`]: the single-use leases of PID 1's link actions.
+//! * [`FROZEN_INODES`], [`FROZEN_NAMES`]: the system code frozen against
+//!   outsiders while a window is open (lot 2.3b, D5).
 //! * [`WINDOW_EVENTS`]: the window's own ring, with its pinned per-CPU
 //!   sequence ([`WINDOW_EVENT_SEQ`]) and drop counters
 //!   ([`WINDOW_EVENT_DROPS`]); [`emit_window_event`] is the one writer.
@@ -26,8 +28,9 @@ use aya_ebpf::{
     maps::{Array, HashMap, PerCpuArray, RingBuf},
 };
 use northnarrow_common::wire::{
-    FsGrantV2, InodeKey, TreeMember, WindowEventRaw, WindowLease, TREE_CGROUP_FILES_MAX, TREE_MEMBERS_MAX,
-    TREE_PENDING_MAX, WINDOW_EVENTS_RING_BYTES, WINDOW_LEASES_MAX,
+    FrozenName, FsGrantV2, InodeKey, TreeMember, WindowEventRaw, WindowLease, FROZEN_INODES_MAX,
+    FROZEN_NAMES_MAX, TREE_CGROUP_FILES_MAX, TREE_MEMBERS_MAX, TREE_PENDING_MAX, WINDOW_EVENTS_RING_BYTES,
+    WINDOW_LEASES_MAX,
 };
 
 /// The grant slot (one).
@@ -53,6 +56,17 @@ pub static TREE_CGROUP_FILES: HashMap<InodeKey, [u64; 2]> = HashMap::pinned(TREE
 /// The single-use leases.
 #[map]
 pub static WINDOW_LEASES: Array<WindowLease> = Array::pinned(WINDOW_LEASES_MAX, 0);
+
+/// Lot 2.3b (D5): the system code a window freezes against outsiders, by
+/// inode (`[generation, FROZEN_*]`), written by the agent at the grant
+/// (`crate::window_tree::nn_tree_frozen`).
+#[map]
+pub static FROZEN_INODES: HashMap<InodeKey, [u64; 2]> = HashMap::pinned(FROZEN_INODES_MAX, 0);
+
+/// Lot 2.3b (D5): the same, by name in its directory (what does not exist
+/// at the grant cannot be created).
+#[map]
+pub static FROZEN_NAMES: HashMap<FrozenName, [u64; 2]> = HashMap::pinned(FROZEN_NAMES_MAX, 0);
 
 /// The window's records. Process-local, as every event ring of the object
 /// (external audit SNS-015): whether lot 2.3 pins it, so that the next

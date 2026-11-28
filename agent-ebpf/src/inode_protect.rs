@@ -76,7 +76,8 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET, QSTR_NAME_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET,
+    INODE_I_INO_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET,
     INODE_I_MODE_OFFSET, INODE_I_RDEV_OFFSET, INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT,
     INODE_SETATTR_DENTRY_ARG_SLOT, INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
 };
@@ -868,6 +869,15 @@ unsafe fn protected_verdict(operation: u8, target: *const c_void, hook: u32) -> 
     }
 }
 
+/// Lot 2.3b (D5): whether the change `operation` of `dentry` (a scalar) is
+/// refused by the freeze of the system code while a window per process
+/// tree is open (`window_tree::nn_tree_frozen`: an outsider, a frozen
+/// object), signed there.
+#[inline(always)]
+fn frozen(dentry: u64, operation: u8) -> bool {
+    crate::window_tree::opaque(crate::window_tree::nn_tree_frozen(dentry, u64::from(operation))) != 0
+}
+
 // ---------------------------------------------------------------------------
 // LSM programs
 // ---------------------------------------------------------------------------
@@ -889,6 +899,16 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
         // either the parent dir or the target inode itself is in the
         // protected set — that covers both "rm somefile inside dir" and
         // "rm /the/protected/file".
+        // Lot 2.3b (the single-use leases): PID 1's removal of one of our
+        // units' enablement links a member leased for it (`systemctl
+        // disable` inside the window), consumed here, signed.
+        if crate::window_tree::opaque(crate::window_tree::nn_tree_lease(
+            crate::window_tree::raw_arg(ctx, 0),
+            crate::window_tree::raw_arg(ctx, 1),
+        )) != 0
+        {
+            return 0;
+        }
         let parent: *const c_void = ctx.arg(0);
         if deny_if_protected(FS_OP_UNLINK, parent, hook::INODE_UNLINK) {
             return -EPERM;
@@ -902,6 +922,10 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
         // Lot 2.3a (the review of #647): our units' enablement links, by name
         let (dir_s, dentry_s) = (crate::window_tree::raw_arg(ctx, 0), crate::window_tree::raw_arg(ctx, 1));
         if crate::window_tree::opaque(nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))) != 0 {
+            return -EPERM;
+        }
+        // Lot 2.3b (D5): the system code, frozen against outsiders
+        if frozen(dentry_s, FS_OP_UNLINK) {
             return -EPERM;
         }
         0
@@ -988,6 +1012,10 @@ unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
                 return -EPERM;
             }
         }
+        // Lot 2.3b (D5): the system code, frozen against outsiders
+        if frozen(crate::window_tree::raw_arg(ctx, 1), FS_OP_RMDIR) {
+            return -EPERM;
+        }
         0
     }
 }
@@ -1041,6 +1069,11 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
         if crate::window_tree::opaque(nn_ancestor_rename(old_s)) != 0
             || crate::window_tree::opaque(nn_ancestor_rename(new_s)) != 0
         {
+            return -EPERM;
+        }
+        // Lot 2.3b (D5): the system code, frozen against outsiders — moved
+        // away, or replaced (a rename over it, a name made there)
+        if frozen(old_s, FS_OP_RENAME) || frozen(new_s, FS_OP_RENAME) {
             return -EPERM;
         }
         0
@@ -1103,6 +1136,10 @@ unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
             if deny_if_protected(FS_OP_SETATTR, target_inode, hook::INODE_SETATTR) {
                 return -EPERM;
             }
+        }
+        // Lot 2.3b (D5): a truncate, a mode, an owner of the system code
+        if frozen(dentry as u64, FS_OP_SETATTR) {
+            return -EPERM;
         }
         0
     }
@@ -1346,6 +1383,14 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         if crate::window_tree::opaque(crate::window_tree::nn_tree_cgroup_file(inode_s)) != 0 {
             return -EPERM;
         }
+        // Lot 2.3b (D5): a write-open of the system code, frozen against
+        // outsiders while a window is open
+        let dentry_slot = (file as *const u8).add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const u64;
+        if let Ok(dentry) = bpf_probe_read_kernel::<u64>(dentry_slot) {
+            if frozen(dentry, FS_OP_WRITE) {
+                return -EPERM;
+            }
+        }
         0
     }
 }
@@ -1564,30 +1609,48 @@ unsafe fn deny_new_entry(operation: u8, dir: *const c_void, hook: u32) -> i32 {
     }
 }
 
+/// [`deny_new_entry`], then lot 2.3b's freeze (D5) of the new entry's
+/// dentry, argument `dentry_arg` (a name made in a frozen directory, or a
+/// frozen name made where it did not exist).
+#[inline(always)]
+unsafe fn deny_new_frozen(ctx: &LsmContext, operation: u8, dir: *const c_void, dentry_arg: usize, hook: u32) -> i32 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let r = deny_new_entry(operation, dir, hook);
+        if r != 0 {
+            return r;
+        }
+        if frozen(crate::window_tree::raw_arg(ctx, dentry_arg), operation) {
+            return -EPERM;
+        }
+        0
+    }
+}
+
 /// `open(O_CREAT)`, `creat(2)`, `mknod(S_IFREG)`, a bpffs pin
 /// (`vfs_mkobj`). Kernel signature: `(dir, dentry, mode)`.
 #[lsm(hook = "inode_create")]
 pub fn protected_create_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_CREATE, ctx.arg(0), hook::INODE_CREATE) }
+    unsafe { deny_new_frozen(&ctx, FS_OP_CREATE, ctx.arg(0), 1, hook::INODE_CREATE) }
 }
 
 /// Kernel signature: `(dir, dentry, mode)`.
 #[lsm(hook = "inode_mkdir")]
 pub fn protected_mkdir_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_MKDIR, ctx.arg(0), hook::INODE_MKDIR) }
+    unsafe { deny_new_frozen(&ctx, FS_OP_MKDIR, ctx.arg(0), 1, hook::INODE_MKDIR) }
 }
 
 /// A device node, FIFO or socket. Kernel signature: `(dir, dentry, mode,
 /// dev)`.
 #[lsm(hook = "inode_mknod")]
 pub fn protected_mknod_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_MKNOD, ctx.arg(0), hook::INODE_MKNOD) }
+    unsafe { deny_new_frozen(&ctx, FS_OP_MKNOD, ctx.arg(0), 1, hook::INODE_MKNOD) }
 }
 
 /// Kernel signature: `(dir, dentry, old_name)`.
 #[lsm(hook = "inode_symlink")]
 pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_SYMLINK, ctx.arg(0), hook::INODE_SYMLINK) }
+    unsafe { deny_new_frozen(&ctx, FS_OP_SYMLINK, ctx.arg(0), 1, hook::INODE_SYMLINK) }
 }
 
 /// A hard link made in a NOCREATE directory — also the way an `O_TMPFILE`
@@ -1598,7 +1661,7 @@ pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
 /// backup's or a deduplicator's link into a COMBAT trigger.
 #[lsm(hook = "inode_link")]
 pub fn protected_link_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_LINK, ctx.arg(1), hook::INODE_LINK) }
+    unsafe { deny_new_frozen(&ctx, FS_OP_LINK, ctx.arg(1), 2, hook::INODE_LINK) }
 }
 
 /// `security.selinux` with its terminator, as the three words a
@@ -1672,6 +1735,10 @@ unsafe fn deny_xattr(ctx: &LsmContext, dentry_arg: Option<usize>, hook: u32) -> 
             return 0;
         }
         if deny_if_protected(FS_OP_XATTR, inode, hook) {
+            return -EPERM;
+        }
+        // Lot 2.3b (D5): the system code's attributes
+        if frozen(dentry as u64, FS_OP_XATTR) {
             return -EPERM;
         }
         0

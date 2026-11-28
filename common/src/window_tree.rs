@@ -667,6 +667,10 @@ pub const fn lease_applies(caller: u32, ext: Option<u8>, w: &[u64; 4]) -> Option
     unit_link_hash(w)
 }
 
+/// Lot 2.3b (D5): how many directories the kernel walks up from the object
+/// an outsider changes (its own included), looking for a frozen mark.
+pub const FREEZE_WALK: u32 = 8;
+
 /// Lot 2.3b (D5, the freeze): whether the object at `level` directories
 /// above what an outsider changes (0: the object itself) is frozen by the
 /// window `generation`, its map value being `value` (`[generation,

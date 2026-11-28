@@ -269,8 +269,8 @@ pub enum Freeze {
 }
 
 /// How many directories the kernel walks up from the object an outsider
-/// changes, looking for a frozen subtree.
-pub const FREEZE_WALK: usize = 8;
+/// changes, looking for a frozen subtree (`common::window_tree`'s).
+pub const FREEZE_WALK: usize = common::window_tree::FREEZE_WALK as usize;
 
 /// The frozen objects, by path: the default `PATH` directories
 /// (`/usr/local` included), the loader's search directories, the

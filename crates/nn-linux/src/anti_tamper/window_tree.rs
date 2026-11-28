@@ -3,7 +3,7 @@
 //! and what the kernel needs for a tree window (the design's section 8,
 //! "Kernel manifest").
 //!
-//! [`attach`] loads and attaches the twelve programs ([`PROGRAMS`]), each pinned
+//! [`attach`] loads and attaches the fourteen programs ([`PROGRAMS`]), each pinned
 //! under its own name in the pin root (`prog_<program>`, `link_<program>`:
 //! several share their hook with another program of the agent, and a deny
 //! hook's pin is named by its hook), the fresh one attached before the prior
@@ -39,7 +39,7 @@ pub enum Kind {
 /// process), the judges, the guards, then the fork's two halves (a child
 /// joins only once what judges it runs; lot 2.3a's review of #647: its
 /// `task_alloc` half before the confirmation at `sched_process_fork`).
-pub const PROGRAMS: [(&str, Kind, &str); 12] = [
+pub const PROGRAMS: [(&str, Kind, &str); 14] = [
     ("tree_exit", Kind::TpBtf, "sched_process_exit"),
     ("tree_task_free", Kind::Lsm, "task_free"),
     ("tree_bprm_check", Kind::Lsm, "bprm_check_security"),
@@ -50,6 +50,10 @@ pub const PROGRAMS: [(&str, Kind, &str); 12] = [
     ("tree_shmat", Kind::Lsm, "shm_shmat"),
     ("tree_ptrace", Kind::Lsm, "ptrace_access_check"),
     ("tree_fd_receive", Kind::Lsm, "file_receive"),
+    // lot 2.3b (D5): a mount on or over the system code frozen against
+    // outsiders (programs of their own beside the mount guard's stages)
+    ("tree_frz_mount", Kind::Lsm, "sb_mount"),
+    ("tree_frz_move", Kind::Lsm, "move_mount"),
     ("tree_task_alloc", Kind::Lsm, "task_alloc"),
     ("tree_fork", Kind::TpBtf, "sched_process_fork"),
 ];

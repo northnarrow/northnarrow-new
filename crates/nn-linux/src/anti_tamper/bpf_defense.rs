@@ -2583,6 +2583,30 @@ pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, Stri
             h.remove(&k).map_err(|e| e.to_string())?;
         }
     }
+    // lot 2.3b (D5): the frozen marks an earlier window left
+    {
+        let m = ebpf
+            .map_mut(common::wire::FROZEN_INODES_MAP_NAME)
+            .ok_or_else(|| format!("{} missing", common::wire::FROZEN_INODES_MAP_NAME))?;
+        let mut h: HashMap<&mut MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<super::filesystem::AyaInodeKey> =
+            h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let m = ebpf
+            .map_mut(common::wire::FROZEN_NAMES_MAP_NAME)
+            .ok_or_else(|| format!("{} missing", common::wire::FROZEN_NAMES_MAP_NAME))?;
+        let mut h: HashMap<&mut MapData, PodFrozenName, [u64; 2]> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<PodFrozenName> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
     let m = ebpf
         .map(WINDOW_EVENT_DROPS_MAP_NAME)
         .ok_or_else(|| format!("{WINDOW_EVENT_DROPS_MAP_NAME} missing"))?;
@@ -2590,6 +2614,13 @@ pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, Stri
         aya::maps::PerCpuArray::try_from(m).map_err(|e| e.to_string())?;
     Ok(a.get(&0, 0).map(|v| v.iter().sum()).unwrap_or(0))
 }
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodFrozenName(common::wire::FrozenName);
+// SAFETY: `FrozenName` is `repr(C)`, `bytemuck::Pod`; the wrapper is
+// `repr(transparent)`.
+unsafe impl aya::Pod for PodFrozenName {}
 
 /// Lot 2.2: the agent's heartbeat for an open window, `now_boot_ns`
 /// (`CLOCK_BOOTTIME`): the slot as it is, with the heartbeat moved — none

@@ -78,6 +78,8 @@ task_setscheduler_deny
 tree_bprm_check
 tree_bprm_commit
 tree_fd_receive
+tree_frz_mount
+tree_frz_move
 tree_mmap_file
 tree_mprotect
 tree_ptrace
