@@ -1043,7 +1043,7 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
             ".map(|start| bpf_ktime_get_ns().saturating_sub(start));",
             // the review of #647: systemd's start of the role's unit only
             "== Ok(1)",
-            "crate::bpf_defense::nn_in_role_unit(raw, u64::from(role - 1))) == 1;",
+            "let for_role = parent_is_init\n            && crate::window_tree::opaque(crate::bpf_defense::nn_in_role_unit(raw, u64::from(role - 1))) == 1;",
             "northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, for_role, age)",
         ],
     )

@@ -1944,6 +1944,7 @@ mod tests {
     #[derive(Default)]
     struct FakeMaps {
         ops: Vec<String>,
+        cgroup_files: Vec<(InodeKey, [u64; 2])>,
         members: BTreeMap<u32, TreeMember>,
         grant: FsGrantV2,
         closed: [u64; 2],
@@ -1979,6 +1980,11 @@ mod tests {
         fn zero_closed(&mut self) -> std::result::Result<(), String> {
             self.ops.push("zero closed".to_string());
             self.closed = [0; 2];
+            Ok(())
+        }
+        fn put_cgroup_file(&mut self, key: InodeKey, value: [u64; 2]) -> std::result::Result<(), String> {
+            self.ops.push(format!("cgroup file {} op {}", key.ino, value[1]));
+            self.cgroup_files.push((key, value));
             Ok(())
         }
     }
@@ -2458,4 +2464,56 @@ mod tests {
         );
         assert_eq!(unified_cgroup("1:name=systemd:/x\n"), None);
     }
+
+    /// A [`LineReader`] whose root's cgroup files are `files`.
+    struct CgroupReader(FakeProc, std::result::Result<Vec<(InodeKey, u8)>, String>);
+
+    impl LineReader for CgroupReader {
+        fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
+            self.0.hop(pid)
+        }
+        fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String> {
+            self.0.guards(pid)
+        }
+        fn cgroup_files(&self, pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+            assert_eq!(pid, 501, "the root's");
+            self.1.clone()
+        }
+    }
+
+    /// Lot 2.3a (D7, the review of #647): the root's cgroup files are
+    /// written with the generation and their operation after the members,
+    /// before the grant; a root whose cgroup cannot be read is refused its
+    /// grant (fail closed), the members withdrawn.
+    #[test]
+    fn the_root_s_cgroup_files_are_armed_with_the_window_and_an_unread_cgroup_refuses_it() {
+        let kill = common::wire::FS_OP_CGROUP_KILL;
+        let freeze = common::wire::FS_OP_CGROUP_FREEZE;
+        let k = |ino| InodeKey { dev: 7, ino };
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        let reader = CgroupReader(host(), Ok(vec![(k(30), kill), (k(31), freeze)]));
+        let g = ov
+            .arm_tree_with(Some(&mut maps), &reader, &[], NOW, 120, (501, 9_000), &line())
+            .expect("armed");
+        assert_eq!(
+            maps.cgroup_files,
+            vec![(k(30), [g, u64::from(kill)]), (k(31), [g, u64::from(freeze)])]
+        );
+        let files = maps.ops.iter().position(|o| o.starts_with("cgroup file")).unwrap();
+        let grant = maps.ops.iter().position(|o| o.starts_with("grant")).unwrap();
+        let last_member = maps.ops.iter().rposition(|o| o.starts_with("member")).unwrap();
+        assert!(last_member < files && files < grant, "{:?}", maps.ops);
+
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        let reader = CgroupReader(host(), Err("/proc/501/cgroup: EACCES".to_string()));
+        let e = ov
+            .arm_tree_with(Some(&mut maps), &reader, &[], NOW, 120, (501, 9_000), &line())
+            .unwrap_err();
+        assert!(e.contains("the root's cgroup files"), "{e}");
+        assert!(maps.members.is_empty(), "the members withdrawn");
+        assert!(!maps.ops.iter().any(|o| o.starts_with("grant")), "{:?}", maps.ops);
+    }
+
 }

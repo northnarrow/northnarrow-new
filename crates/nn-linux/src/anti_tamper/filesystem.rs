@@ -4730,12 +4730,16 @@ mod tests {
                 "/sys/dev/block/259:0/device/dev" => Some("240:0\n".into()),
                 "/sys/dev/block/259:0/device/ng0n1/dev" => Some("242:0\n".into()),
                 "/sys/dev/block/8:1/partition" => Some("1\n".into()),
+                // a partition's own entries are never read (its disk's are)
+                "/sys/dev/block/8:1/device/scsi_generic/sg0/dev" => Some("21:0\n".into()),
+                "/sys/dev/block/8:1/device/dev" => Some("21:9\n".into()),
                 _ => None,
             }
         };
         let list = |p: &str| -> Vec<String> {
             match p {
                 "/sys/dev/block/8:0/device/scsi_generic" => vec!["sg0".into()],
+                "/sys/dev/block/8:1/device/scsi_generic" => vec!["sg0".into()],
                 "/sys/dev/block/8:0/device/bsg" => vec!["0:0:0:0".into()],
                 "/sys/dev/block/259:0/device" => {
                     vec!["ng0n1".into(), "nvme0n1".into(), "power".into()]
@@ -4782,6 +4786,19 @@ mod tests {
         };
         assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
         assert_eq!(written, vec![(k(11), INODE_EXT_WINDOW_KEPT)]);
+        // an entry the key's inode has for another reason is not "kept":
+        // the bit is added, what it had is kept
+        let get = |q: &InodeKey| match q.ino {
+            10 => Some(INODE_EXT_WINDOW_KEPT),
+            _ => Some(INODE_EXT_NO_RENAME),
+        };
+        let mut written = Vec::new();
+        let mut ins = |q: &InodeKey, v: u8| -> Result<()> {
+            written.push((*q, v));
+            Ok(())
+        };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        assert_eq!(written, vec![(k(11), INODE_EXT_NO_RENAME | INODE_EXT_WINDOW_KEPT)]);
         // a registration that fails, and a key file missing: named
         let get = |_: &InodeKey| None;
         let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Err(anyhow!("map full")) };
