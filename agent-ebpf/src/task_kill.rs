@@ -333,9 +333,11 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
             // Lab PR 225: a stop or kill of another security tool, reported.
             // Lot 2.3b (scaffold+): a process the exec quarantine holds is
             // resumed by the agent's verdict only (a SIGCONT from anyone else
-            // refused, signed)
+            // refused). Not written as a refused signal: NN-L-AT-001 judges
+            // that an attack on the agent and kills its sender — the user's
+            // own shell at an `fg` (the lab's case 6c); the held process's
+            // verdict is the quarantine's record
             if execq_held_resume(target as *const u8, target_tgid, sig, caller_tgid) {
-                crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);
                 return -EPERM;
             }
             observe_defender(target_tgid, sig);
