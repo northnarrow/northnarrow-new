@@ -19,6 +19,24 @@ tag makes this block that version's dated section. What changes for an
 operator is in `UPGRADE_NOTES_0.2.md`.
 
 #### Fixed
+- Lot M9: a start of the agent whose binary its predecessor did not mark
+  (an upgrade's, a test's fresh copy) keeps its role. The nightly lab run
+  of 28/11 on AlmaLinux 9 refused such a start at the sensors gate: once
+  the start registered itself in the pinned `PROTECTED_PIDS` (before its
+  bootstraps), a mapping hook of lot 2.2 still attached judged its first
+  executable mapping — glibc's NSS module, loaded by the worker account's
+  lookup (el9's `passwd: sss files systemd`) — against a main image not
+  yet marked, took the role away, and every BPF load of the start was then
+  refused. The agent now marks its own two binaries in the pinned
+  `EXEC_MARKS` before that registration (the marks its arm writes, from
+  the same identities, earlier; nothing is removed): a mapping that is not
+  trusted code still takes the role. The same refusal stopped the lab's
+  own agent from opening the window that purges the pins, so the guest was
+  restarted between two suites, and the agent's two COMBAT tests then
+  failed for want of the netfilter modules a fresh el9 boot has not
+  loaded. `a_start_s_own_binary_is_marked_before_it_claims_its_role` (the
+  watchdog's privileged e2e) reads the marks the moment a new copy's start
+  enters `PROTECTED_PIDS`.
 - Lot M7: the exec quarantine's release at the stop signs what it has
   done before the stop's deadline. The nightly lab run of 27/11 on ubuntu
   26.04 (7.0) failed `a_stop_while_the_controller_is_stuck_releases_every_held_process`:

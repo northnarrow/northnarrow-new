@@ -3013,29 +3013,6 @@ mod tests {
         assert!(role_mark_writes(&[], |_| Some(0)).is_empty());
     }
 
-    /// Lot M9 (the AlmaLinux 9 nightly of 28/11): the early registration
-    /// marks this start's binaries BEFORE it enters `PROTECTED_PIDS` — from
-    /// the entry on, a predecessor's mapping hook judges the process's
-    /// executable mappings against its main image's mark, and the first one
-    /// (el9: glibc's NSS module, at the worker account's lookup) took the
-    /// role of a start whose binary the predecessor had not marked: every
-    /// BPF load refused, `start refused gate="sensors"`.
-    #[test]
-    fn the_early_registration_marks_the_start_s_binaries_first() {
-        let src = include_str!("mod.rs");
-        let body = &src[src
-            .find("pub fn preregister_self(")
-            .expect("preregister_self")..];
-        let body = &body[..body.find("\n}\n").expect("its end")];
-        let mark = body
-            .find("premark_own_images(")
-            .expect("preregister_self marks the start's binaries");
-        let entry = body
-            .find("register_protected_pid(")
-            .expect("preregister_self registers the start");
-        assert!(mark < entry, "the marks after the PROTECTED_PIDS entry");
-    }
-
     /// The review of #644 (F5): the arm flag's word is the hooks' "armed"
     /// only when the marks were written whole; the live watchdog's main
     /// image is kept only when it is a role image already (its own

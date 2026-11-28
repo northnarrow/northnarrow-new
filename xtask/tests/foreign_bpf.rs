@@ -1632,6 +1632,55 @@ fn an_unmarked_executable_mapping_takes_the_role_away() {
     }
 }
 
+/// Lot M9 (the AlmaLinux 9 nightly of 28/11): a start marks its own two
+/// binaries in the pinned `EXEC_MARKS` BEFORE its early `PROTECTED_PIDS`
+/// entry. From that entry on it holds a role, and a predecessor's mapping
+/// hook still attached judges its executable mappings against its main
+/// image's mark: a binary the predecessor had not marked (an upgrade's, a
+/// test copy) lost the role at its first one (el9: glibc's NSS module at
+/// the worker account's lookup) and every BPF load of the start was
+/// refused. The pre-mark adds the arm's own images and removes nothing.
+#[test]
+fn a_start_marks_its_binaries_before_it_claims_its_role() {
+    let u = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&u, "preregister_self"),
+        &[
+            "bpf_defense::premark_own_images(bpffs_root, own)",
+            "register_protected_pid(Some(bpffs_root), std::process::id())?;",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        u.matches("register_protected_pid(Some(bpffs_root), std::process::id())")
+            .count(),
+        1,
+        "the start's early PROTECTED_PIDS entry is preregister_self's alone"
+    );
+    let d = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let pre = body(&d, "premark_own_images");
+    assert!(pre.contains("add_role_marks(&mut map, &role_images(own, None))"));
+    // the two writers go through the one planner (generic functions: their
+    // text up to the next item)
+    let between = |from: &str, to: &str| {
+        let a = d.find(from).unwrap_or_else(|| panic!("{from} not found"));
+        let b = a + d[a..]
+            .find(to)
+            .unwrap_or_else(|| panic!("{to} after {from}"));
+        d[a..b].to_string()
+    };
+    let add = between("fn add_role_marks<", "pub fn premark_own_images(");
+    assert!(add.contains("role_mark_writes(want,"), "{add}");
+    assert!(
+        !pre.contains("remove") && !add.contains("remove"),
+        "the pre-mark removes no mark"
+    );
+    let write = between("fn write_role_marks<", "pub fn role_mark_writes(");
+    assert!(write.contains("add_role_marks(map, want)"), "{write}");
+    let s = code("agent/src/boot/state.rs");
+    assert!(s.contains("preregister_self(\n        std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT),\n        &cli.own_exes(),\n    )"));
+}
+
 /// Lot 2.2 (the review of #644, F3 and F4): the role watch runs at the
 /// agent's start and each round of the link self-check, and at once after
 /// a cgroup attach the kernel let through (the `bpf` ring's row wakes it);
