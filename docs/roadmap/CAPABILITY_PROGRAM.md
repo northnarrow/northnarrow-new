@@ -14874,6 +14874,11 @@ no level changed.
   - Host: the full gates (6,185 workspace tests passed, golden ×5, MSRV 1.89, 15 fuzz targets, 5 portable targets, lockfiles unchanged); `verify-release-tag.sh version
     v0.1.0-alpha` passes; the CHANGELOG's 0.1.0-alpha section untouched
     (`verify-release-tag.sh` refuses an `[Unreleased]` on top).
+- **Lot M8 — Rust toolchain 1.100.1 (no behaviour change, no level
+  change).** `channel = "1.100.1"` (released 2026-11-27: one library fix, so
+  that some types are again seen as `Iterator`; no codegen or LLVM change, so
+  no eBPF or verifier effect and no lab). `rust-version` 1.98 and the eBPF
+  nightly stay. Gates: see the PR.
 - **Lot 397 — Rust toolchain 1.100.0 (no behaviour change, no level
   change).**
   - What was open: `rust-toolchain.toml` pinned 1.99.1 while 1.100.0 was

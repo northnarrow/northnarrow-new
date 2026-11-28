@@ -25,7 +25,7 @@ over an installed `v0.1.1-alpha`, use `install.sh --upgrade`, or
 
 1. Nothing in the units, the configuration or the keys has to change. The
    agent keeps its pins, chains and keys across the upgrade, as before.
-2. **Building from source** needs the new toolchains (§1): Rust 1.100.0
+2. **Building from source** needs the new toolchains (§1): Rust 1.100.1
    (the workspace's minimum is 1.98), and `nightly-2026-08-05` with
    bpf-linker 0.10.3 for the eBPF object. `rustup` takes both from the
    `rust-toolchain.toml` files.
@@ -55,7 +55,7 @@ over an installed `v0.1.1-alpha`, use `install.sh --upgrade`, or
 ## 1. The toolchain and the eBPF compiler (lots 396, 397, 400a, 1.2)
 
 - The workspace and the eBPF crate are on Rust edition 2024; the pinned
-  toolchain is 1.100.0; `rust-version` (the minimum) is 1.98, which aya
+  toolchain is 1.100.1; `rust-version` (the minimum) is 1.98, which aya
   0.16 needs. No behaviour changes with them.
 - User space uses aya 0.16 and aya-obj 0.6. aya 0.16 checks a pinned map
   it reuses (type, key and value size, entries, flags); the start-in-cgroup
