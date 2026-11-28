@@ -86,7 +86,8 @@ Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#
 - Now, [S2 Self-protection after the alpha](ROADMAP.md#s2):
   - done: the SysRq trigger refused outside a trusted-installer window, and a stop the agent did not request restarts it and is signed;
   - done: the stage's scaffold and the design of the installer window per process tree, checked by an adversarial review and a second model before any of its code;
-  - next: the BPF guard and role marks, then the per-tree window itself.
+  - done: role marks (only our own signed binaries hold the agent and watchdog roles; system libraries are judged when they are mapped, so a distribution upgrade keeps the roles) and a guard against foreign BPF programs on our cgroups, counted and signed when present;
+  - now: the installer window per process tree, kernel side first (in review), then the user flows (a window opened for one command, a controlled stop instead of systemd's signals).
 <!-- working-on:end -->
 
 ---
