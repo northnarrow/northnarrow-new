@@ -126,6 +126,13 @@ fn sites(c: &Corpus<'_>, rel: &str) -> Vec<Site> {
 /// caller wrote.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-core/src/anti_tamper/trusted_installer.rs",
+        1,
+        "lot 2.3b: the frozen set's own paths (`binfmt_misc` among them) compared with each other, \
+         component by component, to tell which name is frozen in its parent — no link a caller \
+         wrote is read or matched",
+    ),
+    (
         "crates/nn-linux/src/anti_tamper/pin_lock.rs",
         1,
         "lot 359: the agent's own `/proc/self/exe`, read beneath the `/proc` root, to run its own \

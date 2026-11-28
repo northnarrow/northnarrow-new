@@ -330,13 +330,18 @@ pub const FROZEN: &[(&str, Freeze)] = &[
 /// another in its place. The name of an object below a frozen subtree is
 /// that subtree's already.
 pub fn frozen_names() -> Vec<(&'static str, &'static str, Freeze)> {
-    FROZEN
+    frozen_names_of(FROZEN)
+}
+
+/// [`frozen_names`] of the list `frozen`.
+fn frozen_names_of(frozen: &[(&'static str, Freeze)]) -> Vec<(&'static str, &'static str, Freeze)> {
+    frozen
         .iter()
         .filter_map(|(path, how)| {
             let (parent, name) = path.rsplit_once('/')?;
             let parent = if parent.is_empty() { "/" } else { parent };
             // component by component (`/usr/lib64` is not below `/usr/lib`)
-            let under_subtree = FROZEN.iter().any(|(p, h)| {
+            let under_subtree = frozen.iter().any(|(p, h)| {
                 *h == Freeze::Subtree && std::path::Path::new(parent).starts_with(p)
             });
             (!under_subtree && !name.is_empty()).then_some((parent, name, *how))
@@ -352,9 +357,7 @@ pub const FROZEN_NAME_MAX: usize = 31;
 /// (`common::window_tree::UNIT_LINK_NAMES`, the kernel's), as a lease's
 /// link must be named.
 pub fn is_unit_link_name(name: &str) -> bool {
-    common::window_tree::UNIT_LINK_NAMES
-        .iter()
-        .any(|n| *n == name.as_bytes())
+    common::window_tree::UNIT_LINK_NAMES.contains(&name.as_bytes())
 }
 
 /// The unit directories our enablement links live in.
@@ -381,8 +384,8 @@ pub fn lease_link(path: &str) -> Option<(&str, &str)> {
     let unit = target
         .strip_suffix(".wants")
         .or_else(|| target.strip_suffix(".requires"))?;
+    // (no `/` either: the characters below exclude it)
     let ok = !unit.is_empty()
-        && !unit.contains('/')
         && !unit.starts_with('.')
         && unit.contains('.')
         && unit
@@ -501,6 +504,8 @@ mod window_flow_tests {
             ("/usr/sbin/sshd", cmd(&["sshd"])),
             ("/usr/bin/apt", cmd(&["apt"])),
             ("/home/u/python3", cmd(&["python3", "/usr/bin/dnf"])),
+            ("/tmp/python3", cmd(&["python3", "/usr/bin/dnf"])),
+            ("/usr/bin/perl", cmd(&["perl", "/usr/bin/dnf"])),
         ] {
             assert_eq!(package_manager(exe, &c), None, "{exe} {c:?}");
         }
@@ -568,6 +573,14 @@ mod window_flow_tests {
         for (_, n, _) in &names {
             assert!(n.len() <= FROZEN_NAME_MAX && !n.contains('/'), "{n}");
         }
+        // an object below a frozen subtree is named by it already
+        let below = frozen_names_of(&[
+            ("/usr/lib", Freeze::Subtree),
+            ("/usr/lib/x", Freeze::Subtree),
+            ("/usr/lib64", Freeze::Subtree),
+        ]);
+        assert!(!below.iter().any(|(p, n, _)| *p == "/usr/lib" && *n == "x"), "{below:?}");
+        assert!(below.contains(&("/usr", "lib64", Freeze::Subtree)), "not below /usr/lib: {below:?}");
     }
 
     /// Lot 2.3b: a lease names one of our units' enablement links and

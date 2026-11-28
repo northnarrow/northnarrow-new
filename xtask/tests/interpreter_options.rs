@@ -213,9 +213,9 @@ fn sites(text: &str) -> Vec<String> {
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-admin/src/admin_cli.rs",
-        3,
-        "lot 2.3b: `/proc/<pid>/stat`'s start and parent (fields 22 and 4) and a package \
-         manager's command line (`/proc/<pid>/cmdline`, NUL-separated) read to find a \
+        1,
+        "lot 2.3b: a package manager's command line (`/proc/<pid>/cmdline`, NUL-separated) and \
+         `/proc/<pid>/stat`'s parent and start (fields 4 and 22) read to find a \
          trusted-installer window's root, whose program the agent judges again — no \
          interpreter's option read",
     ),
