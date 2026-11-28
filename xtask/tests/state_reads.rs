@@ -170,6 +170,20 @@ const ROLEWATCH: &str = "lot 2.2 (the review of #644, F3): /etc/ld.so.preload an
                          mapping, and one that is not trusted code took the role away, signed";
 
 const KNOWN: &[(&str, &str, &str)] = &[
+    // lot 2.3b: the window per process tree's inputs, each failing closed
+    (
+        "agent/src/admin/handlers/installer.rs",
+        "read_to_string(LEGACY_TIOCSTI)",
+        "lot 2.3b: dev.tty.legacy_tiocsti, read at a tree grant: unreadable is judged absent, and \
+         `window-run --interactive` is refused — never a wider window",
+    ),
+    (
+        "agent/src/admin/handlers/pregrant.rs",
+        "fs::read(host_path(root,\"var/lib/dpkg/status\"))",
+        "lot 2.3b: dpkg's status, for its conffiles' digests at the pre-grant check: unreadable, no \
+         conffile is vouched for, so each is foreign and the window is refused — never a file let \
+         through",
+    ),
     // lot 2.3a: the block devices behind the agent's files, read at the
     // start: a failed read leaves a device out of the set (the start's warn
     // and the lab's case say which), never a refusal of the agent's own

@@ -559,11 +559,14 @@ mod tests {
         let tree = |ts| SignedPayload::new_trusted_installer_tree_grant([4; 32], ts, AGENT, 300, 700, 7_000);
         let m = signed(&tree(NOW - 400), &[&installer], 4242);
         let ok = verify(&m, &e, |_| false).expect("honoured");
+        assert_eq!(MAX_STAND_DOWN_SECS, 600, "the window's ceiling");
         assert_eq!((ok.nonce, ok.grace_secs), ([4; 32], MAX_STAND_DOWN_SECS));
         assert_eq!(verify(&m, &e, |_| true), Err(Rejection::Replayed));
-        // past the span
-        let m = signed(&tree(NOW - (MAX_SKEW_SECS + MAX_STAND_DOWN_SECS + 1)), &[&installer], 4242);
+        // past the span: the window's 600 s ceiling
+        let m = signed(&tree(NOW - (MAX_SKEW_SECS + 601)), &[&installer], 4242);
         assert!(matches!(verify(&m, &e, |_| false), Err(Rejection::Expired { .. })));
+        let m = signed(&tree(NOW - (MAX_SKEW_SECS + 599)), &[&installer], 4242);
+        assert!(verify(&m, &e, |_| false).is_ok(), "within the span");
         // a key without the role (the shutdown key alone)
         let m = signed(&tree(NOW), &[&a.sks[0]], 4242);
         assert!(matches!(

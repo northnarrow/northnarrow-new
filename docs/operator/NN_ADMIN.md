@@ -125,8 +125,9 @@ under `enforcing`.
 
 ### The window per process tree
 
-`nn-admin window-run --key <key> -- <command> [args…]` opens a
-trusted-installer window for one process tree, and runs `<command>` in it:
+`nn-admin window-run` opens a trusted-installer window for one process tree,
+and runs a command in it (`nn-admin window-run --key <key> -- <command>
+[args…]`):
 
 - **The tree.** The window's root is that `nn-admin` process, the one
   installed beside the agent. `<command>` is its child; every process

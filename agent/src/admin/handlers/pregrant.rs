@@ -293,7 +293,7 @@ mod tests {
         let status = "Package: apt\nStatus: install ok installed\nConffiles:\n \
                       /etc/apt/apt.conf.d/01autoremove 2b3fe0d1d8bbd4de8a1cd03c4b1f84b3\n \
                       /etc/cron.daily/apt-compat 1400ab07a4a2905b04c33e3e93d42b7b obsolete\n\
-                      Description: x\n continued d41d8cd98f00b204e9800998ecf8427e\n";
+                      Description: x\n /usr/share/doc/x d41d8cd98f00b204e9800998ecf8427e\n";
         let c = dpkg_conffiles(status);
         assert_eq!(c.len(), 2);
         assert_eq!(
