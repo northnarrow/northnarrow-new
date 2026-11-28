@@ -107,9 +107,12 @@ use super::{
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
+pub use nn_proto::admin_signed_payload::TreeRootKind;
 use common::wire::{
-    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME,
-    TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME, TreeMember, WINDOW_MAX_NS,
+    FROZEN_INODES_MAP_NAME, FROZEN_NAMES_MAP_NAME, FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2,
+    INODE_EXT_MAP_NAME, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBER_ROOT,
+    TREE_MEMBERS_MAP_NAME, TreeMember, WINDOW_LEASES_MAP_NAME, WINDOW_LEASES_MAX, WINDOW_MAX_NS,
+    WindowLease,
 };
 
 // R08b (lab PR 251): the agent's own units and a window's grant are the
@@ -177,6 +180,9 @@ pub struct TrustedInstallerOverride {
     tree_armed: AtomicBool,
     /// Lot 2.3a: the tree window's state (its grant, the generations).
     tree: Mutex<TreeState>,
+    /// Lot 2.3b (D1): the controlled stop or restart a member asked for —
+    /// the run loop's stop reason, taken once.
+    controlled: Mutex<Option<&'static str>>,
 }
 
 #[derive(Default)]
@@ -206,6 +212,9 @@ struct TreeWindow {
     /// A heartbeat that could not be written was reported (once per
     /// window: the kernel's grace ends the window 60 s after the last one).
     beat_failed: bool,
+    /// Lot 2.3b (D5): PID 1's manager environment at the grant, compared at
+    /// each controlled stop and lease and at the close.
+    pid1_env: Vec<String>,
 }
 
 impl TrustedInstallerOverride {
@@ -232,6 +241,7 @@ impl TrustedInstallerOverride {
             arming: Mutex::new(()),
             tree_armed: AtomicBool::new(false),
             tree: Mutex::new(TreeState::default()),
+            controlled: Mutex::new(None),
         }
     }
 
@@ -735,16 +745,16 @@ impl TrustedInstallerOverride {
         window_secs: u32,
         root: (u32, u64),
         line: &[(u32, u64)],
+        notes: serde_json::Value,
     ) -> std::result::Result<u64, String> {
         let mut pinned = self.bpffs_root.as_deref().map(PinnedTreeMaps);
-        self.arm_tree_with(
+        self.arm_tree_noted(
             pinned.as_mut().map(|m| m as &mut dyn TreeMaps),
             &ProcFs(Path::new("/proc")),
             &super::window_tree::manifest_missing(self.bpffs_root.as_deref()),
             boottime_ns(),
-            window_secs,
-            root,
-            line,
+            (window_secs, root, line),
+            notes,
         )
     }
 
@@ -775,6 +785,27 @@ impl TrustedInstallerOverride {
         root: (u32, u64),
         line: &[(u32, u64)],
     ) -> std::result::Result<u64, String> {
+        self.arm_tree_noted(
+            maps,
+            reader,
+            missing,
+            now_boot_ns,
+            (window_secs, root, line),
+            serde_json::Value::Null,
+        )
+    }
+
+    /// [`Self::arm_tree_with`] whose open record also carries `notes` (lot
+    /// 2.3b: the root's kind, the interactive mark, the pre-grant check).
+    fn arm_tree_noted(
+        &self,
+        maps: Option<&mut dyn TreeMaps>,
+        reader: &dyn LineReader,
+        missing: &[String],
+        now_boot_ns: u64,
+        (window_secs, root, line): (u32, (u32, u64), &[(u32, u64)]),
+        notes: serde_json::Value,
+    ) -> std::result::Result<u64, String> {
         let one_window = self.arming.lock();
         let armed =
             self.arm_tree_locked(maps, reader, missing, now_boot_ns, window_secs, root, line);
@@ -788,15 +819,19 @@ impl TrustedInstallerOverride {
                     members = line.len(),
                     "trusted-installer window per process tree ARMED"
                 );
+                let mut extra = serde_json::json!({
+                    "generation": g.generation,
+                    "root_pid": g.root_tgid,
+                    "root_start_ticks": g.root_start_ticks,
+                    "members": line.iter().map(|(pid, _)| *pid).collect::<Vec<u32>>(),
+                    "expires_boot_ns": g.expires_boot_ns,
+                });
+                if let (Some(e), serde_json::Value::Object(n)) = (extra.as_object_mut(), notes) {
+                    e.extend(n);
+                }
                 self.audit_tree(
                     "trusted_installer_tree_window_open",
-                    serde_json::json!({
-                        "generation": g.generation,
-                        "root_pid": g.root_tgid,
-                        "root_start_ticks": g.root_start_ticks,
-                        "members": line.iter().map(|(pid, _)| *pid).collect::<Vec<u32>>(),
-                        "expires_boot_ns": g.expires_boot_ns,
-                    }),
+                    extra,
                     format!("opened: generation {}", g.generation),
                 );
             }
@@ -895,6 +930,31 @@ impl TrustedInstallerOverride {
                 ));
             }
         }
+        // 1c. (lot 2.3b, D5) the system code frozen against outsiders
+        let plan = match reader.freeze_plan() {
+            Ok(p) => p,
+            Err(e) => return Err(withdrawn(maps, format!("the frozen objects: {e}"))),
+        };
+        for mark in plan {
+            let written = match mark {
+                FreezeMark::Inode(key, reach) => maps.put_frozen_inode(key, [generation, reach]),
+                FreezeMark::Name(name, reach) => maps.put_frozen_name(name, [generation, reach]),
+            };
+            if let Err(e) = written {
+                return Err(withdrawn(maps, format!("a frozen object not written: {e}")));
+            }
+        }
+        // 1d. (lot 2.3b, D5) PID 1's environment, watched: detected, not
+        // refused (no file holds it)
+        let pid1_env = match reader.pid1_env() {
+            Ok(env) => env,
+            Err(e) => {
+                return Err(withdrawn(
+                    maps,
+                    format!("PID 1's environment could not be read, so the window could not watch it: {e}"),
+                ));
+            }
+        };
         // 2. the second read: a tracer, a filter or another process found
         // now clears the members, and the grant is refused
         for &(pid, start_ticks) in line {
@@ -940,6 +1000,7 @@ impl TrustedInstallerOverride {
         tree.open = Some(TreeWindow {
             grant,
             beat_failed: false,
+            pid1_env,
         });
         self.tree_armed.store(true, Ordering::SeqCst);
         Ok(grant)
@@ -991,8 +1052,11 @@ impl TrustedInstallerOverride {
             None
         };
         if let Some(reason) = reason {
+            // lot 2.3b: PID 1's environment, at the close too
+            let at_grant = tree.open.as_ref().map(|w| w.pid1_env.clone()).unwrap_or_default();
             let closed = close_tree_locked(&mut tree, &self.tree_armed, maps);
             drop(tree);
+            self.pid1_env_at_close(reader, &at_grant);
             if let Some(c) = closed {
                 self.audit_tree_close(reason, &c);
             }
@@ -1038,14 +1102,44 @@ impl TrustedInstallerOverride {
 
     fn close_tree_with(&self, maps: &mut dyn TreeMaps, reason: &str) -> bool {
         let mut tree = self.tree.lock();
+        let at_grant = tree.open.as_ref().map(|w| w.pid1_env.clone());
         let closed = close_tree_locked(&mut tree, &self.tree_armed, maps);
         drop(tree);
+        // lot 2.3b: PID 1's environment, at the close too (a close it caused
+        // has already signed its change)
+        if let Some(env) = at_grant.filter(|_| reason != "pid1_environment_changed") {
+            self.pid1_env_at_close(&ProcFs(Path::new("/proc")), &env);
+        }
         match closed {
             Some(c) => {
                 self.audit_tree_close(reason, &c);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Lot 2.3b: PID 1's environment at a window's close compared with
+    /// `at_grant`; a change is signed High (the window is closing anyway).
+    fn pid1_env_at_close(&self, reader: &dyn LineReader, at_grant: &[String]) {
+        match reader.pid1_env() {
+            Ok(now) if nn_core::anti_tamper::trusted_installer::pid1_env_changed(at_grant, &now) => {
+                self.report_high(
+                    PID1_ENV_CHANGED,
+                    &format!(
+                        "PID 1's manager environment changed during the window (seen at its \
+                         close): {} variable(s) at the grant, {} now",
+                        at_grant.len(),
+                        now.len()
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                target: "anti_tamper.trusted_installer",
+                error = %e,
+                "PID 1's environment could not be read at the window's close"
+            ),
         }
     }
 
@@ -1082,6 +1176,290 @@ impl TrustedInstallerOverride {
         );
     }
 
+    /// Lot 2.3b (D1, the leases): the member of the open window that asks
+    /// over the admin socket — `requester`, the socket's peer, pinned
+    /// before it is read — authenticated by three facts: its member entry
+    /// (`TREE_MEMBERS`, its own start), the window's generation (the one
+    /// the request names), and its own state now (not traced, no seccomp
+    /// mode, the initial namespaces). `Ok((tgid, start))`; `Err` why, for
+    /// an outsider (signed by the caller).
+    pub fn window_member(
+        &self,
+        requester: u32,
+        generation: u64,
+    ) -> std::result::Result<(u32, u64), String> {
+        let Some(root) = self.bpffs_root.as_deref() else {
+            return Err("no bpffs pin root this boot: no tree window".to_string());
+        };
+        self.window_member_with(
+            &mut PinnedTreeMaps(root),
+            &ProcFs(Path::new("/proc")),
+            requester,
+            generation,
+        )
+    }
+
+    fn window_member_with(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        requester: u32,
+        generation: u64,
+    ) -> std::result::Result<(u32, u64), String> {
+        let open = self.tree.lock().open.as_ref().map(|w| w.grant.generation);
+        let Some(current) = open else {
+            return Err("no trusted-installer window per process tree is open".to_string());
+        };
+        if generation != current {
+            return Err(format!(
+                "the request names generation {generation}, the open window is {current}"
+            ));
+        }
+        if requester <= 1 {
+            return Err(format!("requester {requester}: PID 1 (or 0) is no member"));
+        }
+        let pin = reader.pin(requester)?;
+        let start = reader.hop(requester)?.start_ticks;
+        match maps.member(requester)? {
+            Some(m) if m.generation == current && m.start_ticks == start => {}
+            Some(_) => {
+                return Err(format!(
+                    "process {requester} holds no entry of this window for itself (another \
+                     generation or another process's start)"
+                ));
+            }
+            None => return Err(format!("process {requester} is outside the window's tree")),
+        }
+        match reader.guards(requester)? {
+            (0, 0) => {}
+            (tracer, seccomp) => {
+                return Err(format!(
+                    "member {requester} is traced (TracerPid {tracer}) or filtered (Seccomp \
+                     {seccomp})"
+                ));
+            }
+        }
+        if !reader.ns_initial(requester)? {
+            return Err(format!(
+                "member {requester} is outside the initial pid, user or mount namespace"
+            ));
+        }
+        if !pin.alive() {
+            return Err(format!("process {requester} exited while it was read"));
+        }
+        Ok((requester, start))
+    }
+
+    /// Lot 2.3b (refinement 2 of D5): PID 1's manager environment compared
+    /// with the grant's, through `reader`; a change (or an environment that
+    /// can no longer be read) closes the window, signed High (`when`: the
+    /// controlled stop, a lease, the close). `true` when it closed it.
+    fn pid1_env_closes(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        when: &str,
+    ) -> bool {
+        let at_grant = match self.tree.lock().open.as_ref() {
+            Some(w) => w.pid1_env.clone(),
+            None => return false,
+        };
+        let why = match reader.pid1_env() {
+            Ok(now) if !nn_core::anti_tamper::trusted_installer::pid1_env_changed(&at_grant, &now) => {
+                return false;
+            }
+            Ok(now) => format!(
+                "PID 1's manager environment changed since the window's grant (at {when}): {} \
+                 variable(s) at the grant, {} now",
+                at_grant.len(),
+                now.len()
+            ),
+            Err(e) => format!("PID 1's manager environment could not be read at {when}: {e}"),
+        };
+        self.report_high(PID1_ENV_CHANGED, &why);
+        self.close_tree_with(maps, "pid1_environment_changed")
+    }
+
+    /// A High finding of the window (`kind`), signed in the audit chain.
+    fn report_high(&self, kind: &'static str, detail: &str) {
+        let audit = self.audit.lock().clone();
+        crate::self_integrity::report_event(
+            audit.as_ref(),
+            &crate::self_integrity::Finding {
+                kind,
+                detail: detail.to_string(),
+            },
+        );
+    }
+
+    /// Lot 2.3b (the single-use leases, the design's section 2): a lease
+    /// for PID 1's removal of our units' enablement link `link`, armed for
+    /// `member` ([`Self::window_member`]) in the window `generation`: bound
+    /// to the link's directory (its inode, a directory of our links the
+    /// start registered) and its name, consumed by its first use, void
+    /// after `WINDOW_LEASE_TTL_NS`; PID 1's environment is compared first.
+    /// `Ok` the slot; `Err` why (signed by the caller).
+    pub fn arm_lease(
+        &self,
+        member: (u32, u64),
+        generation: u64,
+        link: &str,
+    ) -> std::result::Result<u32, String> {
+        let Some(root) = self.bpffs_root.as_deref() else {
+            return Err("no bpffs pin root this boot: no lease".to_string());
+        };
+        self.arm_lease_with(
+            &mut PinnedTreeMaps(root),
+            &ProcFs(Path::new("/proc")),
+            &stat_key,
+            boottime_ns(),
+            member,
+            generation,
+            link,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_lease_with(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        stat: &dyn Fn(&Path) -> Option<InodeKey>,
+        now_boot_ns: u64,
+        member: (u32, u64),
+        generation: u64,
+        link: &str,
+    ) -> std::result::Result<u32, String> {
+        let Some((dir, name)) = nn_core::anti_tamper::trusted_installer::lease_link(link) else {
+            return Err(format!(
+                "{link} is not one of our units' enablement links (a `*.wants` or `*.requires` \
+                 entry named after the agent's or the watchdog's unit)"
+            ));
+        };
+        if self.pid1_env_closes(maps, reader, "a lease") {
+            return Err("PID 1's environment changed: the window is closed".to_string());
+        }
+        if self.tree_generation() != Some(generation) {
+            return Err(format!("the window {generation} is not open"));
+        }
+        let Some(key) = stat(Path::new(dir)) else {
+            return Err(format!("{dir}: no such directory"));
+        };
+        match maps.inode_ext(key)? {
+            Some(ext) if ext & common::wire::INODE_EXT_UNIT_LINKS != 0 => {}
+            _ => {
+                return Err(format!(
+                    "{dir} is not a directory of our units' links this start registered"
+                ));
+            }
+        }
+        let leases = maps.leases()?;
+        let live = |l: &WindowLease| {
+            l.used == 0 && l.generation == generation && now_boot_ns < l.expires_boot_ns
+        };
+        let armed_this_window = leases.iter().filter(|l| l.generation == generation).count();
+        if armed_this_window >= WINDOW_LEASES_MAX as usize {
+            return Err(format!(
+                "this window armed {armed_this_window} leases already (at most {WINDOW_LEASES_MAX})"
+            ));
+        }
+        let Some(slot) = leases.iter().position(|l| !live(l) && l.generation != generation)
+        else {
+            return Err("no lease slot is free".to_string());
+        };
+        let lease = WindowLease {
+            generation,
+            dir: key,
+            name_hash: common::wire::pin_name_hash(name.as_bytes()),
+            expires_boot_ns: now_boot_ns.saturating_add(common::wire::WINDOW_LEASE_TTL_NS),
+            member_tgid: member.0,
+            action: common::wire::LEASE_REMOVE,
+            used: 0,
+            _pad: 0,
+        };
+        let slot = slot as u32;
+        maps.put_lease(slot, lease)?;
+        self.audit_tree(
+            "trusted_installer_tree_lease_armed",
+            serde_json::json!({
+                "generation": generation,
+                "slot": slot,
+                "link": link,
+                "action": "remove",
+                "member_pid": member.0,
+                "member_start_ticks": member.1,
+                "expires_boot_ns": lease.expires_boot_ns,
+            }),
+            format!("armed: slot {slot}"),
+        );
+        Ok(slot)
+    }
+
+    /// Lot 2.3b (D1, the controlled stop): `member` ([`Self::window_member`])
+    /// asked the window `generation` for a stop (`restart`: false) or a
+    /// restart: PID 1's environment is compared, the record naming the
+    /// member is signed, and the run loop's stop reason is set
+    /// (`controlled_stop`, `controlled_restart`: [`Self::take_controlled_stop`]).
+    /// The caller writes the watchdog's stand-down for a stop and wakes the
+    /// run loop. `Err` why, nothing recorded as asked.
+    pub fn controlled_stop(
+        &self,
+        member: (u32, u64),
+        generation: u64,
+        restart: bool,
+    ) -> std::result::Result<&'static str, String> {
+        let Some(root) = self.bpffs_root.as_deref() else {
+            return Err("no bpffs pin root this boot: no tree window".to_string());
+        };
+        self.controlled_stop_with(
+            &mut PinnedTreeMaps(root),
+            &ProcFs(Path::new("/proc")),
+            member,
+            generation,
+            restart,
+        )
+    }
+
+    fn controlled_stop_with(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        member: (u32, u64),
+        generation: u64,
+        restart: bool,
+    ) -> std::result::Result<&'static str, String> {
+        if self.pid1_env_closes(maps, reader, "a controlled stop") {
+            return Err("PID 1's environment changed: the window is closed".to_string());
+        }
+        if self.tree_generation() != Some(generation) {
+            return Err(format!("the window {generation} is not open"));
+        }
+        let reason = if restart {
+            CONTROLLED_RESTART_REASON
+        } else {
+            CONTROLLED_STOP_REASON
+        };
+        self.audit_tree(
+            "trusted_installer_tree_controlled_stop",
+            serde_json::json!({
+                "generation": generation,
+                "action": if restart { "restart" } else { "stop" },
+                "member_pid": member.0,
+                "member_start_ticks": member.1,
+                "agent_pid": std::process::id(),
+            }),
+            format!("{reason}: asked by member {}", member.0),
+        );
+        *self.controlled.lock() = Some(reason);
+        Ok(reason)
+    }
+
+    /// Lot 2.3b: the controlled stop's reason a member asked for, taken
+    /// once (the run loop's, when the admin shutdown signal wakes it).
+    pub fn take_controlled_stop(&self) -> Option<&'static str> {
+        self.controlled.lock().take()
+    }
+
     /// One record of the tree window (the agent's, as the host-wide
     /// window's close).
     fn audit_tree(&self, op: &str, extra: serde_json::Value, result: String) {
@@ -1115,6 +1493,15 @@ impl TrustedInstallerOverride {
 }
 
 // ── Lot 2.3a's minimal path (lot 2.3b replaces it): the tree's kernel half ─
+
+/// Lot 2.3b: the stop reasons of a member's controlled stop and restart
+/// (clean stops: `nn_evidence::heartbeat::CLEAN_STOP_REASONS`).
+pub const CONTROLLED_STOP_REASON: &str = "controlled_stop";
+pub const CONTROLLED_RESTART_REASON: &str = "controlled_restart";
+
+/// Lot 2.3b (D5, refinement 2): the finding of PID 1's environment changed
+/// during a window, High (`crate::self_integrity`).
+pub const PID1_ENV_CHANGED: &str = "window_pid1_environment_changed";
 
 /// How many processes the walk from the requester up to the signed root
 /// reads at most (the root included).
@@ -1150,6 +1537,171 @@ pub trait LineReader {
     fn cgroup_files(&self, _pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
         Ok(Vec::new())
     }
+    /// Lot 2.3b (the admission policy): a handle that tells, after the
+    /// reads, whether `pid` still names the process it named when the
+    /// handle was taken (a pidfd: [`Pidfd`]). Taken before any read of
+    /// the process.
+    fn pin(&self, _pid: u32) -> std::result::Result<Box<dyn ProcPin>, String> {
+        Ok(Box::new(AlwaysAlive))
+    }
+    /// Lot 2.3b: whether `pid` is in the initial pid, user and mount
+    /// namespaces (its `ns/pid`, `ns/user`, `ns/mnt` those of PID 1).
+    fn ns_initial(&self, _pid: u32) -> std::result::Result<bool, String> {
+        Ok(true)
+    }
+    /// Lot 2.3b: its executable — `(st_dev, st_ino)` and its resolved path.
+    fn exe(&self, pid: u32) -> std::result::Result<((u64, u64), String), String> {
+        Err(format!("/proc/{pid}/exe: not read"))
+    }
+    /// Lot 2.3b: its arguments.
+    fn cmdline(&self, _pid: u32) -> std::result::Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    /// Lot 2.3b: its initial environment (`NAME=value` entries).
+    fn environ(&self, _pid: u32) -> std::result::Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    /// Lot 2.3b: the SHA-256 of each regular file it holds open (at most
+    /// [`MAX_DIGESTED_FDS`] descriptors, each file at most
+    /// [`MAX_SCRIPT_BYTES`]).
+    fn open_file_digests(&self, _pid: u32) -> std::result::Result<Vec<[u8; 32]>, String> {
+        Ok(Vec::new())
+    }
+    /// Lot 2.3b: the SHA-256 of the file `arg` names for `pid` (relative
+    /// to its working directory), when it is a regular file of at most
+    /// [`MAX_SCRIPT_BYTES`].
+    fn arg_file_digest(&self, _pid: u32, _arg: &str) -> Option<[u8; 32]> {
+        None
+    }
+    /// Lot 2.3b (D5): the objects the window freezes against outsiders,
+    /// as this host has them ([`freeze_plan`]).
+    fn freeze_plan(&self) -> std::result::Result<Vec<FreezeMark>, String> {
+        Ok(Vec::new())
+    }
+    /// Lot 2.3b (D5): PID 1's manager environment (systemd's
+    /// `Environment`, what `systemctl set-environment` changes).
+    fn pid1_env(&self) -> std::result::Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Lot 2.3b: the most descriptors of a script root whose files are hashed.
+pub const MAX_DIGESTED_FDS: usize = 64;
+/// Lot 2.3b: the largest script the admission hashes.
+pub const MAX_SCRIPT_BYTES: u64 = 4 << 20;
+
+/// Lot 2.3b: a handle on a process taken before it is read ([`LineReader::pin`]).
+pub trait ProcPin {
+    /// Whether the pid still names the process the handle was taken on.
+    fn alive(&self) -> bool;
+}
+
+struct AlwaysAlive;
+
+impl ProcPin for AlwaysAlive {
+    fn alive(&self) -> bool {
+        true
+    }
+}
+
+/// Lot 2.3b: a pidfd (`pidfd_open`, 5.3+), closed on drop. The kernel
+/// keeps it on the process it was opened for: a pid reused since names
+/// another process, and this one answers "gone".
+pub struct Pidfd(std::os::fd::OwnedFd);
+
+impl Pidfd {
+    /// `pidfd_open(pid, 0)`.
+    pub fn open(pid: u32) -> std::result::Result<Self, String> {
+        let pid = libc::pid_t::try_from(pid).map_err(|_| format!("pid {pid} out of range"))?;
+        // SAFETY: a syscall with two integer arguments; the descriptor it
+        // returns, if any, is owned here.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return Err(format!(
+                "pidfd_open({pid}): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: a fresh descriptor the kernel just returned to us.
+        Ok(Self(unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32)
+        }))
+    }
+}
+
+impl ProcPin for Pidfd {
+    fn alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: signal 0 (a liveness test, no signal is sent) through our
+        // own descriptor, no siginfo.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+}
+
+/// Lot 2.3b (D5): one object the window freezes against outsiders, as the
+/// kernel keys it: by its inode (`FROZEN_INODES`), or by its name in its
+/// directory (`FROZEN_NAMES`), with its reach (`FROZEN_SUBTREE`,
+/// `FROZEN_SELF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeMark {
+    Inode(InodeKey, u64),
+    Name(common::wire::FrozenName, u64),
+}
+
+/// Lot 2.3b (D5): the window's frozen objects
+/// (`nn_core::anti_tamper::trusted_installer::FROZEN`) as `stat` (an
+/// object's key, `None` when it does not exist) finds them: each existing
+/// object by its inode — one mark per inode, the reaches joined (`/bin` is
+/// `/usr/bin` on a merged-`/usr` host) — and each name of
+/// `frozen_names()` in its existing parent.
+pub fn freeze_plan(stat: &dyn Fn(&Path) -> Option<InodeKey>) -> Vec<FreezeMark> {
+    use nn_core::anti_tamper::trusted_installer::{FROZEN, Freeze, frozen_names};
+    let reach = |h: Freeze| match h {
+        Freeze::Subtree => common::wire::FROZEN_SUBTREE,
+        Freeze::SelfOnly => common::wire::FROZEN_SELF,
+    };
+    let mut inodes: Vec<(InodeKey, u64)> = Vec::new();
+    for (path, how) in FROZEN {
+        if let Some(key) = stat(Path::new(path)) {
+            match inodes.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, f)) => *f |= reach(*how),
+                None => inodes.push((key, reach(*how))),
+            }
+        }
+    }
+    let mut out: Vec<FreezeMark> = inodes
+        .into_iter()
+        .map(|(k, f)| FreezeMark::Inode(k, f))
+        .collect();
+    for (parent, name, how) in frozen_names() {
+        if let Some(dir) = stat(Path::new(parent)) {
+            out.push(FreezeMark::Name(
+                common::wire::FrozenName {
+                    dir,
+                    name: common::window_tree::name_words4(name.as_bytes()),
+                },
+                reach(how),
+            ));
+        }
+    }
+    out
+}
+
+/// A path's key as the kernel builds it (`stat`, following links).
+fn stat_key(path: &Path) -> Option<InodeKey> {
+    let m = antitamper_bpf::kernel_roots::metadata(path).ok()?;
+    Some(InodeKey {
+        dev: super::filesystem::stat_dev_to_kernel_dev(std::os::unix::fs::MetadataExt::dev(&m)),
+        ino: std::os::unix::fs::MetadataExt::ino(&m),
+    })
 }
 
 /// Lot 2.3a (D7, the review of #647): the files of `cgroup` (a path of the
@@ -1219,6 +1771,109 @@ impl LineReader for ProcFs<'_> {
             })
             .collect())
     }
+
+    fn pin(&self, pid: u32) -> std::result::Result<Box<dyn ProcPin>, String> {
+        Ok(Box::new(Pidfd::open(pid)?))
+    }
+
+    fn ns_initial(&self, pid: u32) -> std::result::Result<bool, String> {
+        use std::os::unix::fs::MetadataExt;
+        for ns in ["pid", "user", "mnt"] {
+            let id = |p: &str| {
+                std::fs::metadata(self.0.join(p).join("ns").join(ns))
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(|e| format!("/proc/{p}/ns/{ns}: {e}"))
+            };
+            if id(&pid.to_string())? != id("1")? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn exe(&self, pid: u32) -> std::result::Result<((u64, u64), String), String> {
+        use std::os::unix::fs::MetadataExt;
+        let link = self.0.join(pid.to_string()).join("exe");
+        let m = std::fs::metadata(&link).map_err(|e| format!("/proc/{pid}/exe: {e}"))?;
+        let path = std::fs::read_link(&link).map_err(|e| format!("/proc/{pid}/exe: {e}"))?;
+        Ok(((m.dev(), m.ino()), path.to_string_lossy().into_owned()))
+    }
+
+    fn cmdline(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
+        let raw = std::fs::read(self.0.join(pid.to_string()).join("cmdline"))
+            .map_err(|e| format!("/proc/{pid}/cmdline: {e}"))?;
+        Ok(nul_split(&raw))
+    }
+
+    fn environ(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        std::fs::File::open(self.0.join(pid.to_string()).join("environ"))
+            .and_then(|f| f.take(64 * 1024).read_to_end(&mut raw))
+            .map_err(|e| format!("/proc/{pid}/environ: {e}"))?;
+        Ok(nul_split(&raw))
+    }
+
+    fn open_file_digests(&self, pid: u32) -> std::result::Result<Vec<[u8; 32]>, String> {
+        let dir = self.0.join(pid.to_string()).join("fd");
+        let entries = std::fs::read_dir(&dir).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
+        Ok(entries
+            .flatten()
+            .take(MAX_DIGESTED_FDS)
+            .filter_map(|e| file_digest(&e.path()))
+            .collect())
+    }
+
+    fn arg_file_digest(&self, pid: u32, arg: &str) -> Option<[u8; 32]> {
+        let p = Path::new(arg);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.0.join(pid.to_string()).join("cwd").join(p)
+        };
+        file_digest(&path)
+    }
+
+    fn freeze_plan(&self) -> std::result::Result<Vec<FreezeMark>, String> {
+        Ok(freeze_plan(&stat_key))
+    }
+
+    fn pid1_env(&self) -> std::result::Result<Vec<String>, String> {
+        let v = crate::systemd_state::manager_property(
+            Path::new(crate::systemd_state::PRIVATE_SOCKET),
+            Duration::from_secs(2),
+            "Environment",
+        )
+        .map_err(|e| format!("PID 1's Environment: {e}"))?;
+        v.strings()
+            .ok_or_else(|| "PID 1's Environment: not a list of strings".to_string())
+    }
+}
+
+/// The NUL-separated strings of a `/proc` file (`cmdline`, `environ`).
+fn nul_split(raw: &[u8]) -> Vec<String> {
+    raw.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// The SHA-256 of the regular file at `path` (followed), when it is at
+/// most [`MAX_SCRIPT_BYTES`].
+fn file_digest(path: &Path) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.is_file() || m.len() > MAX_SCRIPT_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_SCRIPT_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_SCRIPT_BYTES {
+        return None;
+    }
+    Some(sha2::Sha256::digest(&buf).into())
 }
 
 /// `/proc/<pid>/stat`'s parent, start and kernel-thread flag, counted after
@@ -1244,21 +1899,52 @@ fn parse_guards(status: &str) -> Option<(u32, u32)> {
     Some((field("TracerPid:")?, field("Seccomp:")?))
 }
 
-/// Lot 2.3a's minimal path (lot 2.3b replaces it with pidfds and the
-/// admission policy): the line from the requester (`SO_PEERCRED` pid) up
-/// through its parents to the signed `root` (`(pid, start_ticks)`), root
-/// first, each with its start. Refused (`Err`, why): a root that is PID 1
-/// or 0, not on the line within [`MAX_TREE_LINE`] processes, or whose
-/// start differs from the signed one (another process took its pid); a
-/// line that holds a kernel thread, a traced or seccomp-filtered process,
+/// The line from the requester (`SO_PEERCRED` pid) up through its parents
+/// to the signed `root` (`(pid, start_ticks)`), root first, each with its
+/// start, every process pinned ([`LineReader::pin`]) before it is read and
+/// checked still alive after the walk. Refused (`Err`, why): a root that
+/// is PID 1 or 0, not on the line within [`MAX_TREE_LINE`] processes, or
+/// whose start differs from the signed one (another process took its pid);
+/// a line that holds a kernel thread, a traced or seccomp-filtered process,
+/// a process outside the initial pid, user or mount namespace (lot 2.3b),
 /// or one of the agent's own (`own`: [`TrustedInstallerOverride::own_tgids`]);
-/// a root whose parent is one of the agent's own (its worker); any
-/// process on it that cannot be read.
+/// a root whose parent is one of the agent's own (its worker); any process
+/// on it that cannot be read, or that exited during the walk. Lot 2.3b's
+/// admission policy ([`admit_line`]) then judges the root's kind.
 pub fn line_to_root(
     reader: &dyn LineReader,
     requester: u32,
     root: (u32, u64),
     own: &[u32],
+) -> std::result::Result<Vec<(u32, u64)>, String> {
+    let mut pins = Vec::new();
+    let line = walk_line(reader, requester, root, own, &mut pins)?;
+    check_pins(&line, &pins)?;
+    Ok(line)
+}
+
+/// Every pinned process of the line still alive (lot 2.3b: the pidfds
+/// taken before the reads; a pid reused meanwhile is another process).
+fn check_pins(line: &[(u32, u64)], pins: &[(u32, Box<dyn ProcPin>)]) -> std::result::Result<(), String> {
+    for (pid, pin) in pins {
+        if !pin.alive() {
+            return Err(format!(
+                "process {pid} on the line exited during the admission (its pidfd names no live \
+                 process: {} on the line)",
+                line.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`line_to_root`]'s walk, each process pinned into `pins` first.
+fn walk_line(
+    reader: &dyn LineReader,
+    requester: u32,
+    root: (u32, u64),
+    own: &[u32],
+    pins: &mut Vec<(u32, Box<dyn ProcPin>)>,
 ) -> std::result::Result<Vec<(u32, u64)>, String> {
     let (root_pid, root_start) = root;
     if root_pid <= 1 {
@@ -1274,6 +1960,7 @@ pub fn line_to_root(
     let mut line = Vec::new();
     let mut pid = requester;
     for _ in 0..MAX_TREE_LINE {
+        pins.push((pid, reader.pin(pid)?));
         let hop = reader.hop(pid)?;
         if hop.kthread {
             return Err(format!("process {pid} on the line is a kernel thread"));
@@ -1291,6 +1978,11 @@ pub fn line_to_root(
                      (Seccomp {seccomp})"
                 ));
             }
+        }
+        if !reader.ns_initial(pid)? {
+            return Err(format!(
+                "process {pid} on the line is outside the initial pid, user or mount namespace"
+            ));
         }
         line.push((pid, hop.start_ticks));
         if pid == root_pid {
@@ -1322,6 +2014,143 @@ pub fn line_to_root(
     Err(format!(
         "root {root_pid} is not within {MAX_TREE_LINE} processes above the requester {requester}"
     ))
+}
+
+/// Lot 2.3b: the signed request's root as the admission policy judges it
+/// (`TrustedInstallerTreeGrantExtra`'s root, its kind and its script's
+/// digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRoot {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub kind: TreeRootKind,
+    pub script_sha256: [u8; 32],
+}
+
+/// Lot 2.3b (D3, the admission policy; the design's section 1): the line
+/// from `requester` to `root` ([`line_to_root`]'s refusals), then the
+/// root's kind — the agent admits only these roots, every other refused
+/// with its reason:
+///
+/// - **`window-run`:** the root is the requester itself, and runs the
+///   installed `nn-admin` (`installed_admin`: its `(st_dev, st_ino)`; the
+///   one beside the agent's binary).
+/// - **our `install.sh`:** the root is the requester's parent, a system
+///   shell started with a script (an argument of its command line) whose
+///   SHA-256 is the signed one, a file it also holds open.
+/// - **a package manager:** the root runs a package manager's packaged
+///   program (`dpkg`, `rpm`, `dnf`, …), every process between it and the
+///   requester is a system shell, and one of them is our package's
+///   scriptlet (dpkg's or rpm's variables naming our package).
+///
+/// So a session daemon, a subreaper, a terminal multiplexer, `systemd
+/// --user` or an interactive shell is never a root: the allowlist refuses
+/// them, not a denylist. Every process is pinned before it is read and
+/// checked alive after every read.
+pub fn admit_line(
+    reader: &dyn LineReader,
+    requester: u32,
+    root: &TreeRoot,
+    own: &[u32],
+    installed_admin: Option<(u64, u64)>,
+) -> std::result::Result<Vec<(u32, u64)>, String> {
+    use nn_core::anti_tamper::trusted_installer::{
+        is_our_scriptlet_env, is_system_shell, package_manager,
+    };
+    let mut pins = Vec::new();
+    let line = walk_line(reader, requester, (root.pid, root.start_ticks), own, &mut pins)?;
+    let kind = root.kind.as_str();
+    match root.kind {
+        TreeRootKind::WindowRun => {
+            if line.len() != 1 {
+                return Err(format!(
+                    "a {kind} root is the requesting nn-admin itself (the line holds {} processes)",
+                    line.len()
+                ));
+            }
+            let (exe_id, exe) = reader.exe(root.pid)?;
+            match installed_admin {
+                Some(id) if id == exe_id => {}
+                Some(_) => {
+                    return Err(format!(
+                        "the {kind} root {} runs {exe}, not the installed nn-admin",
+                        root.pid
+                    ));
+                }
+                None => {
+                    return Err("the installed nn-admin could not be read: no window-run".to_string());
+                }
+            }
+        }
+        TreeRootKind::InstallScript => {
+            if line.len() != 2 {
+                return Err(format!(
+                    "an {kind} root is the requester's parent (the line holds {} processes)",
+                    line.len()
+                ));
+            }
+            let (_, exe) = reader.exe(root.pid)?;
+            if !is_system_shell(&exe) {
+                return Err(format!("the {kind} root {} runs {exe}, not a system shell", root.pid));
+            }
+            if root.script_sha256 == [0; 32] {
+                return Err(format!("an {kind} grant names no script digest"));
+            }
+            let args = reader.cmdline(root.pid)?;
+            let started_with = args
+                .iter()
+                .skip(1)
+                .any(|a| reader.arg_file_digest(root.pid, a) == Some(root.script_sha256));
+            if !started_with {
+                return Err(format!(
+                    "the {kind} root {} was not started with the signed script (no argument of \
+                     its command line has that digest)",
+                    root.pid
+                ));
+            }
+            if !reader.open_file_digests(root.pid)?.contains(&root.script_sha256) {
+                return Err(format!(
+                    "the {kind} root {} does not hold the signed script open",
+                    root.pid
+                ));
+            }
+        }
+        TreeRootKind::PackageManager => {
+            if line.len() < 2 {
+                return Err(format!(
+                    "a {kind} root is above its scriptlet (the line holds {} process)",
+                    line.len()
+                ));
+            }
+            let (_, exe) = reader.exe(root.pid)?;
+            let args = reader.cmdline(root.pid)?;
+            if package_manager(&exe, &args).is_none() {
+                return Err(format!(
+                    "the {kind} root {} runs {exe}, not a package manager's packaged program",
+                    root.pid
+                ));
+            }
+            let mut scriptlet = false;
+            for &(pid, _) in &line[1..line.len() - 1] {
+                let (_, e) = reader.exe(pid)?;
+                if !is_system_shell(&e) {
+                    return Err(format!(
+                        "process {pid} between the {kind} root and the requester runs {e}, not a \
+                         system shell"
+                    ));
+                }
+                scriptlet |= is_our_scriptlet_env(reader.environ(pid)?.iter().map(String::as_str));
+            }
+            if !scriptlet {
+                return Err(format!(
+                    "no process between the {kind} root and the requester is our package's \
+                     scriptlet"
+                ));
+            }
+        }
+    }
+    check_pins(&line, &pins)?;
+    Ok(line)
 }
 
 /// What a close did: the grant it ended, the members it took out, the
@@ -1358,6 +2187,14 @@ fn close_tree_locked(
             0
         }
     };
+    // lot 2.3b: the frozen marks and the leases of the window go with it
+    // (a mark or a lease of another generation is void in the kernel anyway)
+    if let Err(e) = maps.clear_frozen() {
+        failed.push(format!("the frozen marks not emptied: {e}"));
+    }
+    if let Err(e) = maps.clear_leases() {
+        failed.push(format!("{WINDOW_LEASES_MAP_NAME} not emptied: {e}"));
+    }
     if grant_gone {
         if let Err(e) = maps.zero_closed() {
             failed.push(format!(
@@ -1376,9 +2213,11 @@ fn close_tree_locked(
 /// A refused arming's members taken out again; `why`, with what could not
 /// be taken out.
 fn withdrawn(maps: &mut dyn TreeMaps, why: String) -> String {
-    match maps.clear_members() {
-        Ok(_) => why,
-        Err(e) => format!("{why} (and {TREE_MEMBERS_MAP_NAME} not emptied: {e})"),
+    let frozen = maps.clear_frozen();
+    match (maps.clear_members(), frozen) {
+        (Ok(_), Ok(())) => why,
+        (Err(e), _) => format!("{why} (and {TREE_MEMBERS_MAP_NAME} not emptied: {e})"),
+        (_, Err(e)) => format!("{why} (and the frozen marks not emptied: {e})"),
     }
 }
 
@@ -1403,6 +2242,46 @@ trait TreeMaps {
         _value: [u64; 2],
     ) -> std::result::Result<(), String> {
         Ok(())
+    }
+    /// Lot 2.3b (D5): `FROZEN_INODES[key] = value` (`[generation, reach]`).
+    fn put_frozen_inode(
+        &mut self,
+        _key: InodeKey,
+        _value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Lot 2.3b (D5): `FROZEN_NAMES[name] = value`.
+    fn put_frozen_name(
+        &mut self,
+        _name: common::wire::FrozenName,
+        _value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Lot 2.3b (D5): both frozen maps emptied.
+    fn clear_frozen(&mut self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Lot 2.3b: `TREE_MEMBERS[tgid]`.
+    fn member(&mut self, _tgid: u32) -> std::result::Result<Option<TreeMember>, String> {
+        Ok(None)
+    }
+    /// Lot 2.3b: the lease slots, in order.
+    fn leases(&mut self) -> std::result::Result<Vec<WindowLease>, String> {
+        Ok(Vec::new())
+    }
+    /// Lot 2.3b: `WINDOW_LEASES[slot] = lease`.
+    fn put_lease(&mut self, _slot: u32, _lease: WindowLease) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Lot 2.3b: every lease slot zeroed.
+    fn clear_leases(&mut self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Lot 2.3b: `INODE_EXT[key]` (a directory of our units' links).
+    fn inode_ext(&mut self, _key: InodeKey) -> std::result::Result<Option<u8>, String> {
+        Ok(None)
     }
 }
 
@@ -1478,7 +2357,111 @@ impl TreeMaps for PinnedTreeMaps<'_> {
             .set(0, &[0u64; 2], 0)
             .map_err(|e| e.to_string())
     }
+
+    fn put_frozen_inode(
+        &mut self,
+        key: InodeKey,
+        value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        let mut m: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(FROZEN_INODES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        m.insert(&super::filesystem::AyaInodeKey(key), &value, 0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn put_frozen_name(
+        &mut self,
+        name: common::wire::FrozenName,
+        value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        let mut m: aya::maps::HashMap<MapData, PodFrozenName, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(FROZEN_NAMES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        m.insert(&PodFrozenName(name), &value, 0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn clear_frozen(&mut self) -> std::result::Result<(), String> {
+        let mut i: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(FROZEN_INODES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        let keys: Vec<super::filesystem::AyaInodeKey> =
+            i.keys().filter_map(std::result::Result::ok).collect();
+        for k in &keys {
+            i.remove(k).map_err(|e| e.to_string())?;
+        }
+        let mut n: aya::maps::HashMap<MapData, PodFrozenName, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(FROZEN_NAMES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        let names: Vec<PodFrozenName> = n.keys().filter_map(std::result::Result::ok).collect();
+        for k in &names {
+            n.remove(k).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn member(&mut self, tgid: u32) -> std::result::Result<Option<TreeMember>, String> {
+        match self.members()?.get(&tgid, 0) {
+            Ok(m) => Ok(Some(m.0)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn leases(&mut self) -> std::result::Result<Vec<WindowLease>, String> {
+        let a = self.lease_slots()?;
+        (0..WINDOW_LEASES_MAX)
+            .map(|i| a.get(&i, 0).map(|l| l.0).map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    fn put_lease(&mut self, slot: u32, lease: WindowLease) -> std::result::Result<(), String> {
+        self.lease_slots()?
+            .set(slot, &PodLease(lease), 0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn clear_leases(&mut self) -> std::result::Result<(), String> {
+        let mut a = self.lease_slots()?;
+        for i in 0..WINDOW_LEASES_MAX {
+            a.set(i, &PodLease(bytemuck::Zeroable::zeroed()), 0)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn inode_ext(&mut self, key: InodeKey) -> std::result::Result<Option<u8>, String> {
+        let m: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, u8> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(INODE_EXT_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        match m.get(&super::filesystem::AyaInodeKey(key), 0) {
+            Ok(v) => Ok(Some(v)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
+
+impl PinnedTreeMaps<'_> {
+    fn lease_slots(&self) -> std::result::Result<AyaArray<MapData, PodLease>, String> {
+        AyaArray::try_from(AyaMap::Array(self.open(WINDOW_LEASES_MAP_NAME)?))
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodFrozenName(common::wire::FrozenName);
+// SAFETY: `FrozenName` is `repr(C)`, `bytemuck::Pod`; the wrapper is
+// `repr(transparent)`.
+unsafe impl aya::Pod for PodFrozenName {}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodLease(WindowLease);
+// SAFETY: `WindowLease` is `repr(C)`, `bytemuck::Pod`; as above.
+unsafe impl aya::Pod for PodLease {}
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -2555,4 +3538,576 @@ mod tests {
             maps.ops
         );
     }
+
+    // ── Lot 2.3b: the admission policy, the freeze, the leases, the stop ──
+
+    use std::cell::{Cell, RefCell};
+
+    /// A `/proc` with what the admission reads besides the walk: each
+    /// pid's executable, command line, environment, open files' digests,
+    /// namespaces, and whether its pidfd still names it after the walk.
+    struct FlowProc {
+        base: FakeProc,
+        exe: BTreeMap<u32, ((u64, u64), String)>,
+        cmdline: BTreeMap<u32, Vec<String>>,
+        environ: BTreeMap<u32, Vec<String>>,
+        digests: BTreeMap<u32, Vec<[u8; 32]>>,
+        args: BTreeMap<(u32, String), [u8; 32]>,
+        foreign_ns: Vec<u32>,
+        dies: Vec<u32>,
+        freeze: Vec<FreezeMark>,
+        pid1_env: RefCell<std::result::Result<Vec<String>, String>>,
+        pins: Cell<usize>,
+    }
+
+    impl Default for FlowProc {
+        fn default() -> Self {
+            Self {
+                base: FakeProc::default(),
+                exe: BTreeMap::new(),
+                cmdline: BTreeMap::new(),
+                environ: BTreeMap::new(),
+                digests: BTreeMap::new(),
+                args: BTreeMap::new(),
+                foreign_ns: Vec::new(),
+                dies: Vec::new(),
+                freeze: Vec::new(),
+                pid1_env: RefCell::new(Ok(Vec::new())),
+                pins: Cell::new(0),
+            }
+        }
+    }
+
+    struct FakePin(bool);
+    impl ProcPin for FakePin {
+        fn alive(&self) -> bool {
+            self.0
+        }
+    }
+
+    impl LineReader for FlowProc {
+        fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
+            self.base.hop(pid)
+        }
+        fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String> {
+            self.base.guards(pid)
+        }
+        fn pin(&self, pid: u32) -> std::result::Result<Box<dyn ProcPin>, String> {
+            self.pins.set(self.pins.get() + 1);
+            Ok(Box::new(FakePin(!self.dies.contains(&pid))))
+        }
+        fn ns_initial(&self, pid: u32) -> std::result::Result<bool, String> {
+            Ok(!self.foreign_ns.contains(&pid))
+        }
+        fn exe(&self, pid: u32) -> std::result::Result<((u64, u64), String), String> {
+            self.exe.get(&pid).cloned().ok_or_else(|| format!("{pid}: no exe"))
+        }
+        fn cmdline(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
+            Ok(self.cmdline.get(&pid).cloned().unwrap_or_default())
+        }
+        fn environ(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
+            Ok(self.environ.get(&pid).cloned().unwrap_or_default())
+        }
+        fn open_file_digests(&self, pid: u32) -> std::result::Result<Vec<[u8; 32]>, String> {
+            Ok(self.digests.get(&pid).cloned().unwrap_or_default())
+        }
+        fn arg_file_digest(&self, pid: u32, arg: &str) -> Option<[u8; 32]> {
+            self.args.get(&(pid, arg.to_string())).copied()
+        }
+        fn freeze_plan(&self) -> std::result::Result<Vec<FreezeMark>, String> {
+            Ok(self.freeze.clone())
+        }
+        fn pid1_env(&self) -> std::result::Result<Vec<String>, String> {
+            self.pid1_env.borrow().clone()
+        }
+    }
+
+    const ADMIN: (u64, u64) = (0x803, 4242);
+    const SCRIPT: [u8; 32] = [0x5c; 32];
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// window-run: nn-admin (700, started 7000) under a login shell (600).
+    fn window_run_host() -> FlowProc {
+        let mut f = FlowProc {
+            base: FakeProc::default().with(600, 1, 6_000).with(700, 600, 7_000),
+            pid1_env: RefCell::new(Ok(strs(&["LANG=C.UTF-8"]))),
+            ..FlowProc::default()
+        };
+        f.exe.insert(700, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        f.exe.insert(600, ((0x803, 1), "/usr/bin/bash".to_string()));
+        f
+    }
+
+    fn root(pid: u32, start_ticks: u64, kind: TreeRootKind) -> TreeRoot {
+        TreeRoot {
+            pid,
+            start_ticks,
+            kind,
+            script_sha256: SCRIPT,
+        }
+    }
+
+    /// Lot 2.3b (D2, D3): a window-run's root is the requesting nn-admin
+    /// itself, the installed one by its image; every process is pinned
+    /// before it is read and must still be alive after.
+    #[test]
+    fn a_window_run_root_is_the_installed_nn_admin_requesting_itself() {
+        let host = window_run_host();
+        let r = root(700, 7_000, TreeRootKind::WindowRun);
+        assert_eq!(admit_line(&host, 700, &r, &[], Some(ADMIN)), Ok(vec![(700, 7_000)]));
+        assert_eq!(host.pins.get(), 1, "pinned before it is read");
+        // another nn-admin (a copy elsewhere), no installed one, a root that
+        // is not the requester (the login shell)
+        let e = admit_line(&host, 700, &r, &[], Some((0x803, 1))).unwrap_err();
+        assert!(e.contains("not the installed nn-admin"), "{e}");
+        let e = admit_line(&host, 700, &r, &[], None).unwrap_err();
+        assert!(e.contains("could not be read"), "{e}");
+        let e = admit_line(&host, 700, &root(600, 6_000, TreeRootKind::WindowRun), &[], Some(ADMIN))
+            .unwrap_err();
+        assert!(e.contains("requesting nn-admin itself"), "{e}");
+        // its pidfd names no live process after the reads
+        let mut dying = window_run_host();
+        dying.dies.push(700);
+        let e = admit_line(&dying, 700, &r, &[], Some(ADMIN)).unwrap_err();
+        assert!(e.contains("exited during the admission"), "{e}");
+        // outside the initial namespaces
+        let mut ns = window_run_host();
+        ns.foreign_ns.push(700);
+        let e = admit_line(&ns, 700, &r, &[], Some(ADMIN)).unwrap_err();
+        assert!(e.contains("initial pid, user or mount namespace"), "{e}");
+        // traced, filtered
+        for (t, sc) in [(9, 0), (0, 2)] {
+            let mut g = window_run_host();
+            g.base = g.base.guarded(700, t, sc);
+            assert!(admit_line(&g, 700, &r, &[], Some(ADMIN)).is_err());
+        }
+    }
+
+    /// install.sh: bash (501) runs the script, nn-admin (502) asks.
+    fn script_host() -> FlowProc {
+        let mut f = FlowProc {
+            base: FakeProc::default()
+                .with(400, 1, 100)
+                .with(501, 400, 9_000)
+                .with(502, 501, 9_100),
+            ..FlowProc::default()
+        };
+        f.exe.insert(501, ((0x803, 2), "/usr/bin/bash".to_string()));
+        f.exe.insert(502, ((0x803, 3), "/opt/release/nn-admin".to_string()));
+        f.cmdline.insert(501, strs(&["bash", "./install.sh", "--upgrade"]));
+        f.args.insert((501, "./install.sh".to_string()), SCRIPT);
+        f.digests.insert(501, vec![[1; 32], SCRIPT]);
+        f
+    }
+
+    /// Lot 2.3b (D3): our install.sh is a system shell started with the
+    /// signed script, holding it open, the requester's parent.
+    #[test]
+    fn an_install_script_root_is_a_shell_started_with_the_signed_script() {
+        let r = root(501, 9_000, TreeRootKind::InstallScript);
+        assert_eq!(
+            admit_line(&script_host(), 502, &r, &[], None),
+            Ok(vec![(501, 9_000), (502, 9_100)])
+        );
+        // an interactive shell that merely holds the script open
+        let mut i = script_host();
+        i.cmdline.insert(501, strs(&["-bash"]));
+        let e = admit_line(&i, 502, &r, &[], None).unwrap_err();
+        assert!(e.contains("not started with the signed script"), "{e}");
+        // started with it but no longer holding it (another file in its place)
+        let mut c = script_host();
+        c.digests.insert(501, vec![[1; 32]]);
+        let e = admit_line(&c, 502, &r, &[], None).unwrap_err();
+        assert!(e.contains("does not hold the signed script open"), "{e}");
+        // another digest signed, none signed
+        let e = admit_line(&script_host(), 502, &TreeRoot { script_sha256: [2; 32], ..r }, &[], None)
+            .unwrap_err();
+        assert!(e.contains("not started with the signed script"), "{e}");
+        let e = admit_line(&script_host(), 502, &TreeRoot { script_sha256: [0; 32], ..r }, &[], None)
+            .unwrap_err();
+        assert!(e.contains("no script digest"), "{e}");
+        // not a system shell (sshd, tmux, a shell copied to /tmp)
+        for exe in ["/usr/sbin/sshd", "/usr/bin/tmux", "/tmp/bash"] {
+            let mut n = script_host();
+            n.exe.insert(501, ((0x803, 2), exe.to_string()));
+            let e = admit_line(&n, 502, &r, &[], None).unwrap_err();
+            assert!(e.contains("not a system shell"), "{exe}: {e}");
+        }
+        // the grandparent instead of the parent
+        let e = admit_line(&script_host(), 502, &root(400, 100, TreeRootKind::InstallScript), &[], None)
+            .unwrap_err();
+        assert!(e.contains("requester's parent"), "{e}");
+    }
+
+    /// dpkg (300) runs our preinst (310, dash), which runs install.sh
+    /// (320, bash), which runs nn-admin (330).
+    fn package_host() -> FlowProc {
+        let mut f = FlowProc {
+            base: FakeProc::default()
+                .with(290, 1, 50)
+                .with(300, 290, 3_000)
+                .with(310, 300, 3_100)
+                .with(320, 310, 3_200)
+                .with(330, 320, 3_300),
+            ..FlowProc::default()
+        };
+        f.exe.insert(300, ((0x803, 10), "/usr/bin/dpkg".to_string()));
+        f.cmdline.insert(300, strs(&["dpkg", "-i", "northnarrow.deb"]));
+        f.exe.insert(310, ((0x803, 11), "/usr/bin/dash".to_string()));
+        f.exe.insert(320, ((0x803, 12), "/usr/bin/bash".to_string()));
+        f.environ.insert(
+            310,
+            strs(&["DPKG_MAINTSCRIPT_PACKAGE=northnarrow", "DPKG_MAINTSCRIPT_NAME=preinst"]),
+        );
+        f
+    }
+
+    /// Lot 2.3b (D3): a package manager's process roots a window only for
+    /// our package's scriptlet, through system shells.
+    #[test]
+    fn a_package_manager_root_runs_its_packaged_program_for_our_scriptlet() {
+        let r = root(300, 3_000, TreeRootKind::PackageManager);
+        assert_eq!(admit_line(&package_host(), 330, &r, &[], None).map(|l| l.len()), Ok(4));
+        // another package's scriptlet
+        let mut o = package_host();
+        o.environ.insert(310, strs(&["DPKG_MAINTSCRIPT_PACKAGE=other"]));
+        let e = admit_line(&o, 330, &r, &[], None).unwrap_err();
+        assert!(e.contains("our package's scriptlet"), "{e}");
+        // a process between them that is not a shell (a terminal multiplexer)
+        let mut m = package_host();
+        m.exe.insert(320, ((0x803, 13), "/usr/bin/tmux".to_string()));
+        let e = admit_line(&m, 330, &r, &[], None).unwrap_err();
+        assert!(e.contains("not a system shell"), "{e}");
+        // not a package manager (cron, a user's copy of dpkg)
+        for exe in ["/usr/sbin/cron", "/tmp/dpkg"] {
+            let mut n = package_host();
+            n.exe.insert(300, ((0x803, 10), exe.to_string()));
+            let e = admit_line(&n, 330, &r, &[], None).unwrap_err();
+            assert!(e.contains("not a package manager"), "{exe}: {e}");
+        }
+        // the scriptlet's parent's parent (the session above dpkg)
+        let mut s = package_host();
+        s.exe.insert(290, ((0x803, 14), "/usr/sbin/sshd".to_string()));
+        assert!(admit_line(&s, 330, &root(290, 50, TreeRootKind::PackageManager), &[], None).is_err());
+        // the line's processes are pinned, each before its read
+        let p = package_host();
+        admit_line(&p, 330, &r, &[], None).unwrap();
+        assert_eq!(p.pins.get(), 4);
+    }
+
+    /// Lot 2.3b (D5): the plan freezes each existing object by its inode,
+    /// one mark per inode with the reaches joined, and each name in its
+    /// existing parent.
+    #[test]
+    fn the_freeze_plan_marks_inodes_once_and_names_in_their_parents() {
+        use common::wire::{FROZEN_SELF, FROZEN_SUBTREE};
+        let key = |ino| InodeKey { dev: 8, ino };
+        // a merged-/usr host: /bin is /usr/bin; no /etc/ld.so.preload
+        let stat = |p: &Path| -> Option<InodeKey> {
+            match p.to_str()? {
+                "/usr/bin" | "/bin" => Some(key(10)),
+                "/usr" => Some(key(2)),
+                "/etc" => Some(key(3)),
+                "/etc/ld.so.preload" => None,
+                "/etc/ld.so.cache" => Some(key(30)),
+                "/" => Some(key(1)),
+                _ => None,
+            }
+        };
+        let plan = freeze_plan(&stat);
+        let inodes: Vec<(InodeKey, u64)> = plan
+            .iter()
+            .filter_map(|m| match m {
+                FreezeMark::Inode(k, f) => Some((*k, *f)),
+                FreezeMark::Name(..) => None,
+            })
+            .collect();
+        assert_eq!(inodes.iter().filter(|(k, _)| *k == key(10)).count(), 1);
+        assert!(inodes.contains(&(key(10), FROZEN_SUBTREE)));
+        assert!(inodes.contains(&(key(2), FROZEN_SELF)));
+        assert!(inodes.contains(&(key(30), FROZEN_SUBTREE)));
+        let name = |dir, n: &str| common::wire::FrozenName {
+            dir,
+            name: common::window_tree::name_words4(n.as_bytes()),
+        };
+        assert!(plan.contains(&FreezeMark::Name(name(key(3), "ld.so.preload"), FROZEN_SUBTREE)));
+        assert!(plan.contains(&FreezeMark::Name(name(key(1), "bin"), FROZEN_SUBTREE)));
+        assert!(plan.contains(&FreezeMark::Name(name(key(1), "usr"), FROZEN_SELF)));
+        assert!(plan.contains(&FreezeMark::Name(name(key(2), "bin"), FROZEN_SUBTREE)));
+    }
+
+    /// The kernel's maps of lot 2.3b, recorded.
+    #[derive(Default)]
+    struct FlowMaps {
+        base: FakeMaps,
+        frozen: Vec<FreezeMark>,
+        frozen_cleared: usize,
+        leases: Vec<WindowLease>,
+        leases_cleared: usize,
+        ext: BTreeMap<(u64, u64), u8>,
+    }
+
+    impl TreeMaps for FlowMaps {
+        fn put_member(&mut self, tgid: u32, m: TreeMember) -> std::result::Result<(), String> {
+            self.base.put_member(tgid, m)
+        }
+        fn clear_members(&mut self) -> std::result::Result<usize, String> {
+            self.base.clear_members()
+        }
+        fn write_grant(&mut self, g: FsGrantV2) -> std::result::Result<(), String> {
+            self.base.write_grant(g)
+        }
+        fn read_closed(&mut self) -> std::result::Result<[u64; 2], String> {
+            self.base.read_closed()
+        }
+        fn zero_closed(&mut self) -> std::result::Result<(), String> {
+            self.base.zero_closed()
+        }
+        fn put_frozen_inode(&mut self, k: InodeKey, v: [u64; 2]) -> std::result::Result<(), String> {
+            self.base.ops.push(format!("frozen inode {} gen {} reach {}", k.ino, v[0], v[1]));
+            self.frozen.push(FreezeMark::Inode(k, v[1]));
+            Ok(())
+        }
+        fn put_frozen_name(
+            &mut self,
+            n: common::wire::FrozenName,
+            v: [u64; 2],
+        ) -> std::result::Result<(), String> {
+            self.base.ops.push(format!("frozen name in {} gen {}", n.dir.ino, v[0]));
+            self.frozen.push(FreezeMark::Name(n, v[1]));
+            Ok(())
+        }
+        fn clear_frozen(&mut self) -> std::result::Result<(), String> {
+            self.frozen_cleared += 1;
+            self.frozen.clear();
+            Ok(())
+        }
+        fn member(&mut self, tgid: u32) -> std::result::Result<Option<TreeMember>, String> {
+            Ok(self.base.members.get(&tgid).copied())
+        }
+        fn leases(&mut self) -> std::result::Result<Vec<WindowLease>, String> {
+            if self.leases.is_empty() {
+                self.leases = vec![bytemuck::Zeroable::zeroed(); WINDOW_LEASES_MAX as usize];
+            }
+            Ok(self.leases.clone())
+        }
+        fn put_lease(&mut self, slot: u32, l: WindowLease) -> std::result::Result<(), String> {
+            self.leases[slot as usize] = l;
+            Ok(())
+        }
+        fn clear_leases(&mut self) -> std::result::Result<(), String> {
+            self.leases_cleared += 1;
+            self.leases.clear();
+            Ok(())
+        }
+        fn inode_ext(&mut self, k: InodeKey) -> std::result::Result<Option<u8>, String> {
+            Ok(self.ext.get(&(k.dev, k.ino)).copied())
+        }
+    }
+
+    fn flow_override() -> TrustedInstallerOverride {
+        let ov = tree_override();
+        // the walk's own reader holds no window; arm one on the fakes
+        ov
+    }
+
+    /// Arm a window-run window on `maps` for nn-admin 700.
+    fn arm_window_run(ov: &TrustedInstallerOverride, maps: &mut FlowMaps, host: &FlowProc) -> u64 {
+        ov.arm_tree_noted(
+            Some(maps),
+            host,
+            &[],
+            NOW,
+            (120, (700, 7_000), &[(700, 7_000)]),
+            serde_json::json!({ "root_kind": "window-run" }),
+        )
+        .expect("armed")
+    }
+
+    /// Lot 2.3b (D5): the frozen marks are written with the members, before
+    /// the second read and the grant, and go with the window — at its
+    /// close, or when the arming is refused after them.
+    #[test]
+    fn the_frozen_marks_are_written_before_the_grant_and_go_with_the_window() {
+        let key = InodeKey { dev: 8, ino: 10 };
+        let mut host = window_run_host();
+        host.freeze = vec![FreezeMark::Inode(key, common::wire::FROZEN_SUBTREE)];
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        let g = arm_window_run(&ov, &mut maps, &host);
+        let ops = &maps.base.ops;
+        let frozen = ops.iter().position(|o| o.starts_with("frozen inode 10 gen 1")).unwrap();
+        let grant = ops.iter().position(|o| o == "grant gen 1").unwrap();
+        assert!(frozen < grant, "{ops:?}");
+        assert!(ov.close_tree_with(&mut maps, "test"));
+        assert!(maps.frozen.is_empty() && maps.frozen_cleared == 1 && maps.leases_cleared == 1);
+        assert_eq!(g, 1);
+        // refused after the marks (a tracer at the second read): withdrawn
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        let mut traced = window_run_host();
+        traced.freeze = host.freeze.clone();
+        traced.base = traced.base.guarded(700, 9, 0);
+        let r = ov.arm_tree_noted(
+            Some(&mut maps),
+            &traced,
+            &[],
+            NOW,
+            (120, (700, 7_000), &[(700, 7_000)]),
+            serde_json::Value::Null,
+        );
+        assert!(r.is_err());
+        assert!(maps.frozen.is_empty() && maps.frozen_cleared >= 1);
+        // PID 1's environment unread: refused, nothing left
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        let unread = window_run_host();
+        *unread.pid1_env.borrow_mut() = Err("no bus".to_string());
+        let e = ov
+            .arm_tree_noted(Some(&mut maps), &unread, &[], NOW, (120, (700, 7_000), &[(700, 7_000)]), serde_json::Value::Null)
+            .unwrap_err();
+        assert!(e.contains("PID 1's environment could not be read"), "{e}");
+        assert!(maps.base.members.is_empty() && !ov.tree_window_open());
+    }
+
+    /// Lot 2.3b (D1): a member asks by its entry, its own start, the
+    /// window's generation and its own state now; anyone else is refused.
+    #[test]
+    fn only_a_member_of_the_open_generation_is_authenticated() {
+        let host = window_run_host();
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        let g = arm_window_run(&ov, &mut maps, &host);
+        assert_eq!(ov.window_member_with(&mut maps, &host, 700, g), Ok((700, 7_000)));
+        // another generation, an outsider, PID 1, a reused pid
+        assert!(ov.window_member_with(&mut maps, &host, 700, g + 1).is_err());
+        let e = ov.window_member_with(&mut maps, &host, 600, g).unwrap_err();
+        assert!(e.contains("outside the window's tree"), "{e}");
+        assert!(ov.window_member_with(&mut maps, &host, 1, g).is_err());
+        let reused = FlowProc {
+            base: FakeProc::default().with(700, 600, 7_777),
+            ..FlowProc::default()
+        };
+        let e = ov.window_member_with(&mut maps, &reused, 700, g).unwrap_err();
+        assert!(e.contains("another process's start"), "{e}");
+        // traced or filtered now, outside the namespaces, gone meanwhile
+        let mut t = window_run_host();
+        t.base = t.base.guarded(700, 9, 0);
+        assert!(ov.window_member_with(&mut maps, &t, 700, g).is_err());
+        let mut n = window_run_host();
+        n.foreign_ns.push(700);
+        assert!(ov.window_member_with(&mut maps, &n, 700, g).is_err());
+        let mut d = window_run_host();
+        d.dies.push(700);
+        assert!(ov.window_member_with(&mut maps, &d, 700, g).is_err());
+        // no window open
+        ov.close_tree_with(&mut maps, "test");
+        assert!(ov.window_member_with(&mut maps, &host, 700, g).is_err());
+    }
+
+    const LINK: &str = "/etc/systemd/system/multi-user.target.wants/northnarrow-agent.service";
+
+    fn links_stat(p: &Path) -> Option<InodeKey> {
+        (p == Path::new("/etc/systemd/system/multi-user.target.wants")).then_some(InodeKey { dev: 8, ino: 77 })
+    }
+
+    /// Lot 2.3b (the leases): one lease per link, bound to the registered
+    /// directory, the link's name, the generation and the removal, short-
+    /// lived; anything else is refused.
+    #[test]
+    fn a_lease_is_bound_to_one_registered_link_and_the_window() {
+        let host = window_run_host();
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        maps.ext.insert((8, 77), common::wire::INODE_EXT_UNIT_LINKS);
+        let g = arm_window_run(&ov, &mut maps, &host);
+        let slot = ov
+            .arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+            .expect("armed");
+        let l = maps.leases[slot as usize];
+        assert_eq!(l.generation, g);
+        assert_eq!(l.dir, InodeKey { dev: 8, ino: 77 });
+        assert_eq!(l.name_hash, common::window_tree::UNIT_LINK_HASHES[0]);
+        assert_eq!(l.action, common::wire::LEASE_REMOVE);
+        assert_eq!(l.member_tgid, 700);
+        assert_eq!(l.expires_boot_ns, NOW + common::wire::WINDOW_LEASE_TTL_NS);
+        // the kernel's test lets that very removal through, once
+        let grant = maps.base.grant;
+        assert!(l.usable_for(&grant, l.dir, l.name_hash, common::wire::LEASE_REMOVE, NOW + 1, test_nonce()));
+        // a second lease takes another slot
+        let other = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap();
+        assert_ne!(other, slot);
+        // not one of our links, a directory not registered, another window
+        for bad in [
+            "/etc/systemd/system/multi-user.target.wants/sshd.service",
+            "/etc/systemd/system/northnarrow-agent.service",
+        ] {
+            assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, bad).is_err(), "{bad}");
+        }
+        maps.ext.clear();
+        let e = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap_err();
+        assert!(e.contains("not a directory of our units' links"), "{e}");
+        maps.ext.insert((8, 77), common::wire::INODE_EXT_UNIT_LINKS);
+        assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g + 1, LINK).is_err());
+        // at most WINDOW_LEASES_MAX a window
+        let mut armed = 2;
+        while ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).is_ok() {
+            armed += 1;
+        }
+        assert_eq!(armed, WINDOW_LEASES_MAX as usize);
+    }
+
+    /// Lot 2.3b (D5, refinement 2): PID 1's environment changed since the
+    /// grant closes the window at the next lease or controlled stop, and
+    /// nothing is armed or stopped.
+    #[test]
+    fn pid1_s_environment_changed_closes_the_window_at_the_next_lease_or_stop() {
+        for lease in [true, false] {
+            let host = window_run_host();
+            let ov = flow_override();
+            let mut maps = FlowMaps::default();
+            maps.ext.insert((8, 77), common::wire::INODE_EXT_UNIT_LINKS);
+            let g = arm_window_run(&ov, &mut maps, &host);
+            *host.pid1_env.borrow_mut() = Ok(strs(&["LANG=C.UTF-8", "LD_PRELOAD=/tmp/x.so"]));
+            let r = if lease {
+                ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).map(|_| "")
+            } else {
+                ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g, false)
+            };
+            let e = r.unwrap_err();
+            assert!(e.contains("PID 1's environment changed"), "{e}");
+            assert!(!ov.tree_window_open(), "closed");
+            assert_eq!(ov.take_controlled_stop(), None);
+            assert!(maps.leases.iter().all(|l| l.generation == 0));
+        }
+    }
+
+    /// Lot 2.3b (D1): a member's controlled stop or restart sets the run
+    /// loop's reason once; refused for another generation.
+    #[test]
+    fn a_controlled_stop_sets_the_run_loop_s_reason_once() {
+        let host = window_run_host();
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        let g = arm_window_run(&ov, &mut maps, &host);
+        assert!(ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g + 1, true).is_err());
+        assert_eq!(ov.take_controlled_stop(), None);
+        assert_eq!(
+            ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g, true),
+            Ok(CONTROLLED_RESTART_REASON)
+        );
+        assert_eq!(ov.take_controlled_stop(), Some(CONTROLLED_RESTART_REASON));
+        assert_eq!(ov.take_controlled_stop(), None);
+        assert_eq!(
+            ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g, false),
+            Ok(CONTROLLED_STOP_REASON)
+        );
+        assert_eq!(ov.take_controlled_stop(), Some(CONTROLLED_STOP_REASON));
+        // a stop softens nothing: no host-wide window, no kill grant
+        assert!(!ov.is_window_open());
+    }
 }
+

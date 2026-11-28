@@ -1338,6 +1338,37 @@ impl WindowLease {
     }
 }
 
+// ── Lot 2.3b: the system code frozen against outsiders (D5) ─────────────
+
+/// The pinned map of the objects a window freezes by their inode
+/// (`InodeKey` → `[generation, FROZEN_*]`): written by the agent at the
+/// grant, emptied at the close. A value of another generation than the
+/// grant's freezes nothing.
+pub const FROZEN_INODES_MAP_NAME: &str = "FROZEN_INODES";
+/// Its size: the design's classes, each a directory or a file.
+pub const FROZEN_INODES_MAX: u32 = 128;
+/// The pinned map of the objects a window freezes by their name in their
+/// parent ([`FrozenName`] → `[generation, FROZEN_*]`): what does not exist
+/// at the grant (`/etc/ld.so.preload`) cannot be created, and what does
+/// cannot be replaced.
+pub const FROZEN_NAMES_MAP_NAME: &str = "FROZEN_NAMES";
+pub const FROZEN_NAMES_MAX: u32 = 64;
+/// The object and everything below it (the kernel walks up its parents).
+pub const FROZEN_SUBTREE: u64 = 1;
+/// The object itself only (an ancestor that would move a frozen subtree).
+pub const FROZEN_SELF: u64 = 2;
+
+/// A name frozen in its directory: the directory's inode and the name's
+/// first 31 bytes as four little-endian words
+/// (`window_tree::name_words4`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FrozenName {
+    pub dir: InodeKey,
+    pub name: [u64; 4],
+}
+
 // ── Lot 2.1 (S2 scaffold): the second word of a protected inode ─────────
 
 /// The pinned map of the inodes' second flag word, keyed by [`InodeKey`]:

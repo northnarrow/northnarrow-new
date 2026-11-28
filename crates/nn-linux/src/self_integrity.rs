@@ -1091,6 +1091,8 @@ fn high_kind(kind: &str) -> bool {
             | crate::anti_tamper::role_watch::CGROUP_FOREIGN_KIND
             // lot 2.0: a role stopped by a signal it did not request
             | UNREQUESTED_STOP
+            // lot 2.3b (D5): PID 1's environment changed during a window
+            | crate::anti_tamper::trusted_installer::PID1_ENV_CHANGED
     )
 }
 

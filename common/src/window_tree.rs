@@ -619,6 +619,71 @@ pub const fn unit_link_verdict(ext: Option<u8>, ours: bool, lifted: bool, family
     ext & INODE_EXT_UNIT_LINKS != 0 && ours && !lifted && !family
 }
 
+// ── lot 2.3b: the leases and the freeze ─────────────────────────────────
+
+/// [`crate::wire::pin_name_hash`] of `n`, at compile time.
+const fn name_hash(n: &[u8]) -> u64 {
+    let mut h = crate::wire::PIN_NAME_HASH_SEED;
+    let mut i = 0;
+    while i < n.len() {
+        h = (h ^ n[i] as u64).wrapping_mul(crate::wire::PIN_NAME_HASH_PRIME);
+        i += 1;
+    }
+    h
+}
+
+/// The lease key of each of [`UNIT_LINK_NAMES`] (`WindowLease::name_hash`).
+pub const UNIT_LINK_HASHES: [u64; 2] = [name_hash(UNIT_LINK_NAMES[0]), name_hash(UNIT_LINK_NAMES[1])];
+
+/// The lease key of an entry named `w` ([`name_words4`]): one of our units'
+/// enablement links' hashes ([`UNIT_LINK_HASHES`]), or `None` for any other
+/// name (no lease names it).
+#[inline(always)]
+pub const fn unit_link_hash(w: &[u64; 4]) -> Option<u64> {
+    if words_eq(w, &UNIT_LINK_WORDS[0]) {
+        Some(UNIT_LINK_HASHES[0])
+    } else if words_eq(w, &UNIT_LINK_WORDS[1]) {
+        Some(UNIT_LINK_HASHES[1])
+    } else {
+        None
+    }
+}
+
+/// Lot 2.3b (the single-use leases, the design's section 2): whether the
+/// removal of an entry of one of our units' enablement links' directories
+/// (`ext`: its directory's `INODE_EXT` word) named `w` by `caller` may use
+/// a lease: PID 1 only (the leases are for its file actions; a member gets
+/// the window's lift instead), a directory of our links, one of our links'
+/// names. The lease itself is `WindowLease::usable_for`'s.
+#[inline(always)]
+pub const fn lease_applies(caller: u32, ext: Option<u8>, w: &[u64; 4]) -> Option<u64> {
+    let ext = match ext {
+        Some(e) => e,
+        None => return None,
+    };
+    if caller != 1 || ext & INODE_EXT_UNIT_LINKS == 0 {
+        return None;
+    }
+    unit_link_hash(w)
+}
+
+/// Lot 2.3b (D5, the freeze): whether the object at `level` directories
+/// above what an outsider changes (0: the object itself) is frozen by the
+/// window `generation`, its map value being `value` (`[generation,
+/// FROZEN_*]`): a subtree at any level, the object alone at level 0, and
+/// only for the generation in force (an earlier window's mark freezes
+/// nothing).
+#[inline(always)]
+pub const fn frozen_verdict(value: Option<&[u64; 2]>, generation: u64, level: u32) -> bool {
+    let v = match value {
+        Some(v) => v,
+        None => return false,
+    };
+    generation != 0
+        && v[0] == generation
+        && (v[1] & crate::wire::FROZEN_SUBTREE != 0 || (level == 0 && v[1] & crate::wire::FROZEN_SELF != 0))
+}
+
 // ── records ────────────────────────────────────────────────────────────
 
 /// A refusal's context class (the design's section 7): no tree window in
@@ -1431,5 +1496,41 @@ mod tests {
         ] {
             assert!(!env_var_dangerous(v), "{}", String::from_utf8_lossy(v));
         }
+    }
+
+    /// Lot 2.3b: a lease's key is one of our two links' names, hashed as
+    /// userland hashes it; it applies to PID 1's removal in a directory of
+    /// our links only.
+    #[test]
+    fn a_lease_applies_to_pid1_s_removal_of_our_link_only() {
+        for (i, n) in UNIT_LINK_NAMES.iter().enumerate() {
+            assert_eq!(UNIT_LINK_HASHES[i], crate::wire::pin_name_hash(n));
+            assert_eq!(unit_link_hash(&name_words4(n)), Some(UNIT_LINK_HASHES[i]));
+        }
+        assert_ne!(UNIT_LINK_HASHES[0], UNIT_LINK_HASHES[1]);
+        let ours = name_words4(UNIT_LINK_NAMES[0]);
+        let other = name_words4(b"sshd.service");
+        let ext = Some(INODE_EXT_UNIT_LINKS);
+        assert_eq!(lease_applies(1, ext, &ours), Some(UNIT_LINK_HASHES[0]));
+        assert_eq!(lease_applies(2, ext, &ours), None, "not PID 1");
+        assert_eq!(lease_applies(1, Some(INODE_EXT_NO_RENAME), &ours), None, "not a links directory");
+        assert_eq!(lease_applies(1, None, &ours), None);
+        assert_eq!(lease_applies(1, ext, &other), None, "not our link");
+    }
+
+    /// Lot 2.3b (D5): a subtree is frozen at every level, the object alone
+    /// at its own, and only by the window in force.
+    #[test]
+    fn a_frozen_mark_binds_its_generation_and_its_reach() {
+        use crate::wire::{FROZEN_SELF, FROZEN_SUBTREE};
+        let sub = [5u64, FROZEN_SUBTREE];
+        let own = [5u64, FROZEN_SELF];
+        assert!(frozen_verdict(Some(&sub), 5, 0) && frozen_verdict(Some(&sub), 5, 7));
+        assert!(frozen_verdict(Some(&own), 5, 0));
+        assert!(!frozen_verdict(Some(&own), 5, 1), "an ancestor's own mark binds itself only");
+        assert!(!frozen_verdict(Some(&sub), 6, 0), "another window's mark");
+        assert!(!frozen_verdict(Some(&[0, FROZEN_SUBTREE]), 0, 0), "no window");
+        assert!(!frozen_verdict(None, 5, 0));
+        assert!(!frozen_verdict(Some(&[5, 0]), 5, 0), "no flag");
     }
 }

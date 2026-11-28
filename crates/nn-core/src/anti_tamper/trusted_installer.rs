@@ -348,12 +348,14 @@ pub fn frozen_names() -> Vec<(&'static str, &'static str, Freeze)> {
 /// key, the terminating NUL included).
 pub const FROZEN_NAME_MAX: usize = 31;
 
-/// Our units' names, as a lease's link must be named.
-pub const OWN_UNIT_NAMES: &[&str] = &[
-    "northnarrow-agent.service",
-    "northnarrow-watchdog.service",
-    "northnarrow.slice",
-];
+/// Whether `name` is one of our units' enablement links' names
+/// (`common::window_tree::UNIT_LINK_NAMES`, the kernel's), as a lease's
+/// link must be named.
+pub fn is_unit_link_name(name: &str) -> bool {
+    common::window_tree::UNIT_LINK_NAMES
+        .iter()
+        .any(|n| *n == name.as_bytes())
+}
 
 /// The unit directories our enablement links live in.
 const UNIT_LINK_ROOTS: &[&str] = &[
@@ -364,13 +366,13 @@ const UNIT_LINK_ROOTS: &[&str] = &[
 ];
 
 /// The link a lease may name (`path`, absolute): one of our units' names
-/// ([`OWN_UNIT_NAMES`]) in a `<target>.wants` or `<target>.requires`
+/// ([`is_unit_link_name`]) in a `<target>.wants` or `<target>.requires`
 /// directory of a unit directory, one level deep, no `.` or `..` and no
 /// other separator — `(directory, name)`. `None` for any other path: a
 /// mask, a drop-in, a link to another unit, any file of ours.
 pub fn lease_link(path: &str) -> Option<(&str, &str)> {
     let (dir, name) = path.rsplit_once('/')?;
-    if !OWN_UNIT_NAMES.contains(&name) {
+    if !is_unit_link_name(name) {
         return None;
     }
     let target = UNIT_LINK_ROOTS
@@ -579,7 +581,8 @@ mod window_flow_tests {
                 "northnarrow-agent.service"
             ))
         );
-        assert!(lease_link("/etc/systemd/system/northnarrow-agent.service.requires/northnarrow.slice").is_some());
+        assert!(lease_link("/etc/systemd/system/northnarrow-agent.service.requires/northnarrow-watchdog.service").is_some());
+        assert_eq!(lease_link("/etc/systemd/system/multi-user.target.wants/northnarrow.slice"), None);
         assert!(lease_link("/usr/lib/systemd/system/sysinit.target.requires/northnarrow-watchdog.service").is_some());
         for not in [
             "/etc/systemd/system/northnarrow-agent.service",
