@@ -165,7 +165,7 @@ static OBJ_GET_PATH_SCRATCH: HashMap<TaskKey, [u8; PATH_BUF_LEN]> =
 /// external audit EBPF-010: what a link handle could do (detach, update) is
 /// denied by the link it names in `try_bpf_syscall_observe`.
 #[map]
-pub static OWN_PIN_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
+pub static OWN_PIN_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(128, 0);
 
 /// The agent's own maps, programs and links. Key = `(kind << 32) | id`
 /// ([`own_key`]): map, program and link ids are three independent kernel

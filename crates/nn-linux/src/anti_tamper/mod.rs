@@ -682,6 +682,34 @@ fn attach_reporting(
         deny.missing_hook(program, why);
     }
     observe_failures.extend(bd.observe_failures);
+    // Lot 2.2 (the design's boot-zero): the per-tree window's maps emptied;
+    // a drop count an earlier run left in the window ring is signed.
+    match bpf_defense::zero_window_maps(ebpf) {
+        Ok(0) => {}
+        Ok(n) => report.degraded.push(format!(
+            "window ring: {n} record(s) the kernel could not write while no agent drained it"
+        )),
+        Err(e) => {
+            warn!(error = %e, "window maps NOT emptied at the start");
+            report
+                .degraded
+                .push(format!("window maps not emptied at the start: {e}"));
+        }
+    }
+    // Lot 2.3a: the programs of the trusted-installer window per process
+    // tree, pinned before the census of the agent's own objects below and
+    // before the pin root is protected. Attached after the census, a restart
+    // found the previous start's `prog_tree_*` and `link_tree_*` pins, their
+    // programs not loaded yet: twenty `foreign_pin` findings signed at every
+    // restart, and their link names missing from the frozen `OWN_PIN_NAMES`.
+    // Without them no tree window opens (a tree grant is refused); the
+    // host-wide grant the flows use until lots 2.3b and 2.4 does not need
+    // them.
+    if let Err(why) = window_tree::attach(ebpf, &btf, pin_root) {
+        report.degraded.push(format!(
+            "tree window: not available, tree grants refused ({why})"
+        ));
+    }
     // Every program is loaded now: register the agent's own object ids
     // and arm the mode. A failure leaves the guard with an empty set
     // (nothing denied) and counts as a deny-hook failure.
@@ -735,29 +763,6 @@ fn attach_reporting(
     if let Err(why) = bpf_defense::arm_role_marks(ebpf, &btf, pin_root, own) {
         warn!(reason = %why, "role marks NOT armed — a role is not judged by its executable mappings");
         report.degraded.push(format!("role marks: {why}"));
-    }
-    // Lot 2.2 (the design's boot-zero): the per-tree window's maps emptied;
-    // a drop count an earlier run left in the window ring is signed.
-    match bpf_defense::zero_window_maps(ebpf) {
-        Ok(0) => {}
-        Ok(n) => report.degraded.push(format!(
-            "window ring: {n} record(s) the kernel could not write while no agent drained it"
-        )),
-        Err(e) => {
-            warn!(error = %e, "window maps NOT emptied at the start");
-            report
-                .degraded
-                .push(format!("window maps not emptied at the start: {e}"));
-        }
-    }
-    // Lot 2.3a: the programs of the trusted-installer window per process
-    // tree (pinned before the pin root is protected below). Without them no
-    // tree window opens (a tree grant is refused); the host-wide grant the
-    // flows use until lots 2.3b and 2.4 does not need them.
-    if let Err(why) = window_tree::attach(ebpf, &btf, pin_root) {
-        report.degraded.push(format!(
-            "tree window: not available, tree grants refused ({why})"
-        ));
     }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.
