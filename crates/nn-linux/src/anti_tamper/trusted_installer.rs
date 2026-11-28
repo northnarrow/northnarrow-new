@@ -821,7 +821,15 @@ impl TrustedInstallerOverride {
         (window_secs, root, line): (u32, (u32, u64), &[(u32, u64)]),
         notes: serde_json::Value,
     ) -> std::result::Result<u64, String> {
+        let mut maps = maps;
         let one_window = self.arming.lock();
+        // lot 2.3b (the lab): a window whose root just exited (the kernel
+        // closed it) or whose deadline passed is closed now, not at the next
+        // one-second tick — a script's next window would be refused as "one
+        // window at a time" in between
+        if let Some(m) = maps.as_deref_mut() {
+            let _ = self.tree_tick_inner(m, reader, now_boot_ns, false);
+        }
         let armed =
             self.arm_tree_locked(maps, reader, missing, now_boot_ns, window_secs, root, line);
         drop(one_window);
@@ -1050,6 +1058,19 @@ impl TrustedInstallerOverride {
         reader: &dyn LineReader,
         now_boot_ns: u64,
     ) -> Option<&'static str> {
+        self.tree_tick_inner(maps, reader, now_boot_ns, true)
+    }
+
+    /// [`Self::tree_tick_with`]; `beat`: write the heartbeat when the window
+    /// stays open (lot 2.3b: a grant's own close of a stale window writes
+    /// none).
+    fn tree_tick_inner(
+        &self,
+        maps: &mut dyn TreeMaps,
+        reader: &dyn LineReader,
+        now_boot_ns: u64,
+        beat: bool,
+    ) -> Option<&'static str> {
         if !self.tree_armed.load(Ordering::SeqCst) {
             return None;
         }
@@ -1077,6 +1098,9 @@ impl TrustedInstallerOverride {
                 self.audit_tree_close(reason, &c);
             }
             return Some(reason);
+        }
+        if !beat {
+            return None;
         }
         let beat = FsGrantV2 {
             heartbeat_boot_ns: now_boot_ns.max(g.heartbeat_boot_ns),
@@ -4026,6 +4050,53 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("PID 1's environment could not be read"), "{e}");
         assert!(maps.base.members.is_empty() && !ov.tree_window_open());
+    }
+
+    /// Lot 2.3b (the lab): a window whose root has exited is closed at the
+    /// next grant, not only at the next tick: a script's second window right
+    /// after its first is not refused as "one window at a time".
+    #[test]
+    fn a_grant_right_after_the_last_root_exited_closes_that_window_first() {
+        let host = window_run_host();
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        assert_eq!(arm_window_run(&ov, &mut maps, &host), 1);
+        // the root 700 is gone; nn-admin 701 asks the next window
+        let mut next = FlowProc {
+            base: FakeProc::default().with(600, 1, 6_000).with(701, 600, 7_100),
+            pid1_env: RefCell::new(Ok(strs(&["LANG=C.UTF-8"]))),
+            ..FlowProc::default()
+        };
+        next.exe.insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        let g = ov
+            .arm_tree_noted(
+                Some(&mut maps),
+                &next,
+                &[],
+                NOW + SEC,
+                (120, (701, 7_100), &[(701, 7_100)]),
+                serde_json::Value::Null,
+            )
+            .expect("the stale window closed, the next one armed");
+        assert_eq!(g, 2);
+        // while the first root still runs, the second grant is refused
+        let ov = flow_override();
+        let mut maps = FlowMaps::default();
+        arm_window_run(&ov, &mut maps, &host);
+        let mut both = window_run_host();
+        both.base = both.base.with(701, 600, 7_100);
+        both.exe.insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        let e = ov
+            .arm_tree_noted(
+                Some(&mut maps),
+                &both,
+                &[],
+                NOW + SEC,
+                (120, (701, 7_100), &[(701, 7_100)]),
+                serde_json::Value::Null,
+            )
+            .unwrap_err();
+        assert!(e.contains("one window at a time"), "{e}");
     }
 
     /// Lot 2.3b (D1): a member asks by its entry, its own start, the
