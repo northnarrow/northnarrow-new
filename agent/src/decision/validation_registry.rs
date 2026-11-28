@@ -189,6 +189,9 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
     }
     let direct = rules::anti_tamper::NnLAt001AntiTamperDenial;
     assert!(ids.insert(direct.id().to_string(), "direct").is_none());
+    // Lot 2.3a: the trusted-installer window's ring, outside the engine too.
+    let window = rules::anti_tamper::NnLAt002TreeWindowRecord;
+    assert!(ids.insert(window.id().to_string(), "direct").is_none());
     // Lab PR 219: the exploit guard's rules, issued outside the engine too.
     let guard: [&dyn crate::decision::Rule; 2] = [
         &rules::epg::NnLEpg001CredentialPostcondition,

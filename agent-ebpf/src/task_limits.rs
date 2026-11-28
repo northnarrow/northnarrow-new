@@ -19,6 +19,9 @@
 //! own limits and priorities (the agent's workers do), systemd sets a
 //! service's in the child before its exec, before the pid is protected.
 //! A refusal is signed, rate-limited like a signal.
+//!
+//! Lot 2.3a (D7): while a tree window is open, a member's resource limits
+//! are refused to an outsider too (`window_tree::nn_tree_target_guarded`).
 
 use aya_ebpf::{
     cty::{c_int, c_void},
@@ -79,6 +82,18 @@ pub fn task_setrlimit_deny(ctx: LsmContext) -> i32 {
         let task: *const c_void = ctx.arg(0);
         let resource: u32 = ctx.arg(1);
         if refuse_task_change(task, FS_OP_RLIMIT, resource as u64, hook::TASK_SETRLIMIT) {
+            return -EPERM;
+        }
+        // Lot 2.3a (D7, the review of #647): a member of an open tree window,
+        // from outside its tree — an `RLIMIT_CPU` below its use is a SIGKILL
+        // no `task_kill` sees, mid-install (the target as a scalar: a global
+        // function refuses the hook's typed pointer)
+        if crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(crate::window_tree::raw_arg(&ctx, 0)))
+            != 0
+        {
+            let tgid = bpf_probe_read_kernel::<u32>((task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32)
+                .unwrap_or(0);
+            crate::inode_protect::emit_task_denial(FS_OP_RLIMIT, resource as u64, tgid);
             return -EPERM;
         }
     }

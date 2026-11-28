@@ -10055,7 +10055,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| policy test: events.json: line 1: not an event: unknown variant `kind`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`
+| policy test: events.json: line 1: not an event: unknown variant `kind`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`, `WindowRecord`
 
 ### policy-test.error.events-wrapped-not-an-event
 $ nn-admin policy test --events events.json --config-dir empty
@@ -10063,7 +10063,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| policy test: events.json: line 1: not an event: unknown variant `x`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`
+| policy test: events.json: line 1: not an event: unknown variant `x`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`, `WindowRecord`
 
 ### policy-test.error.events-blank-lines
 $ nn-admin policy test --events events.json --config-dir empty

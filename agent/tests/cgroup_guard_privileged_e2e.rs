@@ -502,20 +502,28 @@ print(res["a"], res["b"])
 /// file is not changed either way); and the agent's `oom_score_adj` is
 /// not written, through its pid or a thread's.
 ///
-/// The file is the installed `/etc/northnarrow/admin.pub`: the agent
+/// The file is an installed file of `/etc/northnarrow`: the agent
 /// write-protects the fixed directory's files (`ETC_WRITE_DENY_FILES`),
 /// not the tempdir's `--admin-pub` (a first version wrote there, and its
-/// "refused" write went through: nothing protected it).
+/// "refused" write went through: nothing protected it). Lot 2.3a: not a key
+/// file — a window keeps `admin.pub` and the signing key refused, so
+/// their write-open fails inside the window too, as asserted below.
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
 fn an_earlier_descriptor_and_the_oom_score_are_refused() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup();
-    let target = "/etc/northnarrow/admin.pub";
-    if !Path::new(target).exists() {
-        eprintln!("no installed {target}: nothing to test");
+    let Some(target) = [
+        "/etc/northnarrow/fim-paths.v1",
+        "/etc/northnarrow/install-manifest.json",
+        "/etc/northnarrow/agent_id",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).exists()) else {
+        eprintln!("no installed protected file of /etc/northnarrow: nothing to test");
         return;
-    }
+    };
+    let key_file = "/etc/northnarrow/admin.pub";
     // Outside a window its write-open is refused: the file is protected.
     let open = r#"
 import errno, os, sys
@@ -540,6 +548,11 @@ except OSError as e:
 "#;
     fx.grant_window(5);
     fx.wait_for_log("trusted-installer override ARMED");
+    // the key files: inside the window the key file's write-open is still refused.
+    if Path::new(key_file).exists() {
+        let (_, out) = py(open, &[key_file]);
+        assert_eq!(out.trim(), "errno=EPERM", "{}", fx.log_tail());
+    }
     let (_, out) = py(script, &[target, "12"]);
     assert_eq!(
         out.split_whitespace().collect::<Vec<_>>(),

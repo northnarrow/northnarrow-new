@@ -9,7 +9,7 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 5 | 90 | `58506ea916d8dbd9dae1739c87ace3a94ae09110673997b826880041c837bb01` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 6 | 91 | `39e7b4d4d33a4423302cee42baef98f5ac614e5a9e05fad44710e27552ba4923` |
 | [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 62 | `f22ae7a6cf96db925177c4cf1d10ed3af0b70b53587e4b9d4f179cf4f767dbb9` |
 | [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 22 | `f07c7a7f7cd83059f9bdc2f4993e98f87bd27b39a50277b7144b3f7f186162bd` |
 
@@ -80,6 +80,11 @@ Change log:
   sub-gate: the kernel now refuses a load of an untrusted file (lot 285),
   and the rule's kill of a load from outside `/lib/modules` is unchanged. No
   new technique or control row. 90 rows, sub-gate 29.
+- `v2-rules.tsv` version 6 (2026-11-28, lot 2.3a, before any V2 run):
+  NN-L-AT-002 (a record of the trusted-installer window per process tree's
+  own ring: an outsider refused or a member evicted, High, never lower; the
+  window's close, Low; direct like NN-L-AT-001, Log only, out of the
+  sub-gate). No new technique or control row. 91 rows, sub-gate 29.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -209,9 +214,9 @@ brings each one back:
 | `net` (NN-L-NET-*) | 20 | | | | | | |
 | `io_uring` (NN-L-IOU-001/002) | 2 | | | | | | |
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
-| `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
+| `anti-tamper` (NN-L-AT-001/002) | 2 | | | | | | |
 | `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
 | `impact` (NN-L-IMP-001/002) | 2 | | | | | | |
 | `evasion` (NN-L-EVA-001..004) | 4 | | | | | | |
-| **Total** | **90** | | | | | | |
+| **Total** | **91** | | | | | | |
 | **Critical sub-gate** | **29** | | | | | | |

@@ -162,6 +162,11 @@ fn decide_now<H: DecisionHost>(engine: &RuleEngine<H>, event: &Event) -> Value {
             let at001 = super::rules::anti_tamper::NnLAt001AntiTamperDenial;
             outside_line(at001.evaluate(event), at001.attack(), None)
         }
+        // Lot 2.3a: a window ring's record, NN-L-AT-002's outside the engine
+        Event::WindowRecord { .. } => {
+            let at002 = super::rules::anti_tamper::NnLAt002TreeWindowRecord;
+            outside_line(at002.evaluate(event), at002.attack(), None)
+        }
         Event::ExploitPostcondition { .. } => {
             let rule = epg::rule_for(event);
             let v = rule.and_then(|r| r.evaluate(event));

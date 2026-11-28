@@ -59,7 +59,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
     for (file, protected, exempt) in [
         ("task_kill.rs", 2, 3),
         ("ptrace_check.rs", 1, 1),
-        ("inode_protect.rs", 0, 1),
+        // lot 2.3a: the renamer of an ancestor, the opener of a block
+        // device, the remover of our units' links by name — callers
+        ("inode_protect.rs", 0, 4),
         ("bpf_defense.rs", 0, 1),
         ("fim_watch.rs", 0, 1),
         ("execq.rs", 0, 2),
@@ -86,6 +88,10 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 2.2: the mapper of a protected file shared and writable, and
         // the holder of a role mapping executable code — callers
         ("role_maps.rs", 0, 2),
+        // lot 2.3a: the outsider signalling or tracing a member, the
+        // receiver of a descriptor, the writer of a member's cgroup.kill or
+        // cgroup.freeze — callers
+        ("window_tree.rs", 0, 3),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -114,6 +120,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "sysctl_guard.rs",
             "sigio_guard.rs",
             "role_maps.rs",
+            "window_tree.rs",
         ]
         .contains(&name.as_str())
         {

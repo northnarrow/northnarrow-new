@@ -143,11 +143,15 @@ unsafe fn try_cgroup_move_stash(ctx: &FExitContext) {
         let pid_tgid = bpf_get_current_pid_tgid();
         // Only a protected process moved by a caller outside the agent's
         // family (a worker is protected, not exempt: R14a), outside a signed
-        // trusted-installer window, is recorded.
-        if !crate::task_kill::is_protected_pid(tgid)
-            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
-            || crate::inode_protect::override_active()
-        {
+        // trusted-installer window, is recorded. Lot 2.3a (D7, the review of
+        // #647): and a member of an open tree window moved by a caller
+        // outside its tree (`nn_tree_target_guarded` judges the caller) —
+        // the move's refusal re-checks the lift, which an outsider lacks.
+        if crate::task_kill::is_protected_pid(tgid) {
+            if crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32) || crate::inode_protect::override_active() {
+                return;
+            }
+        } else if crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(task)) == 0 {
             return;
         }
         let rec = [u64::from(tgid), bpf_ktime_get_ns()];

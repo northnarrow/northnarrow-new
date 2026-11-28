@@ -832,6 +832,44 @@ pub(crate) fn attach(
         );
     }
 
+    // Step 3.9 (lot 2.3a): the ancestors of those paths and the key files
+    // (`INODE_EXT`, the ancestors and the key files), the block devices they live on
+    // (`PROTECTED_BDEVS`, the block devices), our units' enablement links (MUTATE,
+    // the enablement links). Before the hooks attach, as the rest.
+    match register_inode_ext(ebpf) {
+        Ok(n) => info!(
+            registered = n,
+            "anti-tamper FS: ancestors and key files registered (INODE_EXT)"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: ancestors and key files NOT registered — an ancestor's rename is \
+             not refused, and a window lifts the key files"
+        ),
+    }
+    match register_bdevs(ebpf) {
+        Ok(n) => info!(
+            registered = n,
+            "anti-tamper FS: block devices backing the agent's files registered"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: block devices NOT registered — a foreign write-open of the disk is \
+             not refused"
+        ),
+    }
+    match register_enablement_links(ebpf) {
+        Ok(n) => info!(
+            registered = n,
+            "anti-tamper FS: the units' enablement links registered"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: the units' enablement links NOT registered — a `systemctl disable` \
+             is not refused"
+        ),
+    }
+
     // Step 4: attach the inode_protect deny hooks — the
     // FS_PROTECT_EVENTS producers. BUG-024: these MUST re-attach FRESH
     // every boot (binding to this boot's fresh, process-local ring) rather
@@ -1635,6 +1673,568 @@ pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
         "anti-tamper FS: agent binary/unit registration complete"
     );
     Ok(registered)
+}
+
+// ── Lot 2.3a (stage S2): ancestors, key files, block devices, links ───────
+
+/// Lot 2.3a (the key files): the key files, in [`CONFIG_DIR`], that no
+/// trusted-installer window lifts (`INODE_EXT_WINDOW_KEPT`): their write,
+/// rename, removal and the key's read stay the agent's family's alone. The
+/// flows never rewrite them (`install.sh` keeps an existing `admin.pub`;
+/// `uninstall.sh --purge` removes them after the hooks are gone).
+pub const WINDOW_KEPT_FILES: &[&str] = &["admin.pub", "agent.sig.key"];
+
+/// Lot 2.3a (the ancestors): the directories whose own rename or exchange moves
+/// the agent's tree from under the paths it is read by: every ancestor of
+/// `paths` but `/`, each once, in order. A path's own directory is included
+/// (the agent's own directories are also `PROTECTED_INODES` members).
+pub fn ancestors_of<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        let mut cur = p.parent();
+        while let Some(d) = cur {
+            if d.as_os_str().is_empty() || d == Path::new("/") {
+                break;
+            }
+            if !out.iter().any(|x| x == d) {
+                out.push(d.to_path_buf());
+            }
+            cur = d.parent();
+        }
+    }
+    out
+}
+
+/// Lot 2.3a: what [`register_inode_ext`] writes, by path: the ancestors of
+/// the agent's paths (`INODE_EXT_NO_RENAME`); [`CONFIG_DIR`] and its own
+/// ancestors as well kept by any window (`INODE_EXT_DIR_KEPT`: the agent
+/// loads `admin.pub` by its path at its start, so a rename of the key's
+/// directory or of `/etc` is refused to a member too — the design's
+/// section 6 — while the entries inside stay the window's to lift); the key
+/// files kept (`INODE_EXT_WINDOW_KEPT`).
+pub fn inode_ext_plan(etc_dir: &Path, paths: &[&str]) -> Vec<(PathBuf, u8)> {
+    use common::wire::{INODE_EXT_DIR_KEPT, INODE_EXT_NO_RENAME, INODE_EXT_WINDOW_KEPT};
+    let admin = etc_dir.join("admin.pub");
+    let mut all: Vec<&Path> = vec![admin.as_path(), Path::new(STATE_DIR)];
+    all.extend(paths.iter().map(Path::new));
+    let kept_dirs: Vec<PathBuf> = std::iter::once(etc_dir.to_path_buf())
+        .chain(ancestors_of([etc_dir]))
+        .collect();
+    let mut plan: Vec<(PathBuf, u8)> = ancestors_of(all)
+        .into_iter()
+        .map(|d| {
+            let kept = if kept_dirs.contains(&d) {
+                INODE_EXT_DIR_KEPT
+            } else {
+                0
+            };
+            (d, INODE_EXT_NO_RENAME | kept)
+        })
+        .collect();
+    for f in WINDOW_KEPT_FILES {
+        plan.push((etc_dir.join(f), INODE_EXT_WINDOW_KEPT));
+    }
+    plan
+}
+
+/// Lot 2.3a: the `INODE_EXT` map emptied, then [`inode_ext_plan`] for this
+/// host written, each path that exists (a missing one is the other install
+/// layout's). The map is the agent's alone to write: an entry an earlier
+/// start left for an inode since gone would refuse an unrelated rename.
+pub(crate) fn register_inode_ext(ebpf: &mut Ebpf) -> Result<usize> {
+    let plan = inode_ext_plan(Path::new(CONFIG_DIR), BINARY_AND_UNIT_PATHS);
+    let map = ebpf
+        .map_mut(common::wire::INODE_EXT_MAP_NAME)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} missing from the eBPF object",
+                common::wire::INODE_EXT_MAP_NAME
+            )
+        })?;
+    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)?;
+    let old: Vec<AyaInodeKey> = map.keys().filter_map(std::result::Result::ok).collect();
+    for k in old {
+        let _ = map.remove(&k);
+    }
+    let mut n = 0usize;
+    for (path, flags) in plan {
+        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&path) else {
+            continue;
+        };
+        let key = AyaInodeKey(InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        });
+        let have = map.get(&key, 0).unwrap_or(0);
+        map.insert(&key, &(have | flags), 0)
+            .with_context(|| format!("registering {} in INODE_EXT", path.display()))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Lot 2.3a (the block devices): `(major, minor)` of a `/sys/class/block/<x>/dev`
+/// or `/sys/dev/block/<m:n>/../dev` line (`"8:0\n"`).
+pub fn parse_dev_line(text: &str) -> Option<(u32, u32)> {
+    let (a, b) = text.trim().split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Lot 2.3a (the block devices): the block devices that hold `start`'s: each, the
+/// whole disk of a partition (`/sys/dev/block/M:m/partition` present, the
+/// disk's `dev` one directory up), and the devices under a device-mapper or
+/// md device (`slaves/`), recursively, at most half of [`common::wire::PROTECTED_BDEVS_MAX`] (the rest for the disks' passthrough nodes).
+/// `read` reads a sysfs file, `list` a sysfs directory (the tests' fakes).
+pub fn bdev_closure(
+    start: &[(u32, u32)],
+    read: &dyn Fn(&str) -> Option<String>,
+    list: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut queue: Vec<(u32, u32)> = start.to_vec();
+    while let Some(d) = queue.pop() {
+        if out.contains(&d) || d.0 == 0 {
+            continue;
+        }
+        if out.len() >= common::wire::PROTECTED_BDEVS_MAX as usize / 2 {
+            break;
+        }
+        out.push(d);
+        let base = format!("/sys/dev/block/{}:{}", d.0, d.1);
+        if read(&format!("{base}/partition")).is_some() {
+            if let Some(p) = read(&format!("{base}/../dev"))
+                .as_deref()
+                .and_then(parse_dev_line)
+            {
+                queue.push(p);
+            }
+        }
+        for slave in list(&format!("{base}/slaves")) {
+            if let Some(s) = read(&format!("/sys/class/block/{slave}/dev"))
+                .as_deref()
+                .and_then(parse_dev_line)
+            {
+                queue.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Lot 2.3a (the review of #647): the character devices that reach the
+/// blocks of `disk` (a whole disk; a partition has none of its own) past
+/// its block node — its SCSI generic node (`device/scsi_generic/sg*`), its
+/// bsg node (`device/bsg/*`), its NVMe controller (`device/dev`) and the
+/// controller's NVMe generic nodes (`device/ng*`). `read` and `list` as
+/// [`bdev_closure`]'s.
+pub fn passthrough_nodes(
+    disk: (u32, u32),
+    read: &dyn Fn(&str) -> Option<String>,
+    list: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<(u32, u32)> {
+    let base = format!("/sys/dev/block/{}:{}", disk.0, disk.1);
+    if read(&format!("{base}/partition")).is_some() {
+        return Vec::new();
+    }
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut push = |p: String| {
+        if let Some(d) = read(&p).as_deref().and_then(parse_dev_line) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    };
+    for sub in ["scsi_generic", "bsg"] {
+        for n in list(&format!("{base}/device/{sub}")) {
+            push(format!("{base}/device/{sub}/{n}/dev"));
+        }
+    }
+    push(format!("{base}/device/dev"));
+    for n in list(&format!("{base}/device")) {
+        if n.starts_with("ng") {
+            push(format!("{base}/device/{n}/dev"));
+        }
+    }
+    out
+}
+
+/// Lot 2.3a (the block devices): the devices the filesystems of `paths` live on —
+/// a path's `st_dev` when it is a block device's (major not 0); on btrfs
+/// (an anonymous device per subvolume) its mount's source in `table`, a
+/// `/dev` node `stat`ed by `rdev_of`. tmpfs, overlay and the like have none.
+pub fn backing_devices(
+    devs: &[(u32, u32)],
+    table: &crate::mountinfo::MountTable,
+    rdev_of: &dyn Fn(&Path) -> Option<(u32, u32)>,
+) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &(ma, mi) in devs {
+        let found = if ma != 0 {
+            Some((ma, mi))
+        } else {
+            table
+                .entries
+                .iter()
+                .find(|m| m.major == ma && m.minor == mi)
+                .map(|m| Path::new(&m.source))
+                .filter(|src| src.starts_with("/dev/"))
+                .and_then(rdev_of)
+        };
+        if let Some(d) = found {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Lot 2.3a: the `PROTECTED_BDEVS` map emptied, then the block devices of
+/// the agent's directories, binaries and units ([`backing_devices`],
+/// [`bdev_closure`]) written by the kernel's `dev_t`.
+pub(crate) fn register_bdevs(ebpf: &mut Ebpf) -> Result<usize> {
+    let mut paths: Vec<&str> = vec![CONFIG_DIR, STATE_DIR];
+    paths.extend(BINARY_AND_UNIT_PATHS.iter().copied());
+    let devs: Vec<(u32, u32)> = paths
+        .iter()
+        .filter_map(|p| antitamper_bpf::kernel_roots::metadata(p).ok())
+        .map(|m| (libc::major(m.dev()), libc::minor(m.dev())))
+        .collect();
+    let table = crate::mountinfo::read(Path::new("/proc/1/mountinfo")).unwrap_or_default();
+    let rdev_of = |p: &Path| {
+        antitamper_bpf::kernel_roots::metadata(p)
+            .ok()
+            .filter(|m| std::os::unix::fs::FileTypeExt::is_block_device(&m.file_type()))
+            .map(|m| (libc::major(m.rdev()), libc::minor(m.rdev())))
+    };
+    let read = |p: &str| antitamper_bpf::kernel_roots::read_to_string(p).ok();
+    let list = |p: &str| {
+        antitamper_bpf::kernel_roots::read_dir(p)
+            .map(|v| v.into_iter().filter_map(|n| n.into_string().ok()).collect())
+            .unwrap_or_default()
+    };
+    let all = bdev_closure(&backing_devices(&devs, &table, &rdev_of), &read, &list);
+    let map = ebpf
+        .map_mut(common::wire::PROTECTED_BDEVS_MAP_NAME)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} missing from the eBPF object",
+                common::wire::PROTECTED_BDEVS_MAP_NAME
+            )
+        })?;
+    let mut map: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)?;
+    let old: Vec<u32> = map.keys().filter_map(std::result::Result::ok).collect();
+    for k in old {
+        let _ = map.remove(&k);
+    }
+    // lot 2.3a (the review of #647): each whole disk's passthrough nodes
+    let nodes: Vec<(u32, u32)> = all
+        .iter()
+        .flat_map(|d| passthrough_nodes(*d, &read, &list))
+        .collect();
+    for (ma, mi) in &nodes {
+        let k = (ma << 20) | mi;
+        let have = map.get(&k, 0).unwrap_or(0);
+        if let Err(e) = map.insert(&k, &(have | common::window_tree::BDEV_PASSTHROUGH_NODE), 0) {
+            warn!(major = ma, minor = mi, error = %e, "anti-tamper FS: passthrough node NOT registered");
+            continue;
+        }
+        info!(
+            major = ma,
+            minor = mi,
+            "anti-tamper FS: passthrough node of a disk backing the agent's files"
+        );
+    }
+    for (ma, mi) in &all {
+        let k = (ma << 20) | mi;
+        let have = map.get(&k, 0).unwrap_or(0);
+        map.insert(&k, &(have | common::window_tree::BDEV_BACKS_PROTECTED), 0)?;
+        info!(
+            major = ma,
+            minor = mi,
+            "anti-tamper FS: block device backing the agent's files"
+        );
+    }
+    Ok(all.len())
+}
+
+/// Lot 2.3a (the enablement links): the names of our units' enablement links.
+pub const ENABLEMENT_LINK_NAMES: &[&str] =
+    &["northnarrow-agent.service", "northnarrow-watchdog.service"];
+
+/// Lot 2.3a (the enablement links): our units' enablement links under `unit_dir` —
+/// each `*.wants` or `*.requires` directory's entry named in
+/// [`ENABLEMENT_LINK_NAMES`]. `list` lists a directory (the tests' fake).
+pub fn enablement_links(unit_dir: &Path, list: &dyn Fn(&Path) -> Vec<String>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for d in list(unit_dir) {
+        if !(d.ends_with(".wants") || d.ends_with(".requires")) {
+            continue;
+        }
+        let dir = unit_dir.join(&d);
+        for e in list(&dir) {
+            if ENABLEMENT_LINK_NAMES.contains(&e.as_str()) {
+                out.push(dir.join(e));
+            }
+        }
+    }
+    out
+}
+
+/// Lot 2.3a (the enablement links): our units' enablement links in
+/// `/etc/systemd/system` registered as MUTATE-protected, by the link's own
+/// inode: a `systemctl disable` (PID 1 removing them), a `rm` or a rename
+/// is refused outside a window. The single-use lease of lot 2.3b lets
+/// PID 1's removal through inside a tree window; the host-wide window the
+/// flows use until then lifts it as it lifts the rest.
+pub(crate) fn register_enablement_links(ebpf: &mut Ebpf) -> Result<usize> {
+    let list = |p: &Path| {
+        antitamper_bpf::kernel_roots::read_dir(p)
+            .map(|v| v.into_iter().filter_map(|n| n.into_string().ok()).collect())
+            .unwrap_or_default()
+    };
+    let mut n = 0usize;
+    for link in enablement_links(Path::new("/etc/systemd/system"), &list) {
+        let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(&link) else {
+            continue;
+        };
+        let key = InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", link.display()))?;
+        ENABLEMENT_KEYS.lock().push(key);
+        n += 1;
+    }
+    // Lot 2.3a (the review of #647): the links' directories, so that an
+    // entry named after our units is kept by name (a link made after this
+    // start included) and the directory is not moved aside
+    let dirs = enablement_dirs(Path::new("/etc/systemd/system"), &list);
+    let map = ebpf
+        .map_mut(common::wire::INODE_EXT_MAP_NAME)
+        .ok_or_else(|| {
+            anyhow!(
+                "{} missing from the eBPF object",
+                common::wire::INODE_EXT_MAP_NAME
+            )
+        })?;
+    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)?;
+    for dir in dirs {
+        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&dir) else {
+            continue;
+        };
+        let key = AyaInodeKey(InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        });
+        let have = map.get(&key, 0).unwrap_or(0);
+        let flags = common::wire::INODE_EXT_NO_RENAME | common::wire::INODE_EXT_UNIT_LINKS;
+        map.insert(&key, &(have | flags), 0)
+            .with_context(|| format!("registering {} in INODE_EXT", dir.display()))?;
+    }
+    Ok(n)
+}
+
+/// Lot 2.3a (the review of #647): the `*.wants` / `*.requires` directories
+/// under `unit_dir` that hold one of our units' links, and
+/// `multi-user.target.wants` (where the units' `[Install]` puts them) when
+/// it exists: their entries named after our units are kept by name
+/// (`INODE_EXT_UNIT_LINKS`).
+pub fn enablement_dirs(unit_dir: &Path, list: &dyn Fn(&Path) -> Vec<String>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for link in enablement_links(unit_dir, list) {
+        if let Some(d) = link.parent() {
+            if !out.iter().any(|o| o == d) {
+                out.push(d.to_path_buf());
+            }
+        }
+    }
+    let default = unit_dir.join("multi-user.target.wants");
+    if list(unit_dir)
+        .iter()
+        .any(|d| d == "multi-user.target.wants")
+        && !out.contains(&default)
+    {
+        out.push(default);
+    }
+    out
+}
+
+/// Lot 2.3a (the key files, the review of #647: fail-closed): the key files
+/// ([`WINDOW_KEPT_FILES`] in `etc_dir`) as `INODE_EXT` must keep them for a
+/// tree window — each one's inode now (`key_of`: `None` when it cannot be
+/// `stat`ed) carrying `INODE_EXT_WINDOW_KEPT` (`get`). A key whose inode
+/// changed since the start (rotated, or bootstrapped after step 3.9 on a
+/// first boot) is registered here (`insert`); what is still not kept is
+/// named — a tree window is refused while anything is
+/// (`window_tree::manifest_missing`).
+pub fn key_files_not_kept_with(
+    etc_dir: &Path,
+    key_of: &dyn Fn(&Path) -> Option<InodeKey>,
+    get: &dyn Fn(&InodeKey) -> Option<u8>,
+    insert: &mut dyn FnMut(&InodeKey, u8) -> Result<()>,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for f in WINDOW_KEPT_FILES {
+        let path = etc_dir.join(f);
+        let Some(key) = key_of(&path) else {
+            missing.push(format!(
+                "key file {} not found: not kept by any window",
+                path.display()
+            ));
+            continue;
+        };
+        let have = get(&key).unwrap_or(0);
+        if have & common::wire::INODE_EXT_WINDOW_KEPT != 0 {
+            continue;
+        }
+        if let Err(e) = insert(&key, have | common::wire::INODE_EXT_WINDOW_KEPT) {
+            missing.push(format!(
+                "key file {} not registered in INODE_EXT: {e:#}: not kept by any window",
+                path.display()
+            ));
+        }
+    }
+    missing
+}
+
+/// [`key_files_not_kept_with`] on this host: the pinned `INODE_EXT` under
+/// `pin_root`; a map that cannot be opened keeps nothing.
+pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
+    let pin = pin_root.join(common::wire::INODE_EXT_MAP_NAME);
+    let map = MapData::from_pin(&pin)
+        .map_err(anyhow::Error::from)
+        .and_then(|d| {
+            AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(d))
+                .map_err(anyhow::Error::from)
+        });
+    let mut map = match map {
+        Ok(m) => m,
+        Err(e) => {
+            return vec![format!(
+                "INODE_EXT not opened at {}: {e:#}: the key files are not kept by any window",
+                pin.display()
+            )];
+        }
+    };
+    let key_of = |p: &Path| {
+        antitamper_bpf::kernel_roots::metadata(p)
+            .ok()
+            .map(|m| InodeKey {
+                dev: stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            })
+    };
+    let snapshot: Vec<(InodeKey, u8)> = map
+        .iter()
+        .filter_map(std::result::Result::ok)
+        .map(|(k, v)| (k.0, v))
+        .collect();
+    // the lab's fault (a debug-trigger build only): the registration fails,
+    // as a full or unwritable map would — every key file unkept
+    let fail = cfg!(feature = "debug-trigger") && Path::new(DEBUG_KEY_KEPT_FAIL).exists();
+    let get = |k: &InodeKey| {
+        if fail {
+            return None;
+        }
+        snapshot.iter().find(|(q, _)| q == k).map(|(_, v)| *v)
+    };
+    let mut insert = |k: &InodeKey, v: u8| {
+        if fail {
+            return Err(anyhow!(
+                "{DEBUG_KEY_KEPT_FAIL}: the registration's failure simulated"
+            ));
+        }
+        map.insert(&AyaInodeKey(*k), &v, 0)
+            .map_err(anyhow::Error::from)
+    };
+    key_files_not_kept_with(Path::new(CONFIG_DIR), &key_of, &get, &mut insert)
+}
+
+/// A debug-trigger build's lab fault for [`key_files_not_kept`]: while this
+/// file exists the key files' registration fails (the lab's check that a
+/// tree window is then refused, signed).
+pub const DEBUG_KEY_KEPT_FAIL: &str = "/run/nn-debug-key-kept-fail";
+
+/// Lot 2.3a (the key files, the review of #647): after a rotation's rewrite of a key
+/// file (a new inode), the new inode kept by any window in the pinned
+/// `INODE_EXT` (`INODE_EXT_WINDOW_KEPT`), the stale one's entry dropped.
+/// No pin root: nothing to do (no window opens either).
+pub fn reregister_kept_file(
+    bpffs_root: Option<&Path>,
+    path: &Path,
+    old_key: Option<InodeKey>,
+) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    let new_key = crate::fim::attach::key_for_path(path)
+        .with_context(|| format!("stat {} for re-registration", path.display()))?;
+    let pin = root.join(common::wire::INODE_EXT_MAP_NAME);
+    let data = MapData::from_pin(&pin)
+        .with_context(|| format!("opening pinned INODE_EXT at {}", pin.display()))?;
+    let mut map = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(data))
+        .context("INODE_EXT is not a HashMap<InodeKey, u8>")?;
+    let have = map.get(&AyaInodeKey(new_key), 0).unwrap_or(0);
+    map.insert(
+        &AyaInodeKey(new_key),
+        &(have | common::wire::INODE_EXT_WINDOW_KEPT),
+        0,
+    )
+    .context("registering the rotated key file in INODE_EXT")?;
+    if let Some(old) = old_key {
+        if old != new_key {
+            let _ = map.remove(&AyaInodeKey(old));
+        }
+    }
+    Ok(())
+}
+
+/// Lot 2.3a (the enablement links): the links this start registered, for
+/// [`withdraw_enablement_links`].
+static ENABLEMENT_KEYS: parking_lot::Mutex<Vec<InodeKey>> = parking_lot::Mutex::new(Vec::new());
+
+/// Lot 2.3a (the enablement links): a refused start withdraws the
+/// enablement links it registered from the pinned `PROTECTED_INODES`
+/// (before its own pid leaves `PROTECTED_PIDS`, while its handle on the
+/// map is still its family's). The links are protected while an agent
+/// runs; a start that pinned its deny hooks and then refused (exit 78)
+/// leaves the rest protected and no agent to open a window, and the
+/// operator's way out — `systemctl disable` of both units, a reboot
+/// (`INSTALL_UPGRADE_UNINSTALL.md`, the refused key's branch B and the
+/// rollback's exit 4) — must still go through. A second instance beside a
+/// live agent gets no write handle on the map (the kernel's
+/// fresh-instance test), and a start refused before it registered the
+/// links withdraws nothing. The number of links withdrawn.
+pub fn withdraw_enablement_links(bpffs_root: &Path) -> Result<usize> {
+    let keys = std::mem::take(&mut *ENABLEMENT_KEYS.lock());
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let map = std::cell::RefCell::new(ProtectedInodesHandle::open(bpffs_root)?);
+    withdraw_keys(
+        keys,
+        |k| map.borrow().contains(k),
+        |k| map.borrow_mut().remove(k),
+    )
+}
+
+/// [`withdraw_enablement_links`]' walk: each of `keys` still in the map
+/// removed (a key already gone is not counted); the first failure ends it.
+fn withdraw_keys(
+    keys: Vec<InodeKey>,
+    contains: impl Fn(InodeKey) -> bool,
+    mut remove: impl FnMut(InodeKey) -> Result<()>,
+) -> Result<usize> {
+    let mut n = 0usize;
+    for key in keys {
+        if contains(key) {
+            remove(key)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Tappa 9.5 K7: bootstrap an empty canary state log file
@@ -3891,5 +4491,334 @@ mod tests {
         assert!(why.starts_with("not attached: "), "{why}");
         assert!(why.contains("READING_KEXEC_IMAGE is 4"), "{why}");
         assert!(why.contains("neither judged nor recorded"), "{why}");
+    }
+
+    // ── lot 2.3a ──────────────────────────────────────────────────────
+
+    /// Lot 2.3a (the ancestors): every ancestor once, `/` excluded, the
+    /// path's own directory included.
+    #[test]
+    fn the_ancestors_of_the_agent_s_paths() {
+        let a = ancestors_of([
+            Path::new("/etc/northnarrow/admin.pub"),
+            Path::new("/usr/local/bin/northnarrow-agent"),
+            Path::new("/etc/systemd/system/northnarrow-agent.service"),
+        ]);
+        let want: Vec<PathBuf> = [
+            "/etc/northnarrow",
+            "/etc",
+            "/usr/local/bin",
+            "/usr/local",
+            "/usr",
+            "/etc/systemd/system",
+            "/etc/systemd",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(a, want);
+        assert!(ancestors_of([Path::new("/x")]).is_empty());
+    }
+
+    /// Lot 2.3a (the ancestors, the key files, the design's section 6): the key files and
+    /// their directory's line are kept by any window; the other ancestors
+    /// only refuse their rename; nothing for `/`.
+    #[test]
+    fn the_inode_ext_plan_keeps_the_key_files_and_their_directories() {
+        use common::wire::{
+            INODE_EXT_DIR_KEPT as DK, INODE_EXT_NO_RENAME as NR, INODE_EXT_WINDOW_KEPT as K,
+        };
+        let plan = inode_ext_plan(Path::new(CONFIG_DIR), BINARY_AND_UNIT_PATHS);
+        let flags = |p: &str| {
+            plan.iter()
+                .find(|(x, _)| x == Path::new(p))
+                .map(|(_, f)| *f)
+        };
+        // the directories keep their own rename, never their entries' (an
+        // installer writes in /etc/northnarrow inside a window)
+        assert_eq!(flags("/etc/northnarrow"), Some(NR | DK));
+        assert_eq!(flags("/etc"), Some(NR | DK));
+        assert_eq!(flags("/etc/northnarrow/admin.pub"), Some(K));
+        assert_eq!(flags("/etc/northnarrow/agent.sig.key"), Some(K));
+        assert_eq!(flags("/var/lib"), Some(NR));
+        assert_eq!(flags("/var"), Some(NR));
+        assert_eq!(flags("/usr/local/bin"), Some(NR));
+        assert_eq!(flags("/etc/systemd/system"), Some(NR));
+        assert_eq!(flags("/usr/lib/systemd/system"), Some(NR));
+        assert_eq!(flags("/"), None);
+        // within the kernel map's room
+        assert!(
+            plan.len() <= common::wire::INODE_EXT_SLOTS as usize,
+            "{}",
+            plan.len()
+        );
+    }
+
+    /// Lot 2.3a (the block devices): a partition's disk and a device-mapper
+    /// device's slaves, recursively; each once; no device 0.
+    #[test]
+    fn the_block_devices_that_hold_a_filesystem() {
+        let files: std::collections::HashMap<&str, &str> = [
+            // dm-0 (253:0) over sda3 (8:3), a partition of sda (8:0)
+            ("/sys/class/block/sda3/dev", "8:3\n"),
+            ("/sys/dev/block/8:3/partition", "3\n"),
+            ("/sys/dev/block/8:3/../dev", "8:0\n"),
+            // vda1 (252:1), a partition of vda (252:0)
+            ("/sys/dev/block/252:1/partition", "1\n"),
+            ("/sys/dev/block/252:1/../dev", "252:0\n"),
+        ]
+        .into_iter()
+        .collect();
+        let read = |p: &str| files.get(p).map(|s| (*s).to_string());
+        let list = |p: &str| {
+            if p == "/sys/dev/block/253:0/slaves" {
+                vec!["sda3".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let mut lvm = bdev_closure(&[(253, 0)], &read, &list);
+        lvm.sort();
+        assert_eq!(lvm, vec![(8, 0), (8, 3), (253, 0)]);
+        let mut vd = bdev_closure(&[(252, 1), (252, 1), (0, 33)], &read, &list);
+        vd.sort();
+        assert_eq!(vd, vec![(252, 0), (252, 1)]);
+        assert_eq!(parse_dev_line("8:16\n"), Some((8, 16)));
+        assert_eq!(parse_dev_line("x"), None);
+    }
+
+    /// Lot 2.3a (the block devices): a block filesystem's device is its `st_dev`; a
+    /// btrfs subvolume's (major 0) its mount's `/dev` source; a tmpfs none.
+    #[test]
+    fn the_device_behind_each_filesystem() {
+        let table = crate::mountinfo::parse(
+            b"22 1 0:33 / / rw - btrfs /dev/vda2 rw\n\
+              23 22 0:40 / /run rw - tmpfs tmpfs rw\n",
+        );
+        let rdev_of = |p: &Path| (p == Path::new("/dev/vda2")).then_some((252, 2));
+        assert_eq!(backing_devices(&[(8, 1)], &table, &rdev_of), vec![(8, 1)]);
+        assert_eq!(
+            backing_devices(&[(0, 33)], &table, &rdev_of),
+            vec![(252, 2)]
+        );
+        assert!(backing_devices(&[(0, 40)], &table, &rdev_of).is_empty());
+        assert!(backing_devices(&[(0, 99)], &table, &rdev_of).is_empty());
+    }
+
+    /// Lot 2.3a (the enablement links): a refused start withdraws the
+    /// links it registered, each one still in the map once; a key already
+    /// gone is not counted, and a start that registered none withdraws
+    /// nothing (the lab: `systemctl disable` refused after a start that
+    /// pinned its deny hooks and refused, exit 78).
+    #[test]
+    fn a_refused_start_withdraws_the_enablement_links_it_registered() {
+        use std::cell::RefCell;
+        let k = |ino| InodeKey { dev: 8, ino };
+        let map = RefCell::new(std::collections::HashSet::from([
+            (8u64, 1u64),
+            (8, 2),
+            (8, 9),
+        ]));
+        let n = withdraw_keys(
+            vec![k(1), k(2), k(3)],
+            |key| map.borrow().contains(&(key.dev, key.ino)),
+            |key| {
+                map.borrow_mut().remove(&(key.dev, key.ino));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            *map.borrow(),
+            std::collections::HashSet::from([(8u64, 9u64)])
+        );
+        let none = withdraw_keys(Vec::new(), |_| true, |_| unreachable!()).unwrap();
+        assert_eq!(none, 0);
+        let failed = withdraw_keys(vec![k(9)], |_| true, |_| Err(anyhow!("refused")));
+        assert!(failed.is_err());
+        // and each link the start registers is one it records for that
+        let src = include_str!("filesystem.rs");
+        let reg = &src[src.find("pub(crate) fn register_enablement_links").unwrap()..];
+        let reg = &reg[..reg.find("\n}\n").unwrap()];
+        let at = reg
+            .find("register_inode(ebpf, &key, FS_PROTECT_MUTATE)")
+            .unwrap();
+        assert!(
+            reg[at..].contains("ENABLEMENT_KEYS.lock().push(key);"),
+            "each registered link is recorded for the refusal's withdrawal"
+        );
+    }
+
+    /// Lot 2.3a (the enablement links): our units' links in every `*.wants` and
+    /// `*.requires` directory, by name; nothing else.
+    #[test]
+    fn our_units_enablement_links() {
+        let list = |p: &Path| -> Vec<String> {
+            match p.to_str().unwrap() {
+                "/etc/systemd/system" => vec![
+                    "multi-user.target.wants".into(),
+                    "default.target.requires".into(),
+                    "northnarrow-agent.service".into(),
+                    "sockets.target.wants".into(),
+                ],
+                "/etc/systemd/system/multi-user.target.wants" => vec![
+                    "northnarrow-agent.service".into(),
+                    "northnarrow-watchdog.service".into(),
+                    "ssh.service".into(),
+                ],
+                "/etc/systemd/system/default.target.requires" => {
+                    vec!["northnarrow-agent.service".into()]
+                }
+                _ => vec!["northnarrow-scan.service".into()],
+            }
+        };
+        let links = enablement_links(Path::new("/etc/systemd/system"), &list);
+        assert_eq!(
+            links,
+            vec![
+                PathBuf::from(
+                    "/etc/systemd/system/multi-user.target.wants/northnarrow-agent.service"
+                ),
+                PathBuf::from(
+                    "/etc/systemd/system/multi-user.target.wants/northnarrow-watchdog.service"
+                ),
+                PathBuf::from(
+                    "/etc/systemd/system/default.target.requires/northnarrow-agent.service"
+                ),
+            ]
+        );
+    }
+
+    /// Lot 2.3a (the review of #647): the directories of our units' links,
+    /// and `multi-user.target.wants` even when no link is there yet; and
+    /// the names the kernel keeps are the agent's list.
+    #[test]
+    fn the_enablement_directories_are_kept_by_name() {
+        let list = |p: &Path| -> Vec<String> {
+            match p.to_str().unwrap() {
+                "/etc/systemd/system" => vec![
+                    "multi-user.target.wants".into(),
+                    "default.target.requires".into(),
+                    "sockets.target.wants".into(),
+                ],
+                "/etc/systemd/system/default.target.requires" => {
+                    vec!["northnarrow-agent.service".into()]
+                }
+                _ => vec!["ssh.service".into()],
+            }
+        };
+        assert_eq!(
+            enablement_dirs(Path::new("/etc/systemd/system"), &list),
+            vec![
+                PathBuf::from("/etc/systemd/system/default.target.requires"),
+                PathBuf::from("/etc/systemd/system/multi-user.target.wants"),
+            ]
+        );
+        let names: Vec<&[u8]> = ENABLEMENT_LINK_NAMES.iter().map(|n| n.as_bytes()).collect();
+        assert_eq!(names, common::window_tree::UNIT_LINK_NAMES.to_vec());
+    }
+
+    /// Lot 2.3a (the review of #647): a disk's passthrough nodes — sg, bsg,
+    /// the NVMe controller and its generic nodes — and none for a partition.
+    #[test]
+    fn a_disk_s_passthrough_nodes_are_found_in_sysfs() {
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/dev/block/8:0/device/scsi_generic/sg0/dev" => Some("21:0\n".into()),
+                "/sys/dev/block/8:0/device/bsg/0:0:0:0/dev" => Some("244:0\n".into()),
+                "/sys/dev/block/259:0/device/dev" => Some("240:0\n".into()),
+                "/sys/dev/block/259:0/device/ng0n1/dev" => Some("242:0\n".into()),
+                "/sys/dev/block/8:1/partition" => Some("1\n".into()),
+                // a partition's own entries are never read (its disk's are)
+                "/sys/dev/block/8:1/device/scsi_generic/sg0/dev" => Some("21:0\n".into()),
+                "/sys/dev/block/8:1/device/dev" => Some("21:9\n".into()),
+                _ => None,
+            }
+        };
+        let list = |p: &str| -> Vec<String> {
+            match p {
+                "/sys/dev/block/8:0/device/scsi_generic" => vec!["sg0".into()],
+                "/sys/dev/block/8:1/device/scsi_generic" => vec!["sg0".into()],
+                "/sys/dev/block/8:0/device/bsg" => vec!["0:0:0:0".into()],
+                "/sys/dev/block/259:0/device" => {
+                    vec!["ng0n1".into(), "nvme0n1".into(), "power".into()]
+                }
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(
+            passthrough_nodes((8, 0), &read, &list),
+            vec![(21, 0), (244, 0)]
+        );
+        assert_eq!(
+            passthrough_nodes((259, 0), &read, &list),
+            vec![(240, 0), (242, 0)]
+        );
+        assert!(passthrough_nodes((8, 1), &read, &list).is_empty());
+        assert!(passthrough_nodes((253, 0), &read, &list).is_empty());
+    }
+
+    /// Lot 2.3a (the key files, the review of #647: fail-closed): a key file kept
+    /// passes; one whose inode is new is registered; one missing, or whose
+    /// registration fails, is named (a tree window refused).
+    #[test]
+    fn the_key_files_must_be_kept_for_a_tree_window() {
+        use common::wire::{INODE_EXT_NO_RENAME, INODE_EXT_WINDOW_KEPT};
+        let etc = Path::new("/etc/northnarrow");
+        let k = |ino| InodeKey { dev: 8, ino };
+        let key_of = |p: &Path| match p.file_name().unwrap().to_str().unwrap() {
+            "admin.pub" => Some(k(10)),
+            "agent.sig.key" => Some(k(11)),
+            _ => None,
+        };
+        // both kept
+        let get = |q: &InodeKey| (q.ino == 10 || q.ino == 11).then_some(INODE_EXT_WINDOW_KEPT);
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { panic!("nothing to register") };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        // the key bootstrapped after the start (or rotated): registered here
+        let get =
+            |q: &InodeKey| (q.ino == 10).then_some(INODE_EXT_WINDOW_KEPT | INODE_EXT_NO_RENAME);
+        let mut written = Vec::new();
+        let mut ins = |q: &InodeKey, v: u8| -> Result<()> {
+            written.push((*q, v));
+            Ok(())
+        };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        assert_eq!(written, vec![(k(11), INODE_EXT_WINDOW_KEPT)]);
+        // an entry the key's inode has for another reason is not "kept":
+        // the bit is added, what it had is kept
+        let get = |q: &InodeKey| match q.ino {
+            10 => Some(INODE_EXT_WINDOW_KEPT),
+            _ => Some(INODE_EXT_NO_RENAME),
+        };
+        let mut written = Vec::new();
+        let mut ins = |q: &InodeKey, v: u8| -> Result<()> {
+            written.push((*q, v));
+            Ok(())
+        };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        assert_eq!(
+            written,
+            vec![(k(11), INODE_EXT_NO_RENAME | INODE_EXT_WINDOW_KEPT)]
+        );
+        // a registration that fails, and a key file missing: named
+        let get = |_: &InodeKey| None;
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Err(anyhow!("map full")) };
+        let m = key_files_not_kept_with(etc, &key_of, &get, &mut ins);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(
+            m.iter()
+                .all(|l| l.contains("not registered") && l.contains("not kept by any window")),
+            "{m:?}"
+        );
+        let none = |_: &Path| None;
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Ok(()) };
+        let m = key_files_not_kept_with(etc, &none, &get, &mut ins);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(
+            m[0].contains("admin.pub") && m[0].contains("not found"),
+            "{m:?}"
+        );
     }
 }

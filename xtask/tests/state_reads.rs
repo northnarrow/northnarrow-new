@@ -161,6 +161,7 @@ const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed
 /// good state (`LastGood`, a `Condition` in the error's arm) are not sites.
 /// Lot 2.2: the kernel-read option's source, and (the review of #644) what
 /// the role watch reads.
+const BDEVS: &str = "lot 2.3a: the block devices backing the agent's files, read once at the start; a read that fails leaves that device unprotected, never a refusal";
 const ROLEMARK: &str = "lot 2.2: the uprobe PMU's type: an unreadable one leaves no perf PMU to \
                         refuse, signed by the option's status, never a wider role";
 const ROLEWATCH: &str = "lot 2.2 (the review of #644, F3): /etc/ld.so.preload and a role \
@@ -169,6 +170,19 @@ const ROLEWATCH: &str = "lot 2.2 (the review of #644, F3): /etc/ld.so.preload an
                          mapping, and one that is not trusted code took the role away, signed";
 
 const KNOWN: &[(&str, &str, &str)] = &[
+    // lot 2.3a: the block devices behind the agent's files, read at the
+    // start: a failed read leaves a device out of the set (the start's warn
+    // and the lab's case say which), never a refusal of the agent's own
+    (
+        "crates/nn-linux/src/anti_tamper/filesystem.rs",
+        "mountinfo::read(Path::new(\"/proc/1/mountinfo\"))",
+        BDEVS,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/filesystem.rs",
+        "read_to_string(p)",
+        BDEVS,
+    ),
     // lot 2.2: the role marks' and the kernel-read option's sources
     (
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",

@@ -43,9 +43,10 @@ use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
     BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, CONF_PROPAGATED, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG,
-    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB,
-    MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE, SYSFS_MAGIC,
-    TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root, held_under,
+    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_KEPT, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN,
+    MG_SB, MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE,
+    SYSFS_MAGIC, TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root,
+    held_under,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -240,6 +241,9 @@ pub fn protected_points(
     for d in &own {
         add(d, MG_OWN | MG_HOLD, &mut out);
     }
+    // Lot 2.3a (the key files, the review of #647): the key files' directory — a mount
+    // on, over or below it is refused inside a window too
+    add(CONFIG_DIR, MG_KEPT, &mut out);
     for p in BINARY_AND_UNIT_PATHS.iter().filter(|p| exists(p)) {
         add(p, MG_ON | MG_HOLD, &mut out);
     }
@@ -2484,5 +2488,21 @@ mod tests {
             let found = not_canonical(&table(&format!("{HOST}{line}\n")), &pts);
             assert!(found.iter().any(|x| x.contains(words)), "{line}: {found:?}");
         }
+    }
+
+    /// Lot 2.3a (the key files, the review of #647): the key files' directory is kept
+    /// by any window (`MG_KEPT`), on top of being the agent's own; no other
+    /// point is.
+    #[test]
+    fn the_key_directory_is_the_only_point_a_window_keeps() {
+        let pts = protected_points(Some(Path::new("/sys/fs/bpf/northnarrow")), &|_| true);
+        let kept: Vec<&str> = pts
+            .iter()
+            .filter(|(_, f)| f & MG_KEPT != 0)
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(kept, vec![CONFIG_DIR]);
+        let f = pts.iter().find(|(p, _)| p == CONFIG_DIR).unwrap().1;
+        assert_eq!(f & (MG_OWN | MG_HOLD | MG_KEPT), MG_OWN | MG_HOLD | MG_KEPT);
     }
 }

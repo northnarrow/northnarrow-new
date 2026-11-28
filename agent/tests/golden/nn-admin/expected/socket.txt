@@ -10121,7 +10121,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| trusted-installer-grant: server rejected operation
+| trusted-installer-grant: the agent verified the grant and refused it, nothing armed (a window is already open, or the agent could not open this one: its journal says why)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}

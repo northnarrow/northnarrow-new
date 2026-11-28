@@ -2982,6 +2982,10 @@ pub enum TrustedInstallerGrantOutcome {
     AgentIdMismatch,
     UnknownOperation,
     ProtocolVersionUnsupported { server_version: u16 },
+    // Lot 2.3a: the agent verified the grant and refused it, nothing armed
+    // (`AdminResult::ActionFailed`): one window at a time, or a tree window
+    // it could not open (its journal and audit log say why).
+    Refused,
 }
 
 fn map_admin_result_to_trusted_installer(
@@ -3011,8 +3015,9 @@ fn map_admin_result_to_trusted_installer(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             TrustedInstallerGrantOutcome::ProtocolVersionUnsupported { server_version }
         }
-        // Lab PR 217: no reply of this operation; out of spec.
-        AdminResult::ActionFailed => TrustedInstallerGrantOutcome::UnknownOperation,
+        // Lot 2.3a: verified, then refused (lab PR 217's reply: the agent
+        // could not carry it out)
+        AdminResult::ActionFailed => TrustedInstallerGrantOutcome::Refused,
     }
 }
 
@@ -3067,6 +3072,69 @@ pub fn run_trusted_installer_grant_for_installer(
     }
 }
 
+/// Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
+/// replaces it with `window-run`): the grant for the process tree of
+/// `root_pid` started at `root_start_ticks` (both inside the signed scope,
+/// `OperationCode::TrustedInstallerTreeGrant`). Never falls back: an agent
+/// that cannot decode it closes the connection, and that is the error
+/// returned — the host-wide grant is not asked for instead.
+pub fn run_trusted_installer_tree_grant(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    window_secs: u32,
+    root_pid: u32,
+    root_start_ticks: u64,
+) -> Result<TrustedInstallerGrantOutcome> {
+    use nn_proto::admin_protocol::TrustedInstallerTreeGrantRequest;
+    exchange_grant(
+        socket,
+        key_path,
+        agent_id_path,
+        |nonce, now, agent_id| {
+            SignedPayload::new_trusted_installer_tree_grant(
+                nonce,
+                now,
+                agent_id,
+                window_secs,
+                root_pid,
+                root_start_ticks,
+            )
+        },
+        |payload, signatures| {
+            AdminMessage::TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest {
+                payload,
+                signatures,
+            })
+        },
+    )
+}
+
+/// Lot 2.3a's minimal path: the root of `--tree`, this process's parent —
+/// its pid and its start (`/proc/<ppid>/stat`, field 22), read once.
+pub fn parent_root() -> Result<(u32, u64)> {
+    let ppid = std::os::unix::process::parent_id();
+    if ppid <= 1 {
+        bail!("this command's parent is PID {ppid}: no window is rooted there");
+    }
+    let path = format!("/proc/{ppid}/stat");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let start = stat_start_ticks(&String::from_utf8_lossy(&bytes))
+        .ok_or_else(|| anyhow!("{path}: no start"))?;
+    Ok((ppid, start))
+}
+
+/// `/proc/<pid>/stat`'s start (field 22), counted after the `(comm)` field
+/// (which may hold spaces or parentheses).
+fn stat_start_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 fn grant_with(
     socket: &Path,
     key_path: &Path,
@@ -3075,7 +3143,31 @@ fn grant_with(
     wrap: fn(nn_proto::admin_protocol::TrustedInstallerGrantRequest) -> AdminMessage,
 ) -> Result<TrustedInstallerGrantOutcome> {
     use nn_proto::admin_protocol::TrustedInstallerGrantRequest;
+    exchange_grant(
+        socket,
+        key_path,
+        agent_id_path,
+        |nonce, now, agent_id| {
+            SignedPayload::new_trusted_installer_grant(nonce, now, agent_id, window_secs)
+        },
+        |payload, signatures| {
+            wrap(TrustedInstallerGrantRequest {
+                payload,
+                signatures,
+            })
+        },
+    )
+}
 
+/// One grant's exchange: the challenge, the payload `build` makes of it,
+/// signed, sent as `wrap` makes it, and its `TrustedInstallerGrantResult`.
+fn exchange_grant(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    build: impl FnOnce([u8; 32], u64, [u8; AGENT_ID_LEN]) -> SignedPayload,
+    wrap: impl FnOnce(SignedPayload, Vec<KeyedSignature>) -> AdminMessage,
+) -> Result<TrustedInstallerGrantOutcome> {
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
@@ -3093,16 +3185,13 @@ fn grant_with(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let payload = SignedPayload::new_trusted_installer_grant(nonce, now, agent_id_arr, window_secs);
+    let payload = build(nonce, now, agent_id_arr);
     let sig: [u8; 64] = sign(&payload, &signing)
         .map_err(|e| anyhow!("signing trusted-installer-grant payload: {e}"))?;
 
     write_frame(
         &mut stream,
-        &wrap(TrustedInstallerGrantRequest {
-            payload,
-            signatures: vec![KeyedSignature { signature: sig }],
-        }),
+        &wrap(payload, vec![KeyedSignature { signature: sig }]),
     )?;
     let result = match read_frame(&mut stream)? {
         AdminMessage::TrustedInstallerGrantResult(r) => r,
@@ -3971,6 +4060,122 @@ mod tests {
                 .expect("the plain grant after the fallback");
         assert!(matches!(outcome, TrustedInstallerGrantOutcome::Success));
         server.join().unwrap();
+    }
+
+    /// A challenge nonce no literal names (CodeQL
+    /// `rust/hard-coded-cryptographic-value`, as lot 379's `test_nonce`).
+    fn tree_test_nonce() -> [u8; 32] {
+        let seed = std::process::id().to_le_bytes();
+        std::array::from_fn(|i| seed[i % seed.len()] ^ i as u8)
+    }
+
+    /// Lot 2.3a's minimal path (lot 2.3b replaces it): `--tree` sends the
+    /// grant for one tree, its root (pid and start) inside the signed
+    /// scope; the agent's refusal is `Refused`; an agent that cannot decode
+    /// it closes the connection, and no other grant is asked for.
+    #[test]
+    fn cli_trusted_installer_tree_grant_sends_its_signed_root_and_never_falls_back() {
+        use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, signing_digest};
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_path = dir.path().join("admin.key");
+        let agent_id_path = write_agent_id_file(&dir, &[0x33u8; 16]);
+        let signing = SigningKey::generate(&mut OsRng);
+        write_priv_key_file(&priv_path, &signing);
+        let vk = signing.verifying_key();
+        let challenge = |stream: &mut UnixStream| {
+            match server_read_frame(stream) {
+                AdminMessage::ChallengeRequest(_) => {}
+                other => panic!("expected ChallengeRequest, got {other:?}"),
+            }
+            server_write_frame(
+                stream,
+                &AdminMessage::Challenge(Challenge {
+                    nonce: tree_test_nonce(),
+                }),
+            );
+        };
+        for (reply, want) in [
+            (AdminResult::Success, "Success"),
+            (AdminResult::ActionFailed, "Refused"),
+        ] {
+            let _ = std::fs::remove_file(&socket);
+            let server = spawn_mock_server(&socket, move |stream| {
+                challenge(stream);
+                let req = match server_read_frame(stream) {
+                    AdminMessage::TrustedInstallerTreeGrantRequest(r) => r,
+                    other => panic!("expected the tree grant, got {other:?}"),
+                };
+                assert_eq!(req.payload.op, OperationCode::TrustedInstallerTreeGrant);
+                assert_eq!(req.payload.nonce, tree_test_nonce());
+                match &req.payload.extra {
+                    OperationExtra::TrustedInstallerTreeGrant(e) => {
+                        assert_eq!(
+                            (e.window_secs, e.root_pid, e.root_start_ticks),
+                            (120, 4242, 777)
+                        );
+                    }
+                    other => panic!("expected the tree grant's extra, got {other:?}"),
+                }
+                let digest = signing_digest(&req.payload).expect("digest");
+                let sig = ed25519_dalek::Signature::from_bytes(&req.signatures[0].signature);
+                vk.verify_strict(&digest, &sig)
+                    .expect("the root is inside the signed scope");
+                server_write_frame(stream, &AdminMessage::TrustedInstallerGrantResult(reply));
+            });
+            let outcome = run_trusted_installer_tree_grant(
+                &socket,
+                &priv_path,
+                &agent_id_path,
+                120,
+                4242,
+                777,
+            )
+            .expect("tree grant");
+            assert_eq!(format!("{outcome:?}"), want);
+            server.join().unwrap();
+        }
+        // an agent that cannot decode it: an error, and no second request
+        std::fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("accept");
+            challenge(&mut first);
+            let mut header = [0u8; 4];
+            first.read_exact(&mut header).expect("the request's header");
+            drop(first);
+            listener
+        });
+        let e =
+            run_trusted_installer_tree_grant(&socket, &priv_path, &agent_id_path, 120, 4242, 777);
+        assert!(e.is_err(), "{e:?}");
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no fallback grant after the refusal"
+        );
+    }
+
+    /// Lot 2.3a: `--tree`'s root is this process's parent, with the start
+    /// its `/proc/<ppid>/stat` gives (field 22, after a `comm` that may
+    /// hold spaces and parentheses).
+    #[test]
+    fn the_tree_grant_s_root_is_this_command_s_parent() {
+        let line = "4242 (a) b (c)) S 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0\n";
+        assert_eq!(stat_start_ticks(line), Some(777));
+        assert_eq!(stat_start_ticks("4242 (x) S 1"), None);
+        let ppid = std::os::unix::process::parent_id();
+        if ppid > 1 {
+            let (pid, start) = parent_root().expect("the parent's start");
+            assert_eq!(pid, ppid);
+            let stat = std::fs::read(format!("/proc/{ppid}/stat")).unwrap();
+            assert_eq!(
+                stat_start_ticks(&String::from_utf8_lossy(&stat)),
+                Some(start)
+            );
+        }
     }
 
     /// A RoleDenied reply (key lacks `trusted-installer`) maps through

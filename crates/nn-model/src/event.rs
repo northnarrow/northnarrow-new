@@ -578,6 +578,196 @@ pub enum Event {
     /// Lot 275 (C07) — the TLS ClientHello an outbound flow began with, its
     /// JA3 and JA4 computed by the parse worker (NN-L-NET-003 judges it).
     TlsClientHello(crate::telemetry::TlsHelloEvent),
+    /// Lot 2.3a, appended (the variants before keep their place in every
+    /// encoding) — a record of the trusted-installer window's own ring
+    /// (`wire::WINDOW_EVENTS_MAP_NAME`, [`crate::wire::WindowEventRaw`]):
+    /// the window closed by the kernel, a member that left the tree, an
+    /// outsider refused while the window is open (the design's section 7).
+    /// NN-L-AT-002 signs each one, outside the engine as a denial is; a
+    /// refusal is also its own denial record ([`Event::FsProtectDenial`],
+    /// which the posture weighs), so this record raises no trigger.
+    WindowRecord {
+        /// The actor's tgid: the outsider refused, the member that left the
+        /// tree (or the child left outside it), the root whose exit or
+        /// eviction closed the window.
+        tgid: u32,
+        /// The actor's start (`wire::start_ticks`: `USER_HZ` ticks of
+        /// `CLOCK_BOOTTIME`, as `/proc/<pid>/stat` gives it).
+        start_ticks: u64,
+        /// The window's generation (0: none open).
+        generation: u64,
+        /// What the record is.
+        kind: WindowRecordKind,
+        /// Its context class (the design's section 7).
+        class: WindowClass,
+        /// The denial code of a refusal ([`WindowRecordKind::OutsiderRefused`]);
+        /// `None` for a record that refuses nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<FsProtectOperation>,
+        /// What the record is about, by its kind: a refusal's target (an
+        /// inode, a tgid), an eviction's reason (low byte,
+        /// `window_tree::EVICT_*`) and file verdict (second byte), a
+        /// close's cause (`window_tree::CLOSE_*`).
+        detail: u64,
+        /// The ring's per-CPU sequence number, from 1: a gap is a record the
+        /// ring could not take (`wire::WINDOW_EVENT_DROPS_MAP_NAME`).
+        seq: u64,
+        /// The CPU that wrote it (the sequence's).
+        cpu: u32,
+        /// `CLOCK_BOOTTIME` ns.
+        boot_ns: u64,
+    },
+}
+
+/// Lot 2.3a: [`Event::WindowRecord`]'s kind (`wire::WINDOW_EVENT_*`, by the
+/// names of `wire::WINDOW_EVENT_KINDS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WindowRecordKind {
+    Grant,
+    Renewal,
+    /// The kernel closed the window (its root exited or left the tree).
+    Close,
+    ControlledStop,
+    LeaseArmed,
+    LeaseUsed,
+    /// A member left the tree (or, `window_tree::EVICT_FULL`, a member's
+    /// child was left outside it).
+    Eviction,
+    GraceClose,
+    /// A process outside the tree refused while the window is open.
+    OutsiderRefused,
+    /// A kind this build does not know (forward-compatible).
+    Unknown(u8),
+}
+
+impl WindowRecordKind {
+    pub fn from_wire(byte: u8) -> Self {
+        use crate::wire::{
+            WINDOW_EVENT_CLOSE, WINDOW_EVENT_CONTROLLED_STOP, WINDOW_EVENT_EVICTION,
+            WINDOW_EVENT_GRACE_CLOSE, WINDOW_EVENT_GRANT, WINDOW_EVENT_LEASE_ARMED,
+            WINDOW_EVENT_LEASE_USED, WINDOW_EVENT_OUTSIDER_REFUSED, WINDOW_EVENT_RENEWAL,
+        };
+        match byte {
+            WINDOW_EVENT_GRANT => Self::Grant,
+            WINDOW_EVENT_RENEWAL => Self::Renewal,
+            WINDOW_EVENT_CLOSE => Self::Close,
+            WINDOW_EVENT_CONTROLLED_STOP => Self::ControlledStop,
+            WINDOW_EVENT_LEASE_ARMED => Self::LeaseArmed,
+            WINDOW_EVENT_LEASE_USED => Self::LeaseUsed,
+            WINDOW_EVENT_EVICTION => Self::Eviction,
+            WINDOW_EVENT_GRACE_CLOSE => Self::GraceClose,
+            WINDOW_EVENT_OUTSIDER_REFUSED => Self::OutsiderRefused,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// The name the records carry (`wire::window_event_kind_name`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Renewal => "renewal",
+            Self::Close => "close",
+            Self::ControlledStop => "controlled_stop",
+            Self::LeaseArmed => "lease_armed",
+            Self::LeaseUsed => "lease_used",
+            Self::Eviction => "eviction",
+            Self::GraceClose => "grace_close",
+            Self::OutsiderRefused => "outsider_refused",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl core::fmt::Display for WindowRecordKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown(b) => write!(f, "unknown({b})"),
+            other => f.write_str(other.as_str()),
+        }
+    }
+}
+
+/// Lot 2.3a: a window record's context class (`wire::DENIAL_WINDOW_*`, by
+/// the names of `wire::DENIAL_WINDOW_CLASSES`; the design's section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WindowClass {
+    /// No window was open.
+    NoWindow,
+    /// An outsider refused while a window is open (High, never lower).
+    Outsider,
+    /// A member the window keeps a refusal for (High, never lower).
+    Kept,
+    /// A member's act the window let through (Low).
+    InTree,
+    /// PID 1's action through a lease (Low).
+    Pid1Lease,
+    /// A member that left the tree (High, never lower).
+    ExecEvicted,
+    /// A class this build does not know (forward-compatible).
+    Unknown(u8),
+}
+
+impl WindowClass {
+    pub fn from_wire(byte: u8) -> Self {
+        use crate::wire::{
+            DENIAL_WINDOW_EXEC_EVICTED, DENIAL_WINDOW_IN_TREE, DENIAL_WINDOW_KEPT,
+            DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, DENIAL_WINDOW_PID1_LEASE,
+        };
+        match byte {
+            DENIAL_WINDOW_NONE => Self::NoWindow,
+            DENIAL_WINDOW_OUTSIDER => Self::Outsider,
+            DENIAL_WINDOW_KEPT => Self::Kept,
+            DENIAL_WINDOW_IN_TREE => Self::InTree,
+            DENIAL_WINDOW_PID1_LEASE => Self::Pid1Lease,
+            DENIAL_WINDOW_EXEC_EVICTED => Self::ExecEvicted,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// The wire byte.
+    pub const fn to_wire(&self) -> u8 {
+        use crate::wire::{
+            DENIAL_WINDOW_EXEC_EVICTED, DENIAL_WINDOW_IN_TREE, DENIAL_WINDOW_KEPT,
+            DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, DENIAL_WINDOW_PID1_LEASE,
+        };
+        match self {
+            Self::NoWindow => DENIAL_WINDOW_NONE,
+            Self::Outsider => DENIAL_WINDOW_OUTSIDER,
+            Self::Kept => DENIAL_WINDOW_KEPT,
+            Self::InTree => DENIAL_WINDOW_IN_TREE,
+            Self::Pid1Lease => DENIAL_WINDOW_PID1_LEASE,
+            Self::ExecEvicted => DENIAL_WINDOW_EXEC_EVICTED,
+            Self::Unknown(b) => *b,
+        }
+    }
+
+    /// The name the records carry.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoWindow => "no-window",
+            Self::Outsider => "outsider-during-window",
+            Self::Kept => "kept-in-window",
+            Self::InTree => "in-tree",
+            Self::Pid1Lease => "pid1-lease",
+            Self::ExecEvicted => "exec-evicted",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// `wire::window_class_never_softened`: a record of this class is never
+    /// below High — an outsider's refusal, a kept refusal, an eviction.
+    pub const fn never_softened(&self) -> bool {
+        crate::wire::window_class_never_softened(self.to_wire())
+    }
+}
+
+impl core::fmt::Display for WindowClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown(b) => write!(f, "unknown({b})"),
+            other => f.write_str(other.as_str()),
+        }
+    }
 }
 
 /// Lab PR 219: what the exploit post-condition guard found (`epg::kind`).
@@ -1291,6 +1481,52 @@ pub enum FsProtectOperation {
     /// refused at the mapping (`mmap`, or `mprotect` adding the write),
     /// inside a window too. The target the inode.
     SharedMap,
+    /// Lot 2.3: a rename or exchange of an ancestor directory of the
+    /// agent's paths (`wire::INODE_EXT_NO_RENAME`), refused outside the
+    /// agent's family and a window's lift: moved, the paths the agent, its
+    /// units and its keys are found by would lead elsewhere. The target the
+    /// directory's inode.
+    AncestorRename,
+    /// Lot 2.3: a write-open of a block device that backs the agent's
+    /// files (`wire::PROTECTED_BDEVS_MAP_NAME`), or of its disk's SCSI
+    /// generic node, refused under the kernel-read option's block-device
+    /// class (`kernel-read-refuse`; lot 2.3a, the review of #647: let
+    /// through and recorded otherwise, [`Self::BdevWriteNoted`]) — its
+    /// blocks written under the filesystem, past every inode hook. The
+    /// target the device node's inode.
+    BdevWrite,
+    /// Lot 2.3: a read-open of such a block device, refused under the
+    /// kernel-read option (`wire::KERNEL_READ_BLOCK_DEVICE`): the agent's
+    /// key read from the raw blocks. The target the device node's inode.
+    BdevRead,
+    /// Lot 2.3a (lot 330 a): NOT a refusal — a signal whose default action
+    /// ends or stops a process, let through to a protected one (PID 1
+    /// under the window's stop grant or as `systemd-shutdown`, the agent's
+    /// family, the process itself). `target_dev` the signal, `target_ino`
+    /// the target's tgid; the refused ones are [`Self::Signal`].
+    FatalSignal,
+    /// Lot 2.3a: while a tree window is open, a descriptor of an io_uring
+    /// ring or of a protected inode received (`SCM_RIGHTS`, `pidfd_getfd`,
+    /// binder) by a process outside the agent's family, refused. The target
+    /// the inode (0:0 for a ring).
+    FdReceive,
+    /// Lot 2.3a (the review of #647): NOT a refusal — what
+    /// [`Self::BdevWrite`] refuses under the kernel-read option, let
+    /// through and recorded by default (grub-install, LVM, cryptsetup,
+    /// tune2fs meet it). The target the device node's inode.
+    BdevWriteNoted,
+    /// Lot 2.3a (the review of #647): a passthrough command (`SG_IO`,
+    /// `SCSI_IOCTL_SEND_COMMAND`, an NVMe command ioctl) to a block device
+    /// that backs the agent's files or to one of its disk's passthrough
+    /// nodes (sg, bsg, NVMe generic or controller), refused under the
+    /// kernel-read option's block-device class. `target_dev` the device's
+    /// number (the kernel's `MKDEV`: major << 20 | minor), `target_ino` the
+    /// ioctl's command.
+    BdevPassthrough,
+    /// Lot 2.3a (the review of #647): NOT a refusal — such a command let
+    /// through and recorded by default; the fields as
+    /// [`Self::BdevPassthrough`]'s.
+    BdevPassthroughNoted,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1358,6 +1594,14 @@ impl FsProtectOperation {
             crate::wire::FS_OP_KERNEL_READ => Self::KernelRead,
             crate::wire::FS_OP_PERF_EVENT => Self::PerfEvent,
             crate::wire::FS_OP_SHARED_MAP => Self::SharedMap,
+            crate::wire::FS_OP_ANCESTOR_RENAME => Self::AncestorRename,
+            crate::wire::FS_OP_BDEV_WRITE => Self::BdevWrite,
+            crate::wire::FS_OP_BDEV_READ => Self::BdevRead,
+            crate::wire::FS_OP_FATAL_SIGNAL => Self::FatalSignal,
+            crate::wire::FS_OP_FD_RECEIVE => Self::FdReceive,
+            crate::wire::FS_OP_BDEV_WRITE_NOTED => Self::BdevWriteNoted,
+            crate::wire::FS_OP_BDEV_PASSTHROUGH => Self::BdevPassthrough,
+            crate::wire::FS_OP_BDEV_PASSTHROUGH_NOTED => Self::BdevPassthroughNoted,
             other => Self::Unknown(other),
         }
     }
@@ -1423,6 +1667,14 @@ impl FsProtectOperation {
             Self::KernelRead => "kernel_read",
             Self::PerfEvent => "perf_event",
             Self::SharedMap => "shared_map",
+            Self::AncestorRename => "ancestor_rename",
+            Self::BdevWrite => "bdev_write",
+            Self::BdevRead => "bdev_read",
+            Self::FatalSignal => "fatal_signal",
+            Self::FdReceive => "fd_receive",
+            Self::BdevWriteNoted => "bdev_write_noted",
+            Self::BdevPassthrough => "bdev_passthrough",
+            Self::BdevPassthroughNoted => "bdev_passthrough_noted",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2016,6 +2268,24 @@ impl From<&TcpConnectRaw> for Event {
     }
 }
 
+/// Lot 2.3a: a window ring's record.
+impl From<&crate::wire::WindowEventRaw> for Event {
+    fn from(raw: &crate::wire::WindowEventRaw) -> Self {
+        Event::WindowRecord {
+            tgid: raw.tgid,
+            start_ticks: raw.start_ticks,
+            generation: raw.generation,
+            kind: WindowRecordKind::from_wire(raw.kind),
+            class: WindowClass::from_wire(raw.class),
+            operation: (raw.operation != 0).then(|| FsProtectOperation::from_wire(raw.operation)),
+            detail: raw.detail,
+            seq: raw.seq,
+            cpu: raw.cpu,
+            boot_ns: raw.boot_ns,
+        }
+    }
+}
+
 impl From<&FsProtectDenialRaw> for Event {
     fn from(raw: &FsProtectDenialRaw) -> Self {
         Event::FsProtectDenial {
@@ -2370,6 +2640,51 @@ mod tests {
                 FsProtectOperation::SharedMap,
                 "shared_map",
             ),
+            // lot 2.3a: the ancestors, the block devices, the fatal signals
+            // let through, the descriptors across a tree window's boundary
+            (
+                crate::wire::FS_OP_ANCESTOR_RENAME,
+                FsProtectOperation::AncestorRename,
+                "ancestor_rename",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_WRITE,
+                FsProtectOperation::BdevWrite,
+                "bdev_write",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_READ,
+                FsProtectOperation::BdevRead,
+                "bdev_read",
+            ),
+            (
+                crate::wire::FS_OP_FATAL_SIGNAL,
+                FsProtectOperation::FatalSignal,
+                "fatal_signal",
+            ),
+            (
+                crate::wire::FS_OP_FD_RECEIVE,
+                FsProtectOperation::FdReceive,
+                "fd_receive",
+            ),
+            // the review of #647: a block device's raw write let through and
+            // recorded; a passthrough command refused, or let through and
+            // recorded
+            (
+                crate::wire::FS_OP_BDEV_WRITE_NOTED,
+                FsProtectOperation::BdevWriteNoted,
+                "bdev_write_noted",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_PASSTHROUGH,
+                FsProtectOperation::BdevPassthrough,
+                "bdev_passthrough",
+            ),
+            (
+                crate::wire::FS_OP_BDEV_PASSTHROUGH_NOTED,
+                FsProtectOperation::BdevPassthroughNoted,
+                "bdev_passthrough_noted",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -2380,6 +2695,140 @@ mod tests {
             FsProtectOperation::from_wire(crate::wire::FS_OP_LAST + 1),
             FsProtectOperation::Unknown(crate::wire::FS_OP_LAST + 1)
         );
+    }
+
+    /// Lot 2.3a: every S2 denial code that has landed (at or below
+    /// `FS_OP_LAST`) decodes to its own operation, under the name the wire
+    /// reserved for it — none read as unknown.
+    #[test]
+    fn every_landed_s2_code_decodes_to_its_reserved_name() {
+        let mut landed = 0;
+        for (code, name, _lot) in crate::wire::S2_RESERVED_FS_OPS {
+            if code > crate::wire::FS_OP_LAST {
+                continue;
+            }
+            landed += 1;
+            let op = FsProtectOperation::from_wire(code);
+            assert!(!matches!(op, FsProtectOperation::Unknown(_)), "{code}");
+            assert_eq!(op.as_str(), name, "{code}");
+        }
+        // lot 2.2's five and lot 2.3a's eight (the review of #647: three
+        // more, the block devices' records let through and their commands)
+        assert_eq!(landed, 13);
+    }
+
+    /// Lot 2.3a: the window record's kinds and classes are the wire's, byte
+    /// for byte — the names the records carry, the classes never softened.
+    #[test]
+    fn the_window_record_kinds_and_classes_are_the_wire_s() {
+        for byte in 0..=u8::MAX {
+            let kind = WindowRecordKind::from_wire(byte);
+            assert_eq!(
+                kind.as_str(),
+                crate::wire::window_event_kind_name(byte).unwrap_or("unknown"),
+                "{byte}"
+            );
+            let class = WindowClass::from_wire(byte);
+            let wire_name = crate::wire::DENIAL_WINDOW_CLASSES
+                .iter()
+                .find(|(c, _)| *c == byte)
+                .map(|(_, n)| *n);
+            assert_eq!(class.as_str(), wire_name.unwrap_or("unknown"), "{byte}");
+            assert_eq!(class.to_wire(), byte);
+            assert_eq!(
+                class.never_softened(),
+                crate::wire::window_class_never_softened(byte),
+                "{byte}"
+            );
+        }
+        assert_eq!(
+            WindowRecordKind::from_wire(crate::wire::WINDOW_EVENT_OUTSIDER_REFUSED),
+            WindowRecordKind::OutsiderRefused
+        );
+        assert_eq!(WindowRecordKind::Unknown(77).to_string(), "unknown(77)");
+        assert_eq!(WindowClass::Unknown(9).to_string(), "unknown(9)");
+    }
+
+    /// Lot 2.3a: a window ring record becomes an [`Event::WindowRecord`]
+    /// field for field — a refusal with its denial code, a record that
+    /// refuses nothing without one — and survives the JSON encoding.
+    #[test]
+    fn a_window_ring_record_becomes_a_window_record_event() {
+        let raw = crate::wire::WindowEventRaw {
+            seq: 41,
+            boot_ns: 9_000,
+            generation: 7,
+            start_ticks: 1234,
+            detail: 0xabcd,
+            tgid: 4242,
+            cpu: 3,
+            kind: crate::wire::WINDOW_EVENT_OUTSIDER_REFUSED,
+            class: crate::wire::DENIAL_WINDOW_OUTSIDER,
+            operation: crate::wire::FS_OP_FD_RECEIVE,
+            _pad: [0; 5],
+        };
+        let e = Event::from(&raw);
+        match &e {
+            Event::WindowRecord {
+                tgid,
+                start_ticks,
+                generation,
+                kind,
+                class,
+                operation,
+                detail,
+                seq,
+                cpu,
+                boot_ns,
+            } => {
+                assert_eq!(
+                    (
+                        *tgid,
+                        *start_ticks,
+                        *generation,
+                        *detail,
+                        *seq,
+                        *cpu,
+                        *boot_ns
+                    ),
+                    (4242, 1234, 7, 0xabcd, 41, 3, 9_000)
+                );
+                assert_eq!(*kind, WindowRecordKind::OutsiderRefused);
+                assert_eq!(*class, WindowClass::Outsider);
+                assert_eq!(*operation, Some(FsProtectOperation::FdReceive));
+            }
+            other => panic!("{other:?}"),
+        }
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            Event::WindowRecord {
+                operation: Some(FsProtectOperation::FdReceive),
+                class: WindowClass::Outsider,
+                seq: 41,
+                ..
+            }
+        ));
+        // a close refuses nothing: no operation, none written
+        let close = crate::wire::WindowEventRaw {
+            kind: crate::wire::WINDOW_EVENT_CLOSE,
+            class: crate::wire::DENIAL_WINDOW_NONE,
+            operation: 0,
+            ..raw
+        };
+        let e = Event::from(&close);
+        assert!(matches!(
+            e,
+            Event::WindowRecord {
+                kind: WindowRecordKind::Close,
+                class: WindowClass::NoWindow,
+                operation: None,
+                ..
+            }
+        ));
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("operation"), "{json}");
     }
 
     /// Lot 356: the model's sole traces are the wire's, byte for byte.

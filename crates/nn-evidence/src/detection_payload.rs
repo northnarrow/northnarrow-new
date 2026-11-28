@@ -62,6 +62,9 @@ impl Sensor {
             | Event::DnsAnswer(_)
             | Event::TlsClientHello(_) => Sensor::Network,
             Event::FsProtectDenial { .. } | Event::DefenderSignal { .. } => Sensor::AntiTamper,
+            // lot 2.3a: the trusted-installer window's own ring, written by
+            // the anti-tamper hooks
+            Event::WindowRecord { .. } => Sensor::AntiTamper,
             Event::CanaryTripped { .. } => Sensor::Canary,
         }
     }
@@ -211,6 +214,19 @@ impl Principal {
                 uid: nl.uid,
                 ppid: None,
             },
+            // Lot 2.3a: the window ring names its actor by tgid and start
+            // only — no name, no uid (`(uid_t)-1`, the kernel's "no uid");
+            // a refusal's denial record names both.
+            Event::WindowRecord { tgid, .. } => Principal {
+                pid: *tgid,
+                comm: String::new(),
+                uid: WINDOW_RECORD_NO_UID,
+                ppid: None,
+            },
         }
     }
 }
+
+/// Lot 2.3a: the uid of an [`Event::WindowRecord`]'s principal — the
+/// window ring carries none (`(uid_t)-1`).
+pub const WINDOW_RECORD_NO_UID: u32 = u32::MAX;

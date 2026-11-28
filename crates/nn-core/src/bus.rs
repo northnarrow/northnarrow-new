@@ -116,9 +116,10 @@ impl Priority {
 /// - [`EventClass::Tamper`]: `FsProtectDenial`, `BpfSyscall`, `ModuleLoad`,
 ///   `SensorFlood` (the plan's), and `DefenderSignal` (lab PR 225: a stop
 ///   signal to another security tool of the host), `ExploitPostcondition`
-///   (lab PR 219: privilege gained with no mechanism for it) — attempts on
-///   the agent or the host's defences, rare by nature and bounded in the
-///   kernel (budgets, dedup).
+///   (lab PR 219: privilege gained with no mechanism for it), and
+///   `WindowRecord` (lot 2.3a: the trusted-installer window's own ring) —
+///   attempts on the agent or the host's defences, rare by nature and
+///   bounded in the kernel (budgets, dedup, the window ring's size).
 /// - `CanaryTripped` never travels the bus: the canary detector makes it
 ///   inside the consumer from the source event it replaces (a FIM record,
 ///   an exec, a connect); it is that event's class — File, Process or
@@ -702,6 +703,9 @@ pub fn record_time_ns(event: &Event) -> u64 {
         },
         Event::DnsAnswer(a) => a.timestamp_ns,
         Event::TlsClientHello(h) => h.timestamp_ns,
+        // Lot 2.3a: not timed — the window ring's clock is CLOCK_BOOTTIME,
+        // ahead of this one by every suspend since the boot
+        Event::WindowRecord { .. } => 0,
     }
 }
 
@@ -731,6 +735,9 @@ pub fn actor_of(event: &Event) -> (u32, u64) {
         Event::CanaryTripped { accessor_pid, .. } => (*accessor_pid, 0),
         Event::Fim(fe) => (fe.modifier_pid, 0),
         Event::NetListener(nl) => (nl.pid, 0),
+        // Lot 2.3a: its start is in USER_HZ ticks of CLOCK_BOOTTIME, not
+        // this key's clock
+        Event::WindowRecord { tgid, .. } => (*tgid, 0),
     }
 }
 
