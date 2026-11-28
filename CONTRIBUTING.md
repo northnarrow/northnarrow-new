@@ -1,5 +1,51 @@
 # Contributing to NorthNarrow
 
+## Your first contribution (no Rust needed)
+
+Welcome! If you arrived from [Up For Grabs](https://up-for-grabs.net) or the
+[`good first issue`](https://github.com/northnarrow/northnarrow-new/labels/good%20first%20issue)
+label, this section is for you. The rest of this file is about code changes. You can skip it for now.
+
+**What you can do today, with no programming:**
+
+- [#603](https://github.com/northnarrow/northnarrow-new/issues/603): follow the
+  [alpha tester guide](docs/operator/ALPHA_TESTER_GUIDE.md) on a throwaway VM, and tell us
+  where it was unclear (about 1–2 hours).
+- [#604](https://github.com/northnarrow/northnarrow-new/issues/604): try the `.rpm` on Fedora,
+  Rocky Linux or AlmaLinux 10, and tell us what happened (about 1 hour).
+- Found a typo, a broken link or a confusing sentence in any document? A small pull request
+  is welcome, and so is a comment.
+
+**How it works:**
+
+1. **Say you're on it.** A comment like "I'd like to try this" on the issue is enough. You
+   don't need to wait for an assignment, and two people trying the same thing is fine.
+2. **Use a throwaway VM.** NorthNarrow protects itself in the kernel. Don't try it on a
+   machine you care about. Any hypervisor works: GNOME Boxes, virt-manager, VirtualBox,
+   Multipass, or a cloud VM. The guide's §3 lists what the kernel needs.
+3. **Partial results count.** "It wouldn't install on Fedora 43, here is the error" is a
+   useful contribution. So is "step 4 confused me".
+4. **Keep it private-safe.** No host names, IP addresses, user names, keys or files from
+   `/etc/northnarrow`. The guide's
+   [§8](docs/operator/ALPHA_TESTER_GUIDE.md#8-collect-diagnostics-without-personal-data)
+   collects diagnostics without personal data.
+5. **Ask anything.** Comment on the issue, or ask in
+   [Discussions](https://github.com/northnarrow/northnarrow-new/discussions/645). English or
+   Italian are both fine. You will usually get an answer within two days.
+
+**What happens next.** Every report is read and answered. Wording fixes go in quickly. Bugs
+become a tracked fix, and the contributor is credited in the release notes unless they ask
+not to be.
+
+**About AI.** NorthNarrow is built with AI assistance under the founder's direction (see the
+README). Contributions written with or without AI are equally welcome. If a pull request is
+mostly generated, please say so in its description: you stay responsible for what it changes.
+
+**Be kind.** The [Code of Conduct](CODE_OF_CONDUCT.md) applies everywhere in the project.
+
+A security weakness (a way to stop, blind or deceive the agent) is never a public issue: see
+[SECURITY.md](SECURITY.md).
+
 ## Golden rule
 
 Before anything else, read:

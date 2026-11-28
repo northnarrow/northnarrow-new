@@ -86,7 +86,8 @@ Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#
 - Now, [S2 Self-protection after the alpha](ROADMAP.md#s2):
   - done: the SysRq trigger refused outside a trusted-installer window, and a stop the agent did not request restarts it and is signed;
   - done: the stage's scaffold and the design of the installer window per process tree, checked by an adversarial review and a second model before any of its code;
-  - next: the BPF guard and role marks, then the per-tree window itself.
+  - done: role marks (only our own signed binaries hold the agent and watchdog roles; system libraries are judged when they are mapped, so a distribution upgrade keeps the roles) and a guard against foreign BPF programs on our cgroups, counted and signed when present;
+  - now: the installer window per process tree, kernel side first (in review), then the user flows (a window opened for one command, a controlled stop instead of systemd's signals).
 <!-- working-on:end -->
 
 ---
@@ -682,6 +683,8 @@ containment that only a signed human command lifts.
 **Engineers.** Not hiring yet: the project is single-founder by design during the alpha. If you
 work on systems Rust, eBPF or kernel security and want to be on the early list, open an issue
 with a short note. *Issue title: "General inquiry".* Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+**First-time contributors.** No Rust or eBPF needed: try the tester guide or the `.rpm` on a throwaway VM and tell us what happened. Start from the [`good first issue`](https://github.com/northnarrow/northnarrow-new/labels/good%20first%20issue) label and ["Your first contribution"](CONTRIBUTING.md#your-first-contribution-no-rust-needed). NorthNarrow is listed on [Up For Grabs](https://up-for-grabs.net).
 
 **Press and media.** Give your publication, deadline and angle; we answer time-sensitive
 requests within the working day. *Issue title: "Press / media inquiry".*
