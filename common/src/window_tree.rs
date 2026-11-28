@@ -27,9 +27,10 @@
 
 use crate::exec_marks::{CODE_TRUSTED, CodeFacts, code_verdict};
 use crate::wire::{
-    DENIAL_WINDOW_KEPT, DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, FS_OP_BDEV_READ,
-    FS_OP_BDEV_WRITE, FsGrantV2, INODE_EXT_DIR_KEPT, INODE_EXT_NO_RENAME, INODE_EXT_WINDOW_KEPT,
-    KERNEL_READ_BLOCK_DEVICE, TreeMember,
+    DENIAL_WINDOW_KEPT, DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, FS_OP_BDEV_PASSTHROUGH,
+    FS_OP_BDEV_PASSTHROUGH_NOTED, FS_OP_BDEV_READ, FS_OP_BDEV_WRITE, FS_OP_BDEV_WRITE_NOTED,
+    FsGrantV2, INODE_EXT_DIR_KEPT, INODE_EXT_NO_RENAME, INODE_EXT_UNIT_LINKS,
+    INODE_EXT_WINDOW_KEPT, KERNEL_READ_BLOCK_DEVICE, TreeMember,
 };
 
 // ── the lift test ───────────────────────────────────────────────────────
@@ -166,6 +167,30 @@ pub const fn child_joins(parent_verdict: u64, child_tgid: u32, parent_tgid: u32)
     parent_verdict == MEMBER_LIFT && child_tgid != parent_tgid && child_tgid != 0
 }
 
+/// `TASK_NEW` (include/linux/sched.h): `sched_fork` sets it, and
+/// `wake_up_new_task` clears it — a task that has not run yet.
+pub const TASK_NEW: u32 = 0x0800;
+
+/// The fork span's half of the members' guards (D7): a target with no
+/// entry of the window is in the tree's span when a member's `task_alloc`
+/// made it a member by its `task_struct` (`pending`, of the window's
+/// generation), when it is still in `TASK_NEW` (`state`, its `__state`;
+/// `None`: unread — the field is in the tree's manifest), or when its
+/// `real_parent`'s process is a member of the window (`parent_member`: a
+/// vfork child a full map left outside, a `CLONE_VM` child evicted before
+/// its exec, which shares the member's memory). Guarded against outsiders,
+/// never lifted.
+#[inline(always)]
+pub const fn in_tree_span(pending: bool, state: Option<u32>, parent_member: bool) -> bool {
+    if pending || parent_member {
+        return true;
+    }
+    match state {
+        Some(s) => s & TASK_NEW != 0,
+        None => false,
+    }
+}
+
 /// Whether the members' entry of `tgid` is that very process's: its start
 /// is the entry's (a reused tgid is another process, whose entry a member's
 /// fork wrote over the stale one). The exit and the free remove an entry
@@ -220,14 +245,23 @@ pub const ENV_VAR_MAX: u32 = 4096;
 /// The bytes of a variable's head the prefix test reads.
 pub const ENV_HEAD: usize = 24;
 
+/// How many [`DANGEROUS_ENV`] holds.
+pub const ENV_PATTERNS: usize = 46;
+
 /// The variables that change what a member's exec loads or interprets
 /// before its own code: the loader's (`LD_*`), the shells' startup files
 /// (`BASH_ENV`, `ENV`), the interpreters' module paths (`PYTHONPATH`,
 /// `PYTHONSTARTUP`, `PERL5LIB`, `PERL5OPT`, `PERLLIB`), and the others the
 /// units unset (`deploy/systemd/northnarrow-agent.service`,
 /// `UnsetEnvironment=`). Each with its `=`, but for the two families
-/// (`LD_`, `MALLOC_`).
-pub const DANGEROUS_ENV: [&[u8]; 20] = [
+/// (`LD_`, `MALLOC_`). Lot 2.3a (the review of #647): bash's exported
+/// functions (`BASH_FUNC_*`) and options (`SHELLOPTS`, `BASHOPTS`: `xtrace`
+/// runs `PS4`'s expansions), apt's configuration (`APT_CONFIG`), the
+/// option and module variables of node, ruby, java, lua, python and perl's
+/// debugger, and git's that run a command or load a configuration
+/// (`GIT_SSH_COMMAND`, `GIT_CONFIG_*`, …) — `LUA_INIT`, `LUA_PATH`,
+/// `LUA_CPATH` and `BASH_FUNC_` as families.
+pub const DANGEROUS_ENV: [&[u8]; ENV_PATTERNS] = [
     b"LD_",
     b"BASH_ENV=",
     b"ENV=",
@@ -248,6 +282,32 @@ pub const DANGEROUS_ENV: [&[u8]; 20] = [
     b"RESOLV_HOST_CONF=",
     b"RES_OPTIONS=",
     b"TZDIR=",
+    b"BASH_FUNC_",
+    b"SHELLOPTS=",
+    b"BASHOPTS=",
+    b"APT_CONFIG=",
+    b"NODE_OPTIONS=",
+    b"NODE_PATH=",
+    b"RUBYOPT=",
+    b"RUBYLIB=",
+    b"JAVA_TOOL_OPTIONS=",
+    b"_JAVA_OPTIONS=",
+    b"JDK_JAVA_OPTIONS=",
+    b"LUA_INIT",
+    b"LUA_PATH",
+    b"LUA_CPATH",
+    b"PYTHONHOME=",
+    b"PERL5DB=",
+    b"GIT_EXEC_PATH=",
+    b"GIT_SSH=",
+    b"GIT_SSH_COMMAND=",
+    b"GIT_ASKPASS=",
+    b"GIT_PROXY_COMMAND=",
+    b"GIT_EXTERNAL_DIFF=",
+    b"GIT_CONFIG_COUNT=",
+    b"GIT_CONFIG_PARAMETERS=",
+    b"GIT_CONFIG_GLOBAL=",
+    b"GIT_CONFIG_SYSTEM=",
 ];
 
 /// A prefix as three little-endian words and their masks.
@@ -265,10 +325,10 @@ const fn pattern(p: &[u8]) -> Pattern {
     (w, m)
 }
 
-const PATTERNS: [Pattern; 20] = {
-    let mut out = [([0u64; 3], [0u64; 3]); 20];
+const PATTERNS: [Pattern; ENV_PATTERNS] = {
+    let mut out = [([0u64; 3], [0u64; 3]); ENV_PATTERNS];
     let mut i = 0;
-    while i < 20 {
+    while i < ENV_PATTERNS {
         out[i] = pattern(DANGEROUS_ENV[i]);
         i += 1;
     }
@@ -306,6 +366,32 @@ pub const fn env_head_dangerous(head: &[u64; 3]) -> bool {
         || hit(head, &PATTERNS[17])
         || hit(head, &PATTERNS[18])
         || hit(head, &PATTERNS[19])
+        || hit(head, &PATTERNS[20])
+        || hit(head, &PATTERNS[21])
+        || hit(head, &PATTERNS[22])
+        || hit(head, &PATTERNS[23])
+        || hit(head, &PATTERNS[24])
+        || hit(head, &PATTERNS[25])
+        || hit(head, &PATTERNS[26])
+        || hit(head, &PATTERNS[27])
+        || hit(head, &PATTERNS[28])
+        || hit(head, &PATTERNS[29])
+        || hit(head, &PATTERNS[30])
+        || hit(head, &PATTERNS[31])
+        || hit(head, &PATTERNS[32])
+        || hit(head, &PATTERNS[33])
+        || hit(head, &PATTERNS[34])
+        || hit(head, &PATTERNS[35])
+        || hit(head, &PATTERNS[36])
+        || hit(head, &PATTERNS[37])
+        || hit(head, &PATTERNS[38])
+        || hit(head, &PATTERNS[39])
+        || hit(head, &PATTERNS[40])
+        || hit(head, &PATTERNS[41])
+        || hit(head, &PATTERNS[42])
+        || hit(head, &PATTERNS[43])
+        || hit(head, &PATTERNS[44])
+        || hit(head, &PATTERNS[45])
 }
 
 /// [`env_head_dangerous`] of a byte string (the tests', and the agent's).
@@ -332,34 +418,120 @@ pub const fn env_within_bounds(bytes: u64, vars: u32, longest: u32, ended: bool)
 /// agent's files live on (or holds it: the whole disk of a partition, a
 /// device under a device-mapper or md device).
 pub const BDEV_BACKS_PROTECTED: u8 = 1;
+/// Lot 2.3a (the review of #647): `PROTECTED_BDEVS`' value for a character
+/// device that reaches such a disk's blocks — its SCSI generic node
+/// (`/dev/sg*`), its bsg node, its NVMe generic node (`/dev/ngXnY`) or
+/// its NVMe controller (`/dev/nvmeX`). The map is keyed by the device
+/// number alone: a block and a character device of one number share the
+/// entry, each matching its own bit ([`bdev_entry_bit`]).
+pub const BDEV_PASSTHROUGH_NODE: u8 = 2;
 
-/// The refusal of an open of a block device whose `PROTECTED_BDEVS` entry
-/// is `entry` (`None`: not one of them): a write-open always
-/// ([`FS_OP_BDEV_WRITE`]), a read-open under the kernel-read option's
-/// block-device class (`kread_mask`, [`FS_OP_BDEV_READ`]); 0 when the open
-/// goes through — the caller of the agent's family, or a member the window
-/// lifts for (`lifted`).
+/// The entry bit an inode matches: [`BDEV_BACKS_PROTECTED`] for a block
+/// device, [`BDEV_PASSTHROUGH_NODE`] for a character device.
 #[inline(always)]
-pub const fn bdev_open_refusal(
+pub const fn bdev_entry_bit(block: bool) -> u8 {
+    if block {
+        BDEV_BACKS_PROTECTED
+    } else {
+        BDEV_PASSTHROUGH_NODE
+    }
+}
+
+/// A raw access judged by [`bdev_verdict`]: a read-open, a write-open, a
+/// passthrough command (`SG_IO`, an NVMe command: [`is_passthrough_ioctl`]).
+pub const BDEV_ACCESS_READ: u8 = 0;
+pub const BDEV_ACCESS_WRITE: u8 = 1;
+pub const BDEV_ACCESS_PASSTHROUGH: u8 = 2;
+
+/// `SG_IO`, `SCSI_IOCTL_SEND_COMMAND` (include/scsi/sg.h,
+/// include/uapi/linux/../scsi/scsi_ioctl.h).
+pub const SG_IO: u32 = 0x2285;
+pub const SCSI_IOCTL_SEND_COMMAND: u32 = 1;
+/// The NVMe ioctls' type (`'N'`) and the numbers of those that carry a
+/// command (include/uapi/linux/nvme_ioctl.h: `ADMIN_CMD` 0x41,
+/// `SUBMIT_IO` 0x42, `IO_CMD` 0x43, `ADMIN64_CMD` 0x47, `IO64_CMD` 0x48,
+/// `IO64_CMD_VEC` 0x49), whatever the size their encoding carries.
+pub const NVME_IOCTL_TYPE: u32 = 0x4E;
+
+/// Whether `cmd` sends a device a command of its own: SCSI's `SG_IO` and
+/// `SCSI_IOCTL_SEND_COMMAND` (a CAP_SYS_RAWIO caller's, whatever the open
+/// mode), or one of NVMe's command ioctls (a CAP_SYS_ADMIN caller's, on a
+/// read-only descriptor too) — each a write of any block, past the open's
+/// mode.
+#[inline(always)]
+pub const fn is_passthrough_ioctl(cmd: u32) -> bool {
+    if cmd == SG_IO || cmd == SCSI_IOCTL_SEND_COMMAND {
+        return true;
+    }
+    (cmd >> 8) & 0xff == NVME_IOCTL_TYPE
+        && matches!(cmd & 0xff, 0x41 | 0x42 | 0x43 | 0x47 | 0x48 | 0x49)
+}
+
+/// The verdict on a raw `access` ([`BDEV_ACCESS_READ`], `_WRITE`,
+/// `_PASSTHROUGH`) to a device whose `PROTECTED_BDEVS` entry is `entry`
+/// (`None`: not one of them), matched on `bit` ([`bdev_entry_bit`]), by a
+/// caller outside the agent's family the window does not lift for
+/// (`lifted`): the record's operation, 0 when nothing is recorded.
+///
+/// The decision of the review of #647 (a self-DoS otherwise: grub-install
+/// on a BIOS host, LVM metadata, cryptsetup, tune2fs and resize2fs write
+/// the disk of a mounted root): by default a write-open or a passthrough
+/// command is let through and RECORDED ([`FS_OP_BDEV_WRITE_NOTED`],
+/// [`FS_OP_BDEV_PASSTHROUGH_NOTED`], High), a read-open is nothing; under
+/// the kernel-read option's block-device class (`kread_mask`:
+/// `kernel-read-refuse`, the operator's strict choice) each is REFUSED
+/// ([`FS_OP_BDEV_WRITE`], [`FS_OP_BDEV_PASSTHROUGH`], [`FS_OP_BDEV_READ`]).
+/// A character node is judged at its write-open and its commands, never
+/// at a read-open.
+#[inline(always)]
+pub const fn bdev_verdict(
     entry: Option<u8>,
-    write: bool,
+    bit: u8,
+    access: u8,
     kread_mask: u32,
     lifted: bool,
 ) -> u8 {
-    let protected = match entry {
-        Some(f) => f & BDEV_BACKS_PROTECTED != 0,
+    let matched = match entry {
+        Some(f) => f & bit != 0,
         None => false,
     };
-    if !protected || lifted {
+    if !matched || lifted {
         return 0;
     }
-    if write {
-        FS_OP_BDEV_WRITE
-    } else if kread_mask & KERNEL_READ_BLOCK_DEVICE != 0 {
-        FS_OP_BDEV_READ
-    } else {
-        0
+    let strict = kread_mask & KERNEL_READ_BLOCK_DEVICE != 0;
+    match access {
+        BDEV_ACCESS_WRITE => {
+            if strict {
+                FS_OP_BDEV_WRITE
+            } else {
+                FS_OP_BDEV_WRITE_NOTED
+            }
+        }
+        BDEV_ACCESS_PASSTHROUGH => {
+            if strict {
+                FS_OP_BDEV_PASSTHROUGH
+            } else {
+                FS_OP_BDEV_PASSTHROUGH_NOTED
+            }
+        }
+        _ => {
+            if strict && bit == BDEV_BACKS_PROTECTED {
+                FS_OP_BDEV_READ
+            } else {
+                0
+            }
+        }
     }
+}
+
+/// Whether [`bdev_verdict`]'s operation refuses the access (the others
+/// are recorded and let through).
+#[inline(always)]
+pub const fn bdev_refuses(op: u8) -> bool {
+    matches!(
+        op,
+        FS_OP_BDEV_WRITE | FS_OP_BDEV_PASSTHROUGH | FS_OP_BDEV_READ
+    )
 }
 
 // ── the ancestors and the key files (the ancestors, the key files) ────────────────────
@@ -396,6 +568,57 @@ pub const fn window_lift_kept(ext: Option<u8>) -> bool {
     }
 }
 
+/// Lot 2.3a (the review of #647): the names of our units' enablement
+/// links (`nn_linux`'s `ENABLEMENT_LINK_NAMES`, the same list).
+pub const UNIT_LINK_NAMES: [&[u8]; 2] = [
+    b"northnarrow-agent.service",
+    b"northnarrow-watchdog.service",
+];
+
+/// A name of at most 31 bytes as four little-endian words, zero after its
+/// end (as `bpf_probe_read_kernel_str` leaves a zeroed buffer).
+pub const fn name_words4(n: &[u8]) -> [u64; 4] {
+    let mut w = [0u64; 4];
+    let mut i = 0;
+    while i < n.len() && i < 31 {
+        w[i / 8] |= (n[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    w
+}
+
+const UNIT_LINK_WORDS: [[u64; 4]; 2] = [
+    name_words4(UNIT_LINK_NAMES[0]),
+    name_words4(UNIT_LINK_NAMES[1]),
+];
+
+#[inline(always)]
+const fn words_eq(a: &[u64; 4], b: &[u64; 4]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+}
+
+/// Whether a directory entry's name (`w`: [`name_words4`]) is one of
+/// [`UNIT_LINK_NAMES`].
+#[inline(always)]
+pub const fn is_unit_link_name(w: &[u64; 4]) -> bool {
+    words_eq(w, &UNIT_LINK_WORDS[0]) || words_eq(w, &UNIT_LINK_WORDS[1])
+}
+
+/// Whether the removal or the rename (in or out) of an entry named
+/// `ours` ([`is_unit_link_name`]) in a directory whose `INODE_EXT` word is
+/// `ext` is refused: a directory of our units' links
+/// ([`INODE_EXT_UNIT_LINKS`]), for a caller outside the agent's family
+/// (`family`) the window does not lift for (`lifted`) — the enablement
+/// links' MUTATE protection, by name.
+#[inline(always)]
+pub const fn unit_link_verdict(ext: Option<u8>, ours: bool, lifted: bool, family: bool) -> bool {
+    let ext = match ext {
+        Some(e) => e,
+        None => return false,
+    };
+    ext & INODE_EXT_UNIT_LINKS != 0 && ours && !lifted && !family
+}
+
 // ── records ────────────────────────────────────────────────────────────
 
 /// A refusal's context class (the design's section 7): no tree window in
@@ -413,31 +636,48 @@ pub const fn denial_class(tree_in_force: bool, member: bool) -> u8 {
     }
 }
 
+/// Whether a record of `operation` takes a window class
+/// ([`denial_class`]; an outsider's also a window record, High): a refusal
+/// only. A record of what was let through (`wire::is_let_through`: a fatal
+/// signal to the agent's family, a mount or an unmount noted, a block
+/// device's raw write recorded) is no "outsider refused".
+#[inline(always)]
+pub const fn window_classes(operation: u8) -> bool {
+    !crate::wire::is_let_through(operation)
+}
+
 // ── a new instance (task_kill) ─────────────────────────────────────────
 
 /// How long a process running the agent's or the watchdog's binary is
-/// protected by `task_kill` before it registers: its first 10 s. A new
-/// instance registers in the pinned `PROTECTED_PIDS` within its first
-/// second or two (into its predecessor's map, before its bootstraps).
-pub const NEW_INSTANCE_NS: u64 = 10_000_000_000;
+/// protected by `task_kill` before it registers, at most: until it
+/// registers in the pinned `PROTECTED_PIDS` (into its predecessor's map,
+/// before its bootstraps: a second or two) or exits, capped at 60 s (the
+/// review of #647: a fixed 10 s did not hold under load — one vCPU, a
+/// real-time spinner, a slow verifier — and left a start killable).
+pub const NEW_INSTANCE_NS: u64 = 60_000_000_000;
 
 /// Whether `task_kill` protects a target that is not a protected pid: it
 /// runs one of our binaries (`role`: `OWN_EXE_INODES`' role of its
 /// executable, 0 for none), it is not that role's live holder (`holder`:
-/// the role's `ROLE_TGIDS` slot; `tgid`: the target's), and it is a new
-/// instance, in its first [`NEW_INSTANCE_NS`] (`age_ns`; `None`: its start
-/// unread, protected). A holder that is no longer a protected pid, and a
-/// process past its first seconds (a helper left behind by an agent that
-/// exited), are signalled as before; the window lifts the protection for
-/// the processes it lifts.
+/// the role's `ROLE_TGIDS` slot; `tgid`: the target's), it was started
+/// for its role (`for_role`: systemd's start of the role's unit — a child
+/// of PID 1 in that unit's own cgroup, lot 374's test), and it has not
+/// registered yet within [`NEW_INSTANCE_NS`] (`age_ns`; `None`: its start
+/// unread, protected). A holder that is no longer a protected pid, a
+/// process run by hand or by a test or by `install.sh` (not systemd's
+/// start of the unit), and one past the cap, are signalled as before; the
+/// window lifts the protection for the processes it lifts. The new
+/// binary's inode after an upgrade (`OWN_EXE_INODES`) is marked by the
+/// new instance's own start, re-marked by the upgrade flow in lot 2.4.
 #[inline(always)]
 pub const fn new_instance_protected(
     role: u8,
     holder: Option<u32>,
     tgid: u32,
+    for_role: bool,
     age_ns: Option<u64>,
 ) -> bool {
-    if role == 0 {
+    if role == 0 || !for_role {
         return false;
     }
     if matches!(holder, Some(h) if h == tgid) {
@@ -835,36 +1075,131 @@ mod tests {
     }
 
     #[test]
-    fn a_protected_block_device_refuses_foreign_writes_and_reads_under_the_option() {
+    fn a_protected_block_device_records_foreign_writes_and_refuses_them_under_the_option() {
         let p = Some(BDEV_BACKS_PROTECTED);
-        assert_eq!(bdev_open_refusal(p, true, 0, false), FS_OP_BDEV_WRITE);
-        assert_eq!(bdev_open_refusal(p, false, 0, false), 0);
+        let b = BDEV_BACKS_PROTECTED;
+        let strict = KERNEL_READ_BLOCK_DEVICE;
+        // by default: a write-open and a passthrough command recorded, let through
         assert_eq!(
-            bdev_open_refusal(p, false, KERNEL_READ_BLOCK_DEVICE, false),
-            FS_OP_BDEV_READ
+            bdev_verdict(p, b, BDEV_ACCESS_WRITE, 0, false),
+            FS_OP_BDEV_WRITE_NOTED
         );
         assert_eq!(
-            bdev_open_refusal(p, false, !KERNEL_READ_BLOCK_DEVICE, false),
+            bdev_verdict(p, b, BDEV_ACCESS_PASSTHROUGH, 0, false),
+            FS_OP_BDEV_PASSTHROUGH_NOTED
+        );
+        assert_eq!(bdev_verdict(p, b, BDEV_ACCESS_READ, 0, false), 0);
+        assert!(!bdev_refuses(FS_OP_BDEV_WRITE_NOTED));
+        assert!(!bdev_refuses(FS_OP_BDEV_PASSTHROUGH_NOTED));
+        // under the kernel-read option's block-device class: each refused
+        assert_eq!(
+            bdev_verdict(p, b, BDEV_ACCESS_WRITE, strict, false),
+            FS_OP_BDEV_WRITE
+        );
+        assert_eq!(
+            bdev_verdict(p, b, BDEV_ACCESS_PASSTHROUGH, strict, false),
+            FS_OP_BDEV_PASSTHROUGH
+        );
+        assert_eq!(
+            bdev_verdict(p, b, BDEV_ACCESS_READ, strict, false),
+            FS_OP_BDEV_READ
+        );
+        assert!(bdev_refuses(FS_OP_BDEV_WRITE));
+        assert!(bdev_refuses(FS_OP_BDEV_PASSTHROUGH));
+        assert!(bdev_refuses(FS_OP_BDEV_READ));
+        // another class of the option is not the block devices'
+        assert_eq!(
+            bdev_verdict(p, b, BDEV_ACCESS_WRITE, !KERNEL_READ_BLOCK_DEVICE, false),
+            FS_OP_BDEV_WRITE_NOTED
+        );
+        assert_eq!(
+            bdev_verdict(p, b, BDEV_ACCESS_READ, !KERNEL_READ_BLOCK_DEVICE, false),
             0
         );
         // lifted for a member of the window
-        assert_eq!(
-            bdev_open_refusal(p, true, KERNEL_READ_BLOCK_DEVICE, true),
-            0
-        );
-        assert_eq!(
-            bdev_open_refusal(p, false, KERNEL_READ_BLOCK_DEVICE, true),
-            0
-        );
+        for a in [BDEV_ACCESS_READ, BDEV_ACCESS_WRITE, BDEV_ACCESS_PASSTHROUGH] {
+            assert_eq!(bdev_verdict(p, b, a, strict, true), 0);
+            assert_eq!(bdev_verdict(p, b, a, 0, true), 0);
+        }
         // another device, or an entry without the bit
+        assert_eq!(bdev_verdict(None, b, BDEV_ACCESS_WRITE, strict, false), 0);
         assert_eq!(
-            bdev_open_refusal(None, true, KERNEL_READ_BLOCK_DEVICE, false),
+            bdev_verdict(Some(0), b, BDEV_ACCESS_WRITE, strict, false),
+            0
+        );
+    }
+
+    #[test]
+    fn a_disk_s_passthrough_nodes_are_judged_at_their_commands_and_writes_not_their_reads() {
+        let c = bdev_entry_bit(false);
+        assert_eq!(c, BDEV_PASSTHROUGH_NODE);
+        assert_eq!(bdev_entry_bit(true), BDEV_BACKS_PROTECTED);
+        let node = Some(BDEV_PASSTHROUGH_NODE);
+        let strict = KERNEL_READ_BLOCK_DEVICE;
+        assert_eq!(
+            bdev_verdict(node, c, BDEV_ACCESS_PASSTHROUGH, 0, false),
+            FS_OP_BDEV_PASSTHROUGH_NOTED
+        );
+        assert_eq!(
+            bdev_verdict(node, c, BDEV_ACCESS_PASSTHROUGH, strict, false),
+            FS_OP_BDEV_PASSTHROUGH
+        );
+        // the sg node's write interface sends commands too
+        assert_eq!(
+            bdev_verdict(node, c, BDEV_ACCESS_WRITE, strict, false),
+            FS_OP_BDEV_WRITE
+        );
+        assert_eq!(bdev_verdict(node, c, BDEV_ACCESS_READ, strict, false), 0);
+        // one number, two devices: each matches its own bit
+        assert_eq!(
+            bdev_verdict(node, BDEV_BACKS_PROTECTED, BDEV_ACCESS_WRITE, strict, false),
             0
         );
         assert_eq!(
-            bdev_open_refusal(Some(0), true, KERNEL_READ_BLOCK_DEVICE, false),
+            bdev_verdict(
+                Some(BDEV_BACKS_PROTECTED),
+                c,
+                BDEV_ACCESS_PASSTHROUGH,
+                strict,
+                false
+            ),
             0
         );
+        let both = Some(BDEV_BACKS_PROTECTED | BDEV_PASSTHROUGH_NODE);
+        assert_eq!(
+            bdev_verdict(both, c, BDEV_ACCESS_WRITE, 0, false),
+            FS_OP_BDEV_WRITE_NOTED
+        );
+    }
+
+    #[test]
+    fn the_passthrough_ioctls_are_scsi_s_and_nvme_s_commands() {
+        // NVME_IOCTL_ADMIN_CMD, SUBMIT_IO, IO_CMD, ADMIN64_CMD, IO64_CMD, IO64_CMD_VEC
+        for cmd in [
+            0xC048_4E41u32,
+            0x4030_4E42,
+            0xC048_4E43,
+            0xC050_4E47,
+            0xC050_4E48,
+            0xC050_4E49,
+        ] {
+            assert!(is_passthrough_ioctl(cmd), "{cmd:#x}");
+        }
+        assert!(is_passthrough_ioctl(SG_IO));
+        assert!(is_passthrough_ioctl(SCSI_IOCTL_SEND_COMMAND));
+        // NVME_IOCTL_ID, RESET, RESCAN; BLKGETSIZE64, BLKFLSBUF; FS_IOC_SETFLAGS; SG_GET_VERSION_NUM
+        for cmd in [
+            0x4E40u32,
+            0x4E44,
+            0x4E46,
+            0x8008_1272,
+            0x1261,
+            0x4008_6602,
+            0x2282,
+            0,
+        ] {
+            assert!(!is_passthrough_ioctl(cmd), "{cmd:#x}");
+        }
     }
 
     #[test]
@@ -917,27 +1252,40 @@ mod tests {
     /// role's live holder, a process of no binary of ours and one past its
     /// first seconds are not (the fixtures' teardown, a helper left behind).
     #[test]
-    fn a_new_instance_is_protected_only_in_its_first_seconds_and_not_as_its_role_s_holder() {
+    fn a_new_instance_is_protected_until_it_registers_capped_and_only_as_its_unit_s_start() {
         let young = Some(NEW_INSTANCE_NS - 1);
-        assert!(new_instance_protected(2, Some(100), 200, young));
-        assert!(new_instance_protected(1, None, 200, Some(0)));
+        // past the former fixed 10 s, still protected (a slow start)
+        assert!(new_instance_protected(
+            2,
+            Some(100),
+            200,
+            true,
+            Some(30_000_000_000)
+        ));
+        assert!(new_instance_protected(2, Some(100), 200, true, young));
+        assert!(new_instance_protected(1, None, 200, true, Some(0)));
         assert!(
-            new_instance_protected(2, Some(100), 200, None),
+            new_instance_protected(2, Some(100), 200, true, None),
             "its start unread"
         );
         assert!(
-            !new_instance_protected(0, Some(100), 200, young),
+            !new_instance_protected(0, Some(100), 200, true, young),
             "not our binary"
         );
         assert!(
-            !new_instance_protected(2, Some(200), 200, young),
+            !new_instance_protected(2, Some(200), 200, true, young),
             "the role's holder"
         );
         assert!(
-            !new_instance_protected(2, Some(100), 200, Some(NEW_INSTANCE_NS)),
-            "past its first seconds"
+            !new_instance_protected(2, Some(100), 200, true, Some(NEW_INSTANCE_NS)),
+            "past the cap"
         );
-        assert_eq!(NEW_INSTANCE_NS, 10_000_000_000);
+        assert!(
+            !new_instance_protected(2, Some(100), 200, false, young),
+            "not systemd's start of the role's unit (a test agent, install.sh's check)"
+        );
+        assert!(!new_instance_protected(2, Some(100), 200, false, None));
+        assert_eq!(NEW_INSTANCE_NS, 60_000_000_000);
     }
 
     #[test]
@@ -950,6 +1298,138 @@ mod tests {
         }
         for s in [0, 17, 18, 23, 28, 65, -1] {
             assert!(!fatal_or_stop_by_default(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn the_fork_span_guards_a_pending_child_a_new_task_and_a_member_s_child() {
+        // a member's child made a member at task_alloc, before its entry
+        assert!(in_tree_span(true, Some(0), false));
+        // a task that has not run (TASK_NEW), whoever forked it
+        assert!(in_tree_span(false, Some(TASK_NEW), false));
+        assert!(in_tree_span(false, Some(TASK_NEW | 0x1), false));
+        // a member's child the map left outside, or evicted before its exec
+        assert!(in_tree_span(false, Some(0), true));
+        assert!(in_tree_span(false, None, true));
+        // none of them: not in the tree
+        assert!(!in_tree_span(false, Some(0), false));
+        assert!(!in_tree_span(false, Some(0x1), false));
+        assert!(!in_tree_span(false, None, false));
+        assert_eq!(TASK_NEW, 0x0800);
+    }
+
+    #[test]
+    fn a_let_through_record_takes_no_window_class() {
+        use crate::wire::{
+            FS_OP_FATAL_SIGNAL, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW, FS_OP_PTRACE, FS_OP_SIGNAL,
+            FS_OP_SYSRQ_WINDOW, FS_OP_UNLINK, FS_OP_WRITE, is_sole_trace,
+        };
+        for op in [
+            FS_OP_FATAL_SIGNAL,
+            FS_OP_MOUNT_NOTED,
+            FS_OP_MOUNT_WINDOW,
+            FS_OP_SYSRQ_WINDOW,
+            FS_OP_BDEV_WRITE_NOTED,
+            FS_OP_BDEV_PASSTHROUGH_NOTED,
+        ] {
+            assert!(!window_classes(op), "{op}");
+        }
+        for op in 1..=crate::wire::FS_OP_LAST {
+            if is_sole_trace(op) {
+                assert!(!window_classes(op), "{op}");
+            }
+        }
+        for op in [
+            FS_OP_SIGNAL,
+            FS_OP_PTRACE,
+            FS_OP_UNLINK,
+            FS_OP_WRITE,
+            FS_OP_BDEV_WRITE,
+            FS_OP_BDEV_PASSTHROUGH,
+            FS_OP_BDEV_READ,
+        ] {
+            assert!(window_classes(op), "{op}");
+        }
+    }
+
+    #[test]
+    fn our_units_links_are_kept_by_name_in_their_directories() {
+        for n in UNIT_LINK_NAMES {
+            assert!(n.len() < 32);
+            assert!(
+                is_unit_link_name(&name_words4(n)),
+                "{}",
+                String::from_utf8_lossy(n)
+            );
+        }
+        for n in [
+            &b"northnarrow-agent.servic"[..],
+            b"northnarrow-agent.service~",
+            b"northnarrow-agent.socket",
+            b"getty@tty1.service",
+            b"",
+        ] {
+            assert!(
+                !is_unit_link_name(&name_words4(n)),
+                "{}",
+                String::from_utf8_lossy(n)
+            );
+        }
+        let d = Some(INODE_EXT_UNIT_LINKS | INODE_EXT_NO_RENAME);
+        assert!(unit_link_verdict(d, true, false, false));
+        assert!(
+            !unit_link_verdict(d, false, false, false),
+            "another unit's link"
+        );
+        assert!(
+            !unit_link_verdict(d, true, true, false),
+            "lifted by a window"
+        );
+        assert!(
+            !unit_link_verdict(d, true, false, true),
+            "the agent's family"
+        );
+        assert!(!unit_link_verdict(
+            Some(INODE_EXT_NO_RENAME),
+            true,
+            false,
+            false
+        ));
+        assert!(!unit_link_verdict(None, true, false, false));
+    }
+
+    #[test]
+    fn the_shell_apt_interpreter_and_git_variables_evict() {
+        for v in [
+            &b"BASH_FUNC_ls%%=() { id; }"[..],
+            b"SHELLOPTS=xtrace",
+            b"BASHOPTS=extdebug",
+            b"APT_CONFIG=/tmp/apt.conf",
+            b"NODE_OPTIONS=--require /tmp/x.js",
+            b"RUBYOPT=-r/tmp/x",
+            b"JAVA_TOOL_OPTIONS=-javaagent:/tmp/a.jar",
+            b"_JAVA_OPTIONS=-Dx=y",
+            b"LUA_INIT=@/tmp/x.lua",
+            b"LUA_INIT_5_4=os.execute('id')",
+            b"PYTHONHOME=/tmp/py",
+            b"PERL5DB=exec id",
+            b"GIT_SSH_COMMAND=id",
+            b"GIT_CONFIG_COUNT=1",
+            b"GIT_CONFIG_PARAMETERS='core.fsmonitor=id'",
+            b"GIT_EXEC_PATH=/tmp",
+        ] {
+            assert!(env_var_dangerous(v), "{}", String::from_utf8_lossy(v));
+        }
+        for v in [
+            &b"PATH=/usr/bin"[..],
+            b"HOME=/root",
+            b"LANG=C.UTF-8",
+            b"GIT_AUTHOR_NAME=x",
+            b"SHELL=/bin/bash",
+            b"DEBIAN_FRONTEND=noninteractive",
+            b"BASH=/bin/bash",
+        ] {
+            assert!(!env_var_dangerous(v), "{}", String::from_utf8_lossy(v));
         }
     }
 }

@@ -2524,8 +2524,9 @@ pub fn refresh_role_marks(
 /// agent ran), summed.
 pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, String> {
     use common::wire::{
-        FS_GRANT_V2_MAP_NAME, TREE_MEMBERS_MAP_NAME, WINDOW_EVENT_DROPS_MAP_NAME,
-        WINDOW_LEASES_MAP_NAME, WINDOW_LEASES_MAX,
+        FS_GRANT_V2_MAP_NAME, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBERS_MAP_NAME,
+        TREE_PENDING_MAP_NAME, WINDOW_EVENT_DROPS_MAP_NAME, WINDOW_LEASES_MAP_NAME,
+        WINDOW_LEASES_MAX,
     };
     {
         let m = ebpf
@@ -2553,6 +2554,31 @@ pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, Stri
         let mut h: HashMap<&mut MapData, u32, PodMember> =
             HashMap::try_from(m).map_err(|e| e.to_string())?;
         let keys: Vec<u32> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    // lot 2.3a (the review of #647): the fork span's children, and the
+    // root's cgroup files an outsider may not write
+    {
+        let m = ebpf
+            .map_mut(TREE_PENDING_MAP_NAME)
+            .ok_or_else(|| format!("{TREE_PENDING_MAP_NAME} missing"))?;
+        let mut h: HashMap<&mut MapData, u64, u64> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<u64> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let m = ebpf
+            .map_mut(TREE_CGROUP_FILES_MAP_NAME)
+            .ok_or_else(|| format!("{TREE_CGROUP_FILES_MAP_NAME} missing"))?;
+        let mut h: HashMap<&mut MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<super::filesystem::AyaInodeKey> =
+            h.keys().filter_map(std::result::Result::ok).collect();
         for k in keys {
             h.remove(&k).map_err(|e| e.to_string())?;
         }
@@ -3117,7 +3143,7 @@ mod tests {
     /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
     /// of the agent's programs is its own; anything else named `link_*` is
     /// reported, not registered — 70 of them no longer overflow the
-    /// 64-entry `OWN_PIN_NAMES` and refuse the start. Lot 301: every entry
+    /// `OWN_PIN_NAMES` (64 entries then, 128 since lot 2.3a) and refuse the start. Lot 301: every entry
     /// of the pin directories is judged, whatever its name (the root's
     /// `prog_task_kill` that is no BPF object is reported too), a directory
     /// is walked, not reported.

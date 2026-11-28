@@ -108,8 +108,8 @@ use super::{
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
 use common::wire::{
-    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, KillGrant, TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME,
-    TreeMember, WINDOW_MAX_NS,
+    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME,
+    TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME, TreeMember, WINDOW_MAX_NS,
 };
 
 // R08b (lab PR 251): the agent's own units and a window's grant are the
@@ -740,7 +740,7 @@ impl TrustedInstallerOverride {
         self.arm_tree_with(
             pinned.as_mut().map(|m| m as &mut dyn TreeMaps),
             &ProcFs(Path::new("/proc")),
-            &super::window_tree::manifest_missing(),
+            &super::window_tree::manifest_missing(self.bpffs_root.as_deref()),
             boottime_ns(),
             window_secs,
             root,
@@ -875,6 +875,23 @@ impl TrustedInstallerOverride {
                 return Err(withdrawn(
                     maps,
                     format!("member {pid} not written to {TREE_MEMBERS_MAP_NAME}: {e}"),
+                ));
+            }
+        }
+        // 1b. (lot 2.3a, D7) the root's cgroup files: an outsider's
+        // `cgroup.kill` / `cgroup.freeze` of the members' cgroup refused
+        let files = match reader.cgroup_files(root.0) {
+            Ok(f) => f,
+            Err(e) => return Err(withdrawn(maps, format!("the root's cgroup files: {e}"))),
+        };
+        for (key, op) in files {
+            if let Err(e) = maps.put_cgroup_file(key, [generation, u64::from(op)]) {
+                return Err(withdrawn(
+                    maps,
+                    format!(
+                        "cgroup file {}:{} not written to {TREE_CGROUP_FILES_MAP_NAME}: {e}",
+                        key.dev, key.ino
+                    ),
                 ));
             }
         }
@@ -1124,6 +1141,43 @@ pub trait LineReader {
     fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String>;
     /// Its tracer and seccomp mode (`status`: `TracerPid`, `Seccomp`).
     fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String>;
+    /// Lot 2.3a (D7, the review of #647): the `cgroup.kill` and
+    /// `cgroup.freeze` of its cgroup of the unified hierarchy and of every
+    /// cgroup above it but the root ([`cgroup_file_plan`]), by inode, each
+    /// with its operation (`FS_OP_CGROUP_KILL`, `FS_OP_CGROUP_FREEZE`); a
+    /// file this kernel does not have is skipped; its `cgroup` file not
+    /// read is an error (the grant refused: fail closed).
+    fn cgroup_files(&self, _pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Lot 2.3a (D7, the review of #647): the files of `cgroup` (a path of the
+/// unified hierarchy, `/proc/<pid>/cgroup`'s `0::` line) and of every
+/// cgroup above it under `root` (`/sys/fs/cgroup`, its own root excluded:
+/// it has neither file) through which a member is killed or frozen with
+/// its cgroup, each with the operation its refusal is signed as.
+pub fn cgroup_file_plan(root: &Path, cgroup: &str) -> Vec<(PathBuf, u8)> {
+    let mut out = Vec::new();
+    let mut cur = Path::new(cgroup.trim().trim_start_matches('/'));
+    loop {
+        if cur.as_os_str().is_empty() {
+            break;
+        }
+        let dir = root.join(cur);
+        out.push((dir.join("cgroup.kill"), common::wire::FS_OP_CGROUP_KILL));
+        out.push((dir.join("cgroup.freeze"), common::wire::FS_OP_CGROUP_FREEZE));
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    out
+}
+
+/// `/proc/<pid>/cgroup`'s path in the unified hierarchy (its `0::` line).
+fn unified_cgroup(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| l.strip_prefix("0::"))
 }
 
 /// The [`LineReader`] of a `/proc` (the kernel's: `Path::new("/proc")`).
@@ -1140,6 +1194,30 @@ impl LineReader for ProcFs<'_> {
         let status = crate::state_read::read_state(self.0.join(pid.to_string()).join("status"))
             .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
         parse_guards(&status).ok_or_else(|| format!("/proc/{pid}/status: no TracerPid or Seccomp"))
+    }
+
+    fn cgroup_files(&self, pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+        let text = crate::state_read::read_state(self.0.join(pid.to_string()).join("cgroup"))
+            .map_err(|e| format!("/proc/{pid}/cgroup: {e}"))?;
+        // no unified hierarchy: no cgroup.kill nor cgroup.freeze to guard
+        let Some(cg) = unified_cgroup(&text) else {
+            return Ok(Vec::new());
+        };
+        Ok(cgroup_file_plan(Path::new("/sys/fs/cgroup"), cg)
+            .into_iter()
+            .filter_map(|(p, op)| {
+                let m = antitamper_bpf::kernel_roots::metadata(&p).ok()?;
+                Some((
+                    InodeKey {
+                        dev: super::filesystem::stat_dev_to_kernel_dev(
+                            std::os::unix::fs::MetadataExt::dev(&m),
+                        ),
+                        ino: std::os::unix::fs::MetadataExt::ino(&m),
+                    },
+                    op,
+                ))
+            })
+            .collect())
     }
 }
 
@@ -1317,6 +1395,15 @@ trait TreeMaps {
     fn read_closed(&mut self) -> std::result::Result<[u64; 2], String>;
     /// `TREE_CLOSED[0] = [0, 0]`.
     fn zero_closed(&mut self) -> std::result::Result<(), String>;
+    /// Lot 2.3a (D7): `TREE_CGROUP_FILES[key] = value` (`[generation,
+    /// operation]`). Emptied with the members ([`Self::clear_members`]).
+    fn put_cgroup_file(
+        &mut self,
+        _key: InodeKey,
+        _value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The pinned maps under the pin root.
@@ -1351,7 +1438,28 @@ impl TreeMaps for PinnedTreeMaps<'_> {
         for k in &keys {
             h.remove(k).map_err(|e| e.to_string())?;
         }
+        // lot 2.3a (D7): and the root's cgroup files
+        let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        let files: Vec<super::filesystem::AyaInodeKey> =
+            c.keys().filter_map(std::result::Result::ok).collect();
+        for k in &files {
+            c.remove(k).map_err(|e| e.to_string())?;
+        }
         Ok(keys.len())
+    }
+
+    fn put_cgroup_file(
+        &mut self,
+        key: InodeKey,
+        value: [u64; 2],
+    ) -> std::result::Result<(), String> {
+        let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
+            aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
+                .map_err(|e| e.to_string())?;
+        c.insert(&super::filesystem::AyaInodeKey(key), &value, 0)
+            .map_err(|e| e.to_string())
     }
 
     fn write_grant(&mut self, grant: FsGrantV2) -> std::result::Result<(), String> {
@@ -1836,6 +1944,7 @@ mod tests {
     #[derive(Default)]
     struct FakeMaps {
         ops: Vec<String>,
+        cgroup_files: Vec<(InodeKey, [u64; 2])>,
         members: BTreeMap<u32, TreeMember>,
         grant: FsGrantV2,
         closed: [u64; 2],
@@ -1871,6 +1980,16 @@ mod tests {
         fn zero_closed(&mut self) -> std::result::Result<(), String> {
             self.ops.push("zero closed".to_string());
             self.closed = [0; 2];
+            Ok(())
+        }
+        fn put_cgroup_file(
+            &mut self,
+            key: InodeKey,
+            value: [u64; 2],
+        ) -> std::result::Result<(), String> {
+            self.ops
+                .push(format!("cgroup file {} op {}", key.ino, value[1]));
+            self.cgroup_files.push((key, value));
             Ok(())
         }
     }
@@ -2312,5 +2431,128 @@ mod tests {
         );
         assert_eq!(rows[3]["result"], "closed: ttl_expired");
         assert_eq!(rows[3]["extra"]["members_cleared"], 3);
+    }
+
+    /// Lot 2.3a (D7, the review of #647): the root's cgroup and every cgroup
+    /// above it but the hierarchy's root, `cgroup.kill` and `cgroup.freeze`.
+    #[test]
+    fn the_root_s_cgroup_files_are_its_cgroup_s_and_its_ancestors() {
+        let root = Path::new("/sys/fs/cgroup");
+        let plan = cgroup_file_plan(root, "/user.slice/user-0.slice/session-3.scope\n");
+        let kill = common::wire::FS_OP_CGROUP_KILL;
+        let freeze = common::wire::FS_OP_CGROUP_FREEZE;
+        let p = |s: &str| PathBuf::from(format!("/sys/fs/cgroup/{s}"));
+        assert_eq!(
+            plan,
+            vec![
+                (
+                    p("user.slice/user-0.slice/session-3.scope/cgroup.kill"),
+                    kill
+                ),
+                (
+                    p("user.slice/user-0.slice/session-3.scope/cgroup.freeze"),
+                    freeze
+                ),
+                (p("user.slice/user-0.slice/cgroup.kill"), kill),
+                (p("user.slice/user-0.slice/cgroup.freeze"), freeze),
+                (p("user.slice/cgroup.kill"), kill),
+                (p("user.slice/cgroup.freeze"), freeze),
+            ]
+        );
+        assert!(
+            cgroup_file_plan(root, "/").is_empty(),
+            "the root has neither file"
+        );
+        assert_eq!(
+            unified_cgroup("12:pids:/x\n0::/system.slice/apt.service\n"),
+            Some("/system.slice/apt.service")
+        );
+        assert_eq!(unified_cgroup("1:name=systemd:/x\n"), None);
+    }
+
+    /// A [`LineReader`] whose root's cgroup files are `files`.
+    struct CgroupReader(FakeProc, std::result::Result<Vec<(InodeKey, u8)>, String>);
+
+    impl LineReader for CgroupReader {
+        fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
+            self.0.hop(pid)
+        }
+        fn guards(&self, pid: u32) -> std::result::Result<(u32, u32), String> {
+            self.0.guards(pid)
+        }
+        fn cgroup_files(&self, pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+            assert_eq!(pid, 501, "the root's");
+            self.1.clone()
+        }
+    }
+
+    /// Lot 2.3a (D7, the review of #647): the root's cgroup files are
+    /// written with the generation and their operation after the members,
+    /// before the grant; a root whose cgroup cannot be read is refused its
+    /// grant (fail closed), the members withdrawn.
+    #[test]
+    fn the_root_s_cgroup_files_are_armed_with_the_window_and_an_unread_cgroup_refuses_it() {
+        let kill = common::wire::FS_OP_CGROUP_KILL;
+        let freeze = common::wire::FS_OP_CGROUP_FREEZE;
+        let k = |ino| InodeKey { dev: 7, ino };
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        let reader = CgroupReader(host(), Ok(vec![(k(30), kill), (k(31), freeze)]));
+        let g = ov
+            .arm_tree_with(
+                Some(&mut maps),
+                &reader,
+                &[],
+                NOW,
+                120,
+                (501, 9_000),
+                &line(),
+            )
+            .expect("armed");
+        assert_eq!(
+            maps.cgroup_files,
+            vec![
+                (k(30), [g, u64::from(kill)]),
+                (k(31), [g, u64::from(freeze)])
+            ]
+        );
+        let files = maps
+            .ops
+            .iter()
+            .position(|o| o.starts_with("cgroup file"))
+            .unwrap();
+        let grant = maps
+            .ops
+            .iter()
+            .position(|o| o.starts_with("grant"))
+            .unwrap();
+        let last_member = maps
+            .ops
+            .iter()
+            .rposition(|o| o.starts_with("member"))
+            .unwrap();
+        assert!(last_member < files && files < grant, "{:?}", maps.ops);
+
+        let ov = tree_override();
+        let mut maps = FakeMaps::default();
+        let reader = CgroupReader(host(), Err("/proc/501/cgroup: EACCES".to_string()));
+        let e = ov
+            .arm_tree_with(
+                Some(&mut maps),
+                &reader,
+                &[],
+                NOW,
+                120,
+                (501, 9_000),
+                &line(),
+            )
+            .unwrap_err();
+        assert!(e.contains("the root's cgroup files"), "{e}");
+        assert!(maps.members.is_empty(), "the members withdrawn");
+        assert!(
+            !maps.ops.iter().any(|o| o.starts_with("grant")),
+            "{:?}",
+            maps.ops
+        );
     }
 }

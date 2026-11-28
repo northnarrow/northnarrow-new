@@ -60,8 +60,8 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         ("task_kill.rs", 2, 3),
         ("ptrace_check.rs", 1, 1),
         // lot 2.3a: the renamer of an ancestor, the opener of a block
-        // device — callers
-        ("inode_protect.rs", 0, 3),
+        // device, the remover of our units' links by name — callers
+        ("inode_protect.rs", 0, 4),
         ("bpf_defense.rs", 0, 1),
         ("fim_watch.rs", 0, 1),
         ("execq.rs", 0, 2),
@@ -89,8 +89,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // the holder of a role mapping executable code — callers
         ("role_maps.rs", 0, 2),
         // lot 2.3a: the outsider signalling or tracing a member, the
-        // receiver of a descriptor — callers
-        ("window_tree.rs", 0, 2),
+        // receiver of a descriptor, the writer of a member's cgroup.kill or
+        // cgroup.freeze — callers
+        ("window_tree.rs", 0, 3),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(

@@ -76,7 +76,7 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET, QSTR_NAME_OFFSET,
     INODE_I_MODE_OFFSET, INODE_I_RDEV_OFFSET, INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT,
     INODE_SETATTR_DENTRY_ARG_SLOT, INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
 };
@@ -741,7 +741,13 @@ pub(crate) fn emit_sole_trace(operation: u8, key: InodeKey) -> bool {
 fn emit_denial(operation: u8, key: InodeKey) -> bool {
     // Lot 2.3a: the refusal's class while a tree window is open (an
     // outsider's also goes to the window's ring), before the reservation.
-    let window = crate::window_tree::nn_window_class(u64::from(operation), key.ino) as u8;
+    // A record of what was let through takes none (the review of #647: the
+    // agent's supervision signals are no outsider's refused attempt).
+    let window = if northnarrow_common::window_tree::window_classes(operation) {
+        crate::window_tree::nn_window_class(u64::from(operation), key.ino) as u8
+    } else {
+        northnarrow_common::wire::DENIAL_WINDOW_NONE
+    };
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
@@ -893,7 +899,72 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
                 return -EPERM;
             }
         }
+        // Lot 2.3a (the review of #647): our units' enablement links, by name
+        let (dir_s, dentry_s) = (crate::window_tree::raw_arg(ctx, 0), crate::window_tree::raw_arg(ctx, 1));
+        if crate::window_tree::opaque(nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))) != 0 {
+            return -EPERM;
+        }
         0
+    }
+}
+
+/// Lot 2.3a (the review of #647, the enablement links): whether removing
+/// or renaming the entry `dentry` of directory `dir` (scalar pointers) is
+/// refused because `dir` holds our units' links ([`INODE_EXT`]'s
+/// `INODE_EXT_UNIT_LINKS`) and the entry is named after one of our units
+/// (`window_tree::unit_link_verdict`: outside the agent's family and a
+/// window's lift) — a link made after the start included, whatever its
+/// inode; a new entry (an enable) is made freely. Signed as `operation` on
+/// the directory. 1 when refused. A global
+/// function: one `INODE_EXT` lookup for any other directory.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_unit_link(dir: u64, dentry: u64, operation: u64) -> u64 {
+    // SAFETY: the directory, the dentry and its name are read through the helper only.
+    unsafe {
+        let dir = dir as *const c_void;
+        if dir.is_null() || dentry == 0 {
+            return 0;
+        }
+        let Some(key) = read_inode_key(dir) else {
+            return 0;
+        };
+        let Some(ext) = INODE_EXT.get(&key).copied() else {
+            return 0;
+        };
+        let dentry = dentry as *const u8;
+        // a negative entry (a rename's new name not taken: an enable) is
+        // made, not changed — MUTATE only
+        match bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_INODE_OFFSET)) as *const u64) {
+            Ok(i) if i != 0 => {}
+            _ => return 0,
+        }
+        let Ok(name) = bpf_probe_read_kernel::<u64>(
+            dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)) as *const u64,
+        ) else {
+            return 0;
+        };
+        let mut w = [0u64; 4];
+        if name == 0
+            || aya_ebpf::helpers::generated::bpf_probe_read_kernel_str(
+                w.as_mut_ptr() as *mut c_void,
+                32,
+                name as *const c_void,
+            ) <= 0
+        {
+            return 0;
+        }
+        let ours = northnarrow_common::window_tree::is_unit_link_name(&w);
+        let family = crate::task_kill::is_exempt_pid((bpf_get_current_pid_tgid() >> 32) as u32);
+        if !northnarrow_common::window_tree::unit_link_verdict(Some(ext), ours, override_active(), family) {
+            return 0;
+        }
+        if operation == u64::from(FS_OP_UNLINK) {
+            emit_attempt(FS_OP_UNLINK, key);
+        } else {
+            emit_attempt(FS_OP_RENAME, key);
+        }
+        1
     }
 }
 
@@ -959,6 +1030,14 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
         // (scalars for the global function: the hook's typed pointers are
         // refused there)
         let (old_s, new_s) = (crate::window_tree::raw_arg(ctx, 1), crate::window_tree::raw_arg(ctx, 3));
+        // Lot 2.3a (the review of #647): our units' enablement links, by
+        // name, moved out of or replaced in their directory
+        let rename = u64::from(FS_OP_RENAME);
+        if crate::window_tree::opaque(nn_unit_link(crate::window_tree::raw_arg(ctx, 0), old_s, rename)) != 0
+            || crate::window_tree::opaque(nn_unit_link(crate::window_tree::raw_arg(ctx, 2), new_s, rename)) != 0
+        {
+            return -EPERM;
+        }
         if crate::window_tree::opaque(nn_ancestor_rename(old_s)) != 0
             || crate::window_tree::opaque(nn_ancestor_rename(new_s)) != 0
         {
@@ -1122,6 +1201,25 @@ unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
             return 0;
         }
 
+        // Lot 2.3a (the review of #647): a passthrough command to a block
+        // device under the agent's files, or to its disk's sg, bsg or NVMe
+        // node — a write of any block, whatever the descriptor's mode
+        if northnarrow_common::window_tree::is_passthrough_ioctl(cmd) {
+            let file = crate::window_tree::raw_arg(ctx, 0) as *const u8;
+            if file.is_null() {
+                return 0;
+            }
+            let Ok(inode) = bpf_probe_read_kernel::<u64>(file.add(off!(FILE_F_INODE_OFFSET)) as *const u64) else {
+                crate::fail_open::bump(hook);
+                return 0;
+            };
+            let access = u64::from(northnarrow_common::window_tree::BDEV_ACCESS_PASSTHROUGH);
+            if crate::window_tree::opaque(nn_bdev_raw(inode, access, u64::from(cmd))) != 0 {
+                return -EPERM;
+            }
+            return 0;
+        }
+
         if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {
             return 0;
         }
@@ -1213,8 +1311,14 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
                 return 0;
             }
         };
-        // Lot 2.3a (the block devices): a block device that backs the agent's files.
-        if crate::window_tree::opaque(nn_bdev_open(inode as u64, u64::from(f_mode & FMODE_WRITE != 0))) != 0 {
+        // Lot 2.3a (the block devices): a block device that backs the agent's
+        // files, or one of its disk's passthrough nodes.
+        let access = if f_mode & FMODE_WRITE != 0 {
+            northnarrow_common::window_tree::BDEV_ACCESS_WRITE
+        } else {
+            northnarrow_common::window_tree::BDEV_ACCESS_READ
+        };
+        if crate::window_tree::opaque(nn_bdev_raw(inode as u64, u64::from(access), 0)) != 0 {
             return -EPERM;
         }
         if f_mode & FMODE_WRITE == 0 {
@@ -1234,6 +1338,12 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         // Lot 273b: a protected cgroup's resource file, a cgroup v1 hierarchy,
         // a protected process's `oom_score_adj`.
         if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {
+            return -EPERM;
+        }
+        // Lot 2.3a (D7, the review of #647): the `cgroup.kill` or
+        // `cgroup.freeze` of an open tree window's members, from outside it.
+        let inode_s = inode as u64;
+        if crate::window_tree::opaque(crate::window_tree::nn_tree_cgroup_file(inode_s)) != 0 {
             return -EPERM;
         }
         0
@@ -1315,25 +1425,38 @@ unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
 /// `S_IFBLK` (include/uapi/linux/stat.h).
 const S_IFBLK: u16 = 0o060000;
 
-/// Lot 2.3a (the block devices): whether the open of `inode` (a scalar pointer),
-/// for writing when `write` is 1, is refused: a block device whose
-/// `i_rdev` is one of [`PROTECTED_BDEVS`], opened by a process outside the
-/// agent's family that the window does not lift for — a write-open always,
-/// a read-open under the kernel-read option's block-device class
-/// (`window_tree::bdev_open_refusal`), signed. 1 when refused; any other
-/// file costs one read of its mode. A global function.
+/// `S_IFCHR` (include/uapi/linux/stat.h).
+const S_IFCHR: u16 = 0o020000;
+
+/// Lot 2.3a (the block devices; the review of #647): the verdict on a raw
+/// `access` (`window_tree::BDEV_ACCESS_*`: a read-open, a write-open, a
+/// passthrough command `cmd`) to `inode` (a scalar pointer) — a block
+/// device whose `i_rdev` is one of [`PROTECTED_BDEVS`], or a character
+/// device registered there as one of such a disk's passthrough nodes — by
+/// a process outside the agent's family that the window does not lift for
+/// (`window_tree::bdev_verdict`): recorded and let through by default (a
+/// write-open, a command), refused under the kernel-read option's
+/// block-device class (and a read-open of a block device), signed either
+/// way. 1 when refused; any other file costs one read of its mode. A
+/// global function.
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn nn_bdev_open(inode: u64, write: u64) -> u64 {
+pub extern "C" fn nn_bdev_raw(inode: u64, access: u64, cmd: u64) -> u64 {
     // SAFETY: the inode is read through the helper only.
     unsafe {
         let inode = inode as *const u8;
         if inode.is_null() {
             return 0;
         }
-        match bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
-            Ok(m) if m & S_IFMT == S_IFBLK => {}
+        let block = match bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
+            Ok(m) if m & S_IFMT == S_IFBLK => true,
+            Ok(m) if m & S_IFMT == S_IFCHR => false,
             _ => return 0,
+        };
+        // a character node's read-open is never judged: no map lookup for
+        // the host's `/dev/null`, ttys and the like
+        if !block && access == u64::from(northnarrow_common::window_tree::BDEV_ACCESS_READ) {
+            return 0;
         }
         let Some(o) = off_opt!(INODE_I_RDEV_OFFSET) else {
             return 0;
@@ -1354,13 +1477,24 @@ pub extern "C" fn nn_bdev_open(inode: u64, write: u64) -> u64 {
             Some(m) => *m,
             None => 0,
         };
-        let op = northnarrow_common::window_tree::bdev_open_refusal(entry, write != 0, mask, override_active());
+        let op = northnarrow_common::window_tree::bdev_verdict(
+            entry,
+            northnarrow_common::window_tree::bdev_entry_bit(block),
+            access as u8,
+            mask,
+            override_active(),
+        );
         if op == 0 {
             return 0;
         }
-        let key = read_inode_key(inode as *const c_void).unwrap_or(InodeKey { dev: u64::from(rdev), ino: 0 });
+        let key = if access == u64::from(northnarrow_common::window_tree::BDEV_ACCESS_PASSTHROUGH) {
+            // the device's number and the command
+            InodeKey { dev: u64::from(rdev), ino: cmd }
+        } else {
+            read_inode_key(inode as *const c_void).unwrap_or(InodeKey { dev: u64::from(rdev), ino: 0 })
+        };
         emit_attempt(op, key);
-        1
+        u64::from(northnarrow_common::window_tree::bdev_refuses(op))
     }
 }
 

@@ -673,6 +673,20 @@ pub(crate) fn process_event(
                          systemd-shutdown, the agent's family or the process itself (recorded, \
                          not refused)"
                     );
+                } else if matches!(
+                    operation,
+                    nn_model::FsProtectOperation::BdevWriteNoted
+                        | nn_model::FsProtectOperation::BdevPassthroughNoted
+                ) {
+                    // lot 2.3a (the review of #647): recorded High, let through
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        op = %operation,
+                        target_dev, target_ino,
+                        "BLOCK DEVICE RAW WRITE: a write-open or a passthrough command to a disk \
+                         under the agent's files (recorded, not refused; refused under \
+                         kernel-read-refuse block-device)"
+                    );
                 } else {
                     warn!(
                         pid, uid, comm = %Escaped(comm),
@@ -864,6 +878,16 @@ pub(crate) fn process_event(
                                  let through (PID 1 under the window's stop grant or as \
                                  systemd-shutdown, the agent's family, the process itself)"
                             )
+                        } else if matches!(
+                            operation,
+                            nn_model::FsProtectOperation::BdevWriteNoted
+                                | nn_model::FsProtectOperation::BdevPassthroughNoted
+                        ) {
+                            // lot 2.3a (the review of #647): the default
+                            "not refused: a raw write path to a disk under the agent's files, \
+                             recorded (refused under the kernel-read option's block-device \
+                             class)"
+                                .to_string()
                         } else {
                             "denied in kernel (anti-tamper LSM hook)".to_string()
                         };

@@ -18,15 +18,20 @@
 //!   remove an entry, each only for its own process (its start). The
 //!   root's death, or its eviction, closes the window in the kernel at
 //!   once ([`TREE_CLOSED`]).
-//!   - `task_alloc` cannot write the entry: `copy_process` calls it before
-//!     the child has its pid (`alloc_pid`) and its start
-//!     (`start_boottime`), so it has no key. `sched_process_fork` runs in
-//!     `kernel_clone` after `copy_process` succeeded and before
-//!     `wake_up_new_task`: the child never runs without its entry. The
-//!     race left: the child is in the pid hash from `copy_process`'s
-//!     `attach_pid` on, so for that span a signal or a ptrace check names a
-//!     child not yet a member — it has not run, and it is guarded from its
-//!     entry on. A member's fork after the window closed writes nothing.
+//!   - The fork span. `copy_process` calls `task_alloc` before the child
+//!     has its pid (`alloc_pid`) and its start (`start_boottime`), and puts
+//!     it in the pid hash (`attach_pid`) before `sched_process_fork`, so
+//!     an outsider could name the child between the two (a ptrace attach,
+//!     a `/proc/<pid>/mem` open — whose descriptor keeps the child's mm, a
+//!     vfork or `posix_spawn` child's being the member's own). So
+//!     [`tree_task_alloc`] makes a member's child a member at once,
+//!     synchronously, by its `task_struct` ([`TREE_PENDING`]: the
+//!     generation, the start unknown yet), and [`tree_fork`] confirms it
+//!     under its tgid with its start before `wake_up_new_task`. Until then
+//!     the guards of D7 ([`nn_tree_target_guarded`]) also protect a task
+//!     still in `TASK_NEW`, and any child of a member (a vfork child a full
+//!     map left outside, a `CLONE_VM` child evicted before its exec).
+//!     A member's fork after the window closed writes nothing.
 //!   - An exec by a thread that is not the leader takes the leader's pid
 //!     and its start (`de_thread` copies `start_boottime`), so the pair
 //!     stays the process's; every test reads the group leader's start.
@@ -66,12 +71,13 @@ use aya_ebpf::{
 use northnarrow_common::exec_marks::CODE_ANONYMOUS;
 use northnarrow_common::window_tree::{
     caller_state_verdict, child_joins, denial_class, entry_is_process, env_head_dangerous, exec_verdict,
-    grant_in_force, is_root, window_closed, CallerFacts, CLOSE_ROOT_EVICTED, CLOSE_ROOT_EXIT,
+    grant_in_force, in_tree_span, is_root, window_closed, CallerFacts, CLOSE_ROOT_EVICTED, CLOSE_ROOT_EXIT,
     CODE_UNSAFE_DIR, ENV_HEAD, ENV_MAX_BYTES, ENV_MAX_VARS, ENV_VAR_MAX, EVICT_ENV, EVICT_EXEC,
     EVICT_FULL, EVICT_MAP, EVICT_TRACED, MEMBER_LIFT, MEMBER_NONE,
 };
 use northnarrow_common::wire::{
-    start_ticks, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED,
+    start_ticks, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED, FS_OP_CGROUP_FREEZE,
+    FS_OP_CGROUP_KILL,
     DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, FS_OP_FD_RECEIVE, FS_OP_PTRACE,
     WINDOW_EVENT_CLOSE, WINDOW_EVENT_EVICTION, WINDOW_EVENT_OUTSIDER_REFUSED,
 };
@@ -83,11 +89,12 @@ use crate::btf_offsets::{
     PATH_DENTRY_OFFSET, PF_IO_WORKER, PID_NAMESPACE_INUM_OFFSET, QSTR_NAME_OFFSET,
     SIGNAL_STRUCT_LIVE_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
     TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_NSPROXY_OFFSET,
-    TASK_STRUCT_PTRACE_OFFSET, TASK_STRUCT_SECCOMP_MODE_OFFSET, TASK_STRUCT_SIGNAL_OFFSET,
-    TASK_STRUCT_START_BOOTTIME_OFFSET, TASK_STRUCT_TGID_OFFSET, USER_NAMESPACE_INUM_OFFSET,
+    TASK_STRUCT_PTRACE_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_SECCOMP_MODE_OFFSET,
+    TASK_STRUCT_SIGNAL_OFFSET, TASK_STRUCT_START_BOOTTIME_OFFSET, TASK_STRUCT_STATE_OFFSET,
+    TASK_STRUCT_TGID_OFFSET, USER_NAMESPACE_INUM_OFFSET,
     VM_AREA_STRUCT_VM_FILE_OFFSET, VM_AREA_STRUCT_VM_FLAGS_OFFSET,
 };
-use crate::window_maps::{emit_window_event, FS_GRANT_V2, TREE_MEMBERS};
+use crate::window_maps::{emit_window_event, FS_GRANT_V2, TREE_CGROUP_FILES, TREE_MEMBERS, TREE_PENDING};
 
 const EPERM: c_int = 1;
 /// `PROT_EXEC`, `VM_EXEC`.
@@ -111,6 +118,12 @@ const IO_URING_HI_MASK: u64 = 0xff_ffff;
 /// the window's other maps.
 #[map]
 pub static TREE_CLOSED: Array<[u64; 2]> = Array::pinned(1, 0);
+
+/// `SHM_EXEC` (include/uapi/linux/shm.h).
+const SHM_EXEC: u64 = 0o100000;
+
+/// `CLONE_THREAD` (include/uapi/linux/sched.h).
+const CLONE_THREAD: u64 = 0x0001_0000;
 
 /// A variable's length is read here when its head did not hold it (the
 /// helper copies up to the variable's end, the length is all that is used:
@@ -485,10 +498,55 @@ pub extern "C" fn nn_window_class(operation: u64, detail: u64) -> u64 {
     }
 }
 
-/// Whether `target` (a `task_struct`) is a member of the open window and
-/// the calling process is outside the tree and outside the agent's family:
-/// the members' protection (D7). 1 when the access or the signal must be
-/// refused. A global function: `task_kill` and the ptrace guard ask it.
+/// Whether the process `tgid` (its leader `task`'s start) holds an entry of
+/// generation `generation`.
+#[inline(always)]
+unsafe fn holds_entry(tgid: u32, task: *const u8, generation: u64) -> bool {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match TREE_MEMBERS.get(&tgid) {
+            Some(m) if m.generation == generation => {
+                matches!(process_start(task), Some(st) if entry_is_process(m, st))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The fork span's half of the guards (`window_tree::in_tree_span`):
+/// `target` (thread group `ttgid`) is a member's child that has no entry
+/// yet ([`TREE_PENDING`] of generation `generation`), a task still in
+/// `TASK_NEW` (it has not run), or — `parents` — a child of a member (its
+/// `real_parent`'s process holds an entry of the window).
+#[inline(always)]
+unsafe fn target_in_span(target: *const u8, generation: u64, parents: bool) -> bool {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let pending = matches!(TREE_PENDING.get(&(target as u64)), Some(v) if *v == generation);
+        let state = match off_opt!(TASK_STRUCT_STATE_OFFSET) {
+            Some(o) => read_u32(target.add(o)),
+            None => None,
+        };
+        let parent_member = parents
+            && match read_ptr(target.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) {
+                Some(p) => match read_u32(p.add(off!(TASK_STRUCT_TGID_OFFSET))) {
+                    Some(ptgid) => holds_entry(ptgid, p, generation),
+                    None => false,
+                },
+                None => false,
+            };
+        in_tree_span(pending, state, parent_member)
+    }
+}
+
+/// Whether `target` (a `task_struct`) is in the open window's tree — a
+/// member ([`TREE_MEMBERS`], its own process), or in the fork span
+/// ([`target_in_span`]) — and the calling process is outside the tree and
+/// outside the agent's family: the members' protection (D7). The caller is
+/// judged by the lift test ([`member_now`]: a traced or filtered member is
+/// an outsider, and leaves the tree). 1 when the access or the signal must
+/// be refused. A global function: `task_kill`, the ptrace guard, the
+/// limits' and the cgroup move's guards ask it.
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_tree_target_guarded(target: u64) -> u64 {
@@ -498,27 +556,25 @@ pub extern "C" fn nn_tree_target_guarded(target: u64) -> u64 {
         if target.is_null() {
             return 0;
         }
-        let Some(ttgid) = read_u32(target.add(off!(TASK_STRUCT_TGID_OFFSET))) else {
-            return 0;
-        };
-        let Some(m) = TREE_MEMBERS.get(&ttgid) else {
-            return 0;
-        };
-        let s = session();
         let Some(g) = grant_now() else {
             return 0;
         };
-        if !tree_open(&g, bpf_ktime_get_boot_ns(), s) || m.generation != g.generation {
+        let s = session();
+        if !tree_open(&g, bpf_ktime_get_boot_ns(), s) {
             return 0;
         }
-        if !matches!(process_start(target), Some(st) if entry_is_process(&m, st)) {
+        let Some(ttgid) = read_u32(target.add(off!(TASK_STRUCT_TGID_OFFSET))) else {
             return 0;
-        }
+        };
         let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
-        if caller == ttgid || crate::task_kill::is_exempt_pid(caller) || caller_is_member(&g) {
+        if caller == ttgid || crate::task_kill::is_exempt_pid(caller) {
             return 0;
         }
-        1
+        let generation = g.generation;
+        if !holds_entry(ttgid, target, generation) && !target_in_span(target, generation, true) {
+            return 0;
+        }
+        u64::from(member_now() != MEMBER_LIFT)
     }
 }
 
@@ -539,21 +595,54 @@ pub extern "C" fn nn_tree_member_target(target: u64) -> u64 {
         let Some(ttgid) = read_u32(target.add(off!(TASK_STRUCT_TGID_OFFSET))) else {
             return 0;
         };
-        let Some(m) = TREE_MEMBERS.get(&ttgid) else {
-            return 0;
-        };
         let s = session();
         let Some(g) = grant_now() else {
             return 0;
         };
-        if !tree_open(&g, bpf_ktime_get_boot_ns(), s) || m.generation != g.generation {
+        if !tree_open(&g, bpf_ktime_get_boot_ns(), s) {
             return 0;
         }
-        u64::from(matches!(process_start(target), Some(st) if entry_is_process(&m, st)))
+        u64::from(holds_entry(ttgid, target, g.generation) || target_in_span(target, g.generation, false))
     }
 }
 
 // ── the members ─────────────────────────────────────────────────────────
+
+/// `task_alloc(struct task_struct *task, unsigned long clone_flags)`, in
+/// the forking process, before the child is in the pid hash: a member's
+/// new process is a member from here on, by its `task_struct`
+/// ([`TREE_PENDING`]), guarded before it can be named; [`tree_fork`]
+/// confirms it. A thread joins nothing (its process's entry is its own).
+#[lsm(hook = "task_alloc")]
+pub fn tree_task_alloc(ctx: LsmContext) -> i32 {
+    unsafe {
+        let ptgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if TREE_MEMBERS.get(&ptgid).is_none() {
+            return 0;
+        }
+        let _ = nn_tree_pending(raw_arg(&ctx, 0), raw_arg(&ctx, 1));
+    }
+    0
+}
+
+/// [`tree_task_alloc`]'s write, a global function: the child `child` (a
+/// scalar `task_struct` pointer) of a member the window lifts for, unless
+/// `clone_flags` makes it a thread. Always 0.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_tree_pending(child: u64, clone_flags: u64) -> u64 {
+    if child == 0 || clone_flags & CLONE_THREAD != 0 {
+        return 0;
+    }
+    if nn_tree_member_now() != MEMBER_LIFT {
+        return 0;
+    }
+    if let Some(g) = grant_now() {
+        // full: the TASK_NEW and parent guards still hold the span
+        let _ = TREE_PENDING.insert(&child, &g.generation, 0);
+    }
+    0
+}
 
 /// `sched_process_fork(struct task_struct *parent, struct task_struct
 /// *child)`, in the forking process: a member's new process joins the
@@ -573,12 +662,14 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
         if TREE_MEMBERS.get(&ptgid).is_none() {
             return;
         }
-        let v = nn_tree_member_now();
-        if v != MEMBER_LIFT {
-            return;
-        }
         let child = ctx.arg::<*const c_void>(1) as *const u8;
         if child.is_null() {
+            return;
+        }
+        // the span ends here: the entry below, or no membership
+        let _ = TREE_PENDING.remove(&(child as u64));
+        let v = nn_tree_member_now();
+        if v != MEMBER_LIFT {
             return;
         }
         let Some(ctgid) = read_u32(child.add(off!(TASK_STRUCT_TGID_OFFSET))) else {
@@ -673,6 +764,11 @@ pub fn tree_task_free(ctx: LsmContext) -> i32 {
         let task = ctx.arg::<*const c_void>(0) as *const u8;
         if task.is_null() {
             return 0;
+        }
+        // a fork that failed after `task_alloc` (or a task freed before its
+        // confirmation): its span goes, while a tree grant is armed
+        if matches!(grant_now(), Some(g) if g.generation != 0) {
+            let _ = TREE_PENDING.remove(&(task as u64));
         }
         let Some(tgid) = read_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET))) else {
             return 0;
@@ -895,6 +991,26 @@ pub fn tree_mmap_file(ctx: LsmContext) -> i32 {
     0
 }
 
+/// `shm_shmat(struct kern_ipc_perm *perm, char __user *shmaddr, int
+/// shmflg)`: a System V segment attached executable (`SHM_EXEC`) by a
+/// member — `do_shmat` maps it through `do_mmap`, past `mmap_file`, with
+/// `VM_EXEC` from its birth (no `mprotect` follows): judged as anonymous
+/// memory, as an executable mapping of no trusted file is (the review of
+/// #647).
+#[lsm(hook = "shm_shmat")]
+pub fn tree_shmat(ctx: LsmContext) -> i32 {
+    unsafe {
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if TREE_MEMBERS.get(&tgid).is_none() {
+            return 0;
+        }
+        if raw_arg(&ctx, 2) & SHM_EXEC != 0 {
+            let _ = nn_tree_judge_file(0, EVICT_MAP);
+        }
+    }
+    0
+}
+
 /// `file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
 /// unsigned long prot)`: an `mprotect` that makes a mapping executable,
 /// judged on its file (a mapping already executable was judged at its
@@ -953,6 +1069,50 @@ pub fn tree_ptrace(ctx: LsmContext) -> i32 {
             }
         }
         -EPERM
+    }
+}
+
+/// Lot 2.3a (D7, the review of #647): whether the write-open of `inode` (a
+/// scalar pointer) is refused: a `cgroup.kill` or `cgroup.freeze` of the
+/// window root's cgroup or of one above it ([`TREE_CGROUP_FILES`], of this
+/// generation — the agent writes them when it arms the window), while the
+/// window is open, by a caller outside the tree and outside the agent's
+/// family: a member killed or frozen with its cgroup, which no `task_kill`
+/// sees. Signed (`FS_OP_CGROUP_KILL`, `FS_OP_CGROUP_FREEZE`). 1 when
+/// refused. A global function: an array read for any other open while no
+/// tree grant is armed.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_tree_cgroup_file(inode: u64) -> u64 {
+    // SAFETY: the inode is read through the helper only; the maps are this
+    // object's.
+    unsafe {
+        let Some(g) = grant_now() else {
+            return 0;
+        };
+        if g.generation == 0 || inode == 0 {
+            return 0;
+        }
+        let Some(key) = crate::inode_protect::read_inode_key(inode as *const c_void) else {
+            return 0;
+        };
+        let Some(v) = TREE_CGROUP_FILES.get(&key) else {
+            return 0;
+        };
+        let (generation, op) = (v[0], v[1]);
+        if generation != g.generation || !tree_open(g, bpf_ktime_get_boot_ns(), session()) {
+            return 0;
+        }
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if crate::task_kill::is_exempt_pid(caller) || member_now() == MEMBER_LIFT {
+            return 0;
+        }
+        if op == u64::from(FS_OP_CGROUP_FREEZE) {
+            crate::inode_protect::emit_attempt(FS_OP_CGROUP_FREEZE, key);
+        } else {
+            crate::inode_protect::emit_attempt(FS_OP_CGROUP_KILL, key);
+        }
+        1
     }
 }
 

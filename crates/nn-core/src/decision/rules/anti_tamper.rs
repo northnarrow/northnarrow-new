@@ -682,11 +682,55 @@ impl Rule for NnLAt001AntiTamperDenial {
                  window's lift — moved, the paths its binaries, units and keys are found by \
                  would lead to another tree"
             ),
+            // Lot 2.3a (the review of #647): refused only under the
+            // kernel-read option's block-device class; recorded otherwise.
             FsProtectOperation::BdevWrite => format!(
-                "to open for writing a block device that backs the agent's files (device node \
-                 inode {target_dev}:{target_ino}) — its blocks written under the filesystem, \
-                 past every inode hook"
+                "to open for writing a block device that backs the agent's files, or its disk's \
+                 SCSI generic node (device node inode {target_dev}:{target_ino}), under {BDEV_OPTION} \
+                 — its blocks written under the filesystem, past every inode hook"
             ),
+            FsProtectOperation::BdevPassthrough => format!(
+                "to send {} to {}, under {BDEV_OPTION} — the device's own command writes any \
+                 block, past the open's mode and every inode hook",
+                passthrough_command_text(*target_ino),
+                passthrough_device_text(*target_dev)
+            ),
+            FsProtectOperation::BdevWriteNoted => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) opened for writing a block device that backs the \
+                     agent's files, or its disk's SCSI generic node (device node inode \
+                     {target_dev}:{target_ino}): let through and recorded, not refused — the \
+                     kernel refuses it only under {BDEV_OPTION}. Its blocks can be written under \
+                     the filesystem, past every inode hook, the agent's binaries, units and keys \
+                     among them. grub-install, LVM, cryptsetup, tune2fs and resize2fs open a \
+                     mounted disk this way: check that the operator meant it."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
+            FsProtectOperation::BdevPassthroughNoted => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) sent {} to {}: let through and recorded, not refused — \
+                     the kernel refuses it only under {BDEV_OPTION}. The device's own command \
+                     writes any block, past the open's mode and every inode hook, the agent's \
+                     binaries, units and keys among them. A disk tool (smartctl, sg3_utils, \
+                     nvme-cli) sends such commands too: check that the operator meant it.",
+                    passthrough_command_text(*target_ino),
+                    passthrough_device_text(*target_dev)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
             FsProtectOperation::BdevRead => format!(
                 "to open for reading a block device that backs the agent's files (device node \
                  inode {target_dev}:{target_ino}) under the kernel-read option — the agent's \
@@ -734,6 +778,36 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 2.3a (the review of #647): the option under which the kernel refuses
+/// a block device's raw write or command, named as the operator writes it.
+const BDEV_OPTION: &str =
+    "the kernel-read option's block-device class (`kernel-read-refuse block-device` or `all`)";
+
+/// Lot 2.3a (the review of #647): a passthrough record's command
+/// (`target_ino`), in hex with its name.
+fn passthrough_command_text(cmd: u64) -> String {
+    use common::window_tree::{NVME_IOCTL_TYPE, SCSI_IOCTL_SEND_COMMAND, SG_IO};
+    let name = match u32::try_from(cmd) {
+        Ok(SG_IO) => "SG_IO",
+        Ok(SCSI_IOCTL_SEND_COMMAND) => "SCSI_IOCTL_SEND_COMMAND",
+        Ok(c) if (c >> 8) & 0xff == NVME_IOCTL_TYPE => "an NVMe command ioctl",
+        _ => "a passthrough ioctl",
+    };
+    format!("passthrough command {cmd:#x} ({name})")
+}
+
+/// Lot 2.3a (the review of #647): a passthrough record's device
+/// (`target_dev`, the kernel's `MKDEV`: major << 20 | minor), as
+/// major:minor.
+fn passthrough_device_text(dev: u64) -> String {
+    format!(
+        "device {}:{} (a block device that backs the agent's files, or one of its disk's \
+         passthrough nodes: sg, bsg, NVMe generic or controller)",
+        dev >> 20,
+        dev & 0xf_ffff
+    )
 }
 
 /// Lot 2.3a — NN-L-AT-002: every record of the trusted-installer window's
@@ -1770,6 +1844,11 @@ mod tests {
             FsProtectOperation::BdevWrite,
             FsProtectOperation::BdevRead,
             FsProtectOperation::FdReceive,
+            // the review of #647: refused under the option, or let through
+            // and recorded — High either way
+            FsProtectOperation::BdevPassthrough,
+            FsProtectOperation::BdevWriteNoted,
+            FsProtectOperation::BdevPassthroughNoted,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -2332,6 +2411,101 @@ mod tests {
             v.reasoning
         );
         assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    /// Lot 2.3a (named, the review of #647): a block device under the
+    /// agent's files written raw, or sent a passthrough command, is High
+    /// whether the kernel refused it or not, and the record says which — a
+    /// refusal names the option it was refused under (`kernel-read-refuse`,
+    /// its block-device class), a record let through says so and never
+    /// "the kernel refused it". A command's device is its major:minor, the
+    /// command in hex with its name.
+    #[test]
+    fn a_block_device_s_raw_write_or_command_says_whether_the_kernel_refused_it() {
+        let r = |op, dev, ino| {
+            let mut e = denial(op);
+            if let Event::FsProtectDenial {
+                target_dev,
+                target_ino,
+                ..
+            } = &mut e
+            {
+                (*target_dev, *target_ino) = (dev, ino);
+            }
+            NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict")
+        };
+        // /dev/sda (8:0, MKDEV 8 << 20) sent SG_IO; an NVMe namespace
+        // (259:3) sent NVME_IOCTL_IO_CMD (_IOWR('N', 0x43, 72))
+        let sda = 8u64 << 20;
+        let nvme = (259u64 << 20) | 3;
+        for (op, dev, ino, refused, words) in [
+            (
+                FsProtectOperation::BdevWrite,
+                9,
+                709,
+                true,
+                &["for writing a block device", "device node inode 9:709"][..],
+            ),
+            (
+                FsProtectOperation::BdevWriteNoted,
+                9,
+                709,
+                false,
+                &["for writing a block device", "device node inode 9:709"][..],
+            ),
+            (
+                FsProtectOperation::BdevPassthrough,
+                sda,
+                0x2285,
+                true,
+                &["passthrough command 0x2285 (SG_IO)", "device 8:0 "][..],
+            ),
+            (
+                FsProtectOperation::BdevPassthroughNoted,
+                nvme,
+                0xc048_4e43,
+                false,
+                &[
+                    "passthrough command 0xc0484e43 (an NVMe command ioctl)",
+                    "device 259:3 ",
+                ][..],
+            ),
+            (
+                FsProtectOperation::BdevPassthroughNoted,
+                sda,
+                1,
+                false,
+                &["passthrough command 0x1 (SCSI_IOCTL_SEND_COMMAND)"][..],
+            ),
+        ] {
+            let v = r(op, dev, ino);
+            assert_eq!(v.severity, Severity::High, "{op}");
+            assert!(matches!(v.action, ResponseAction::Log), "{op}");
+            for w in words {
+                assert!(v.reasoning.contains(w), "{op}: {w}: {}", v.reasoning);
+            }
+            // the option is named either way: what refuses it, or what would
+            assert!(
+                v.reasoning
+                    .contains("`kernel-read-refuse block-device` or `all`")
+                    && v.reasoning.contains("block-device class"),
+                "{op}: {}",
+                v.reasoning
+            );
+            assert_eq!(
+                v.reasoning.contains("the kernel refused it"),
+                refused,
+                "{op}: {}",
+                v.reasoning
+            );
+            assert_eq!(
+                v.reasoning
+                    .contains("let through and recorded, not refused"),
+                !refused,
+                "{op}: {}",
+                v.reasoning
+            );
+        }
     }
 
     fn window_record(kind: WindowRecordKind, class: WindowClass, detail: u64) -> Event {

@@ -445,9 +445,14 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    refuses outside a window, loaded inside one — `bpf_held_load` High, not \
                    refused — and its later runs and attaches outside a window, through any \
                    descriptor, refused — `bpf_held_use` High). Lot 2.3a: a rename of an \
-                   ancestor of the agent's paths, a write-open of a block device under its \
-                   files (and, under the kernel-read option, a read-open), a descriptor \
-                   received across a trusted-installer window's tree (High); a signal that \
+                   ancestor of the agent's paths, a descriptor received across a \
+                   trusted-installer window's tree (High); a write-open of a block device \
+                   under its files (or of its disk's SCSI generic node) and a passthrough \
+                   command to it or to its disk's sg, bsg or NVMe node (`SG_IO`, an NVMe \
+                   command ioctl) — let through and recorded by default (`bdev_write_noted`, \
+                   `bdev_passthrough_noted`, High, not refused), refused under the kernel-read \
+                   option's block-device class, `kernel-read-refuse` (`bdev_write`, \
+                   `bdev_passthrough`, High, with a read-open: `bdev_read`); a signal that \
                    ends or stops a protected process let through to it — PID 1 under the \
                    window's stop grant or as systemd-shutdown, the agent's family, the process \
                    itself — `fatal_signal`, Low, not refused. Issued by process_event outside \
@@ -469,8 +474,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           longer refused or recorded — the writing thread's check only. Lot \
                           373: the packaged bpftool run by root listing or showing programs or \
                           maps (`prog show`, `map list`, `cgroup tree`) takes a handle by id on \
-                          each of the agent's — refused, recorded Low, no posture. The \
-                          kernel refused the action either way; the record is Log only.",
+                          each of the agent's — refused, recorded Low, no posture. Lot \
+                          2.3a: grub-install, LVM, cryptsetup, tune2fs and resize2fs write the \
+                          disk of a mounted root, and smartctl, sg3_utils or nvme-cli send it \
+                          passthrough commands — let through and recorded High \
+                          (`bdev_write_noted`, `bdev_passthrough_noted`), no posture; refused \
+                          only under `kernel-read-refuse` (block-device class). The record is \
+                          Log only: a refusal already failed, a record let through says so.",
 
         how_to_test: "`kill -9` the agent from a root shell (anti-tamper.sh case C01) or read \
                       /proc/<agent>/mem (case C03): the record names the refused operation \
@@ -479,6 +489,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::a_refused_sigio_names_the_path_and_not_an_arming_process",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::the_window_tree_s_refusals_are_named_and_a_fatal_signal_let_through_is_low",
+            "crates/nn-core/src/decision/rules/anti_tamper.rs::a_block_device_s_raw_write_or_command_says_whether_the_kernel_refused_it",
             "deploy/lab/adversarial/anti-tamper.sh::case C112",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause",

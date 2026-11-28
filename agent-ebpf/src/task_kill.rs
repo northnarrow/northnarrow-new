@@ -46,16 +46,19 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-use crate::btf_offsets::{TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
+use crate::btf_offsets::{TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
 
-/// Lot 2.3a (a new instance): `task` (thread group `tgid`) runs the agent's
-/// or the watchdog's binary, is not that role's live holder, and is in its
-/// first seconds (`northnarrow_common::window_tree::new_instance_protected`):
-/// a new instance between its exec and its registration in
-/// `PROTECTED_PIDS`. Its start is `start_time` (`CLOCK_MONOTONIC`, as
-/// `bpf_ktime_get_ns`); unread, it is protected.
+/// Lot 2.3a (a new instance): `task` (thread group `tgid`; `raw` the same
+/// pointer as a scalar, for the global functions) runs the agent's or the
+/// watchdog's binary, is not that role's live holder, was started for its
+/// role (a child of PID 1 in the role's unit cgroup, lot 374's
+/// `nn_in_role_unit`), and has not registered within its first 60 s
+/// (`northnarrow_common::window_tree::new_instance_protected`): a new
+/// instance between its exec and its registration in `PROTECTED_PIDS`.
+/// Its start is `start_time` (`CLOCK_MONOTONIC`, as `bpf_ktime_get_ns`);
+/// unread, it is protected.
 #[inline(always)]
-fn new_instance(task: *const u8, tgid: u32) -> bool {
+fn new_instance(task: *const u8, raw: u64, tgid: u32) -> bool {
     // SAFETY: `task` is the hook's target task; every read below goes
     // through `bpf_probe_read_kernel`.
     unsafe {
@@ -70,7 +73,17 @@ fn new_instance(task: *const u8, tgid: u32) -> bool {
         let age = bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64)
             .ok()
             .map(|start| bpf_ktime_get_ns().saturating_sub(start));
-        northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, age)
+        let parent_is_init = match bpf_probe_read_kernel::<*const u8>(
+            task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
+        ) {
+            Ok(p) if !p.is_null() => {
+                bpf_probe_read_kernel::<u32>(p.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32) == Ok(1)
+            }
+            _ => false,
+        };
+        let for_role = parent_is_init
+            && crate::window_tree::opaque(crate::bpf_defense::nn_in_role_unit(raw, u64::from(role - 1))) == 1;
+        northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, for_role, age)
     }
 }
 
@@ -301,7 +314,8 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         // watchdog's binary before it registered — not its role's holder, in
         // its first seconds ([`new_instance`]).
         let registered = is_protected_pid(target_tgid);
-        let is_protected = registered || new_instance(target as *const u8, target_tgid);
+        let is_protected =
+            registered || new_instance(target as *const u8, crate::window_tree::raw_arg(ctx, 0), target_tgid);
         let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         if !is_protected {
             // Lot 2.3a (D7): a member of an open tree window, from outside
