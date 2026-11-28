@@ -135,6 +135,9 @@ the source tree.
   (`a_system_binary_behind_a_symlink_runs_as_the_file_it_names`).
 
 ### Changed
+- Lot M8: the pinned Rust toolchain is 1.100.1 (a library-only patch for an
+  `Iterator` inference regression; no codegen change). `rust-version` (1.98)
+  and the eBPF nightly stay.
 - Lot 396 (#607): Rust edition 2024 for the workspace, `fuzz/` and
   `agent-ebpf/`. No behaviour change and no dependency moved. The eBPF
   object's programs were checked on the five lab kernels against rc15's
