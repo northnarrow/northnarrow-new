@@ -4644,4 +4644,101 @@ mod tests {
             ]
         );
     }
+
+    /// Lot 2.3a (the review of #647): the directories of our units' links,
+    /// and `multi-user.target.wants` even when no link is there yet; and
+    /// the names the kernel keeps are the agent's list.
+    #[test]
+    fn the_enablement_directories_are_kept_by_name() {
+        let list = |p: &Path| -> Vec<String> {
+            match p.to_str().unwrap() {
+                "/etc/systemd/system" => vec![
+                    "multi-user.target.wants".into(),
+                    "default.target.requires".into(),
+                    "sockets.target.wants".into(),
+                ],
+                "/etc/systemd/system/default.target.requires" => {
+                    vec!["northnarrow-agent.service".into()]
+                }
+                _ => vec!["ssh.service".into()],
+            }
+        };
+        assert_eq!(
+            enablement_dirs(Path::new("/etc/systemd/system"), &list),
+            vec![
+                PathBuf::from("/etc/systemd/system/default.target.requires"),
+                PathBuf::from("/etc/systemd/system/multi-user.target.wants"),
+            ]
+        );
+        let names: Vec<&[u8]> = ENABLEMENT_LINK_NAMES.iter().map(|n| n.as_bytes()).collect();
+        assert_eq!(names, common::window_tree::UNIT_LINK_NAMES.to_vec());
+    }
+
+    /// Lot 2.3a (the review of #647): a disk's passthrough nodes — sg, bsg,
+    /// the NVMe controller and its generic nodes — and none for a partition.
+    #[test]
+    fn a_disk_s_passthrough_nodes_are_found_in_sysfs() {
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "/sys/dev/block/8:0/device/scsi_generic/sg0/dev" => Some("21:0\n".into()),
+                "/sys/dev/block/8:0/device/bsg/0:0:0:0/dev" => Some("244:0\n".into()),
+                "/sys/dev/block/259:0/device/dev" => Some("240:0\n".into()),
+                "/sys/dev/block/259:0/device/ng0n1/dev" => Some("242:0\n".into()),
+                "/sys/dev/block/8:1/partition" => Some("1\n".into()),
+                _ => None,
+            }
+        };
+        let list = |p: &str| -> Vec<String> {
+            match p {
+                "/sys/dev/block/8:0/device/scsi_generic" => vec!["sg0".into()],
+                "/sys/dev/block/8:0/device/bsg" => vec!["0:0:0:0".into()],
+                "/sys/dev/block/259:0/device" => vec!["ng0n1".into(), "nvme0n1".into(), "power".into()],
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(passthrough_nodes((8, 0), &read, &list), vec![(21, 0), (244, 0)]);
+        assert_eq!(passthrough_nodes((259, 0), &read, &list), vec![(240, 0), (242, 0)]);
+        assert!(passthrough_nodes((8, 1), &read, &list).is_empty());
+        assert!(passthrough_nodes((253, 0), &read, &list).is_empty());
+    }
+
+    /// Lot 2.3a (K4, the review of #647: fail-closed): a key file kept
+    /// passes; one whose inode is new is registered; one missing, or whose
+    /// registration fails, is named (a tree window refused).
+    #[test]
+    fn the_key_files_must_be_kept_for_a_tree_window() {
+        use common::wire::{INODE_EXT_NO_RENAME, INODE_EXT_WINDOW_KEPT};
+        let etc = Path::new("/etc/northnarrow");
+        let k = |ino| InodeKey { dev: 8, ino };
+        let key_of = |p: &Path| match p.file_name().unwrap().to_str().unwrap() {
+            "admin.pub" => Some(k(10)),
+            "agent.sig.key" => Some(k(11)),
+            _ => None,
+        };
+        // both kept
+        let get = |q: &InodeKey| (q.ino == 10 || q.ino == 11).then_some(INODE_EXT_WINDOW_KEPT);
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { panic!("nothing to register") };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        // the key bootstrapped after the start (or rotated): registered here
+        let get = |q: &InodeKey| (q.ino == 10).then_some(INODE_EXT_WINDOW_KEPT | INODE_EXT_NO_RENAME);
+        let mut written = Vec::new();
+        let mut ins = |q: &InodeKey, v: u8| -> Result<()> {
+            written.push((*q, v));
+            Ok(())
+        };
+        assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
+        assert_eq!(written, vec![(k(11), INODE_EXT_WINDOW_KEPT)]);
+        // a registration that fails, and a key file missing: named
+        let get = |_: &InodeKey| None;
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Err(anyhow!("map full")) };
+        let m = key_files_not_kept_with(etc, &key_of, &get, &mut ins);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().all(|l| l.contains("not registered") && l.contains("K4")), "{m:?}");
+        let none = |_: &Path| None;
+        let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Ok(()) };
+        let m = key_files_not_kept_with(etc, &none, &get, &mut ins);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m[0].contains("admin.pub") && m[0].contains("not found"), "{m:?}");
+    }
+
 }

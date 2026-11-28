@@ -76,7 +76,8 @@ use northnarrow_common::window_tree::{
     EVICT_FULL, EVICT_MAP, EVICT_TRACED, MEMBER_LIFT, MEMBER_NONE,
 };
 use northnarrow_common::wire::{
-    start_ticks, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED,
+    start_ticks, FsGrantV2, InodeKey, TreeMember, DENIAL_WINDOW_EXEC_EVICTED, FS_OP_CGROUP_FREEZE,
+    FS_OP_CGROUP_KILL,
     DENIAL_WINDOW_NONE, DENIAL_WINDOW_OUTSIDER, FS_OP_FD_RECEIVE, FS_OP_PTRACE,
     WINDOW_EVENT_CLOSE, WINDOW_EVENT_EVICTION, WINDOW_EVENT_OUTSIDER_REFUSED,
 };
@@ -1106,7 +1107,11 @@ pub extern "C" fn nn_tree_cgroup_file(inode: u64) -> u64 {
         if crate::task_kill::is_exempt_pid(caller) || member_now() == MEMBER_LIFT {
             return 0;
         }
-        crate::inode_protect::emit_attempt(op as u8, key);
+        if op == u64::from(FS_OP_CGROUP_FREEZE) {
+            crate::inode_protect::emit_attempt(FS_OP_CGROUP_FREEZE, key);
+        } else {
+            crate::inode_protect::emit_attempt(FS_OP_CGROUP_KILL, key);
+        }
         1
     }
 }

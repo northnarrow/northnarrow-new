@@ -931,21 +931,70 @@ fn the_ancestors_and_the_block_devices_are_judged() {
         body(&i, "try_protected_open_deny"),
         &[
             "refuse_memory_view(file, inode)",
-            "if crate::window_tree::opaque(nn_bdev_open(inode as u64, u64::from(f_mode & FMODE_WRITE != 0))) != 0 {\n            return -EPERM;\n        }",
+            "let access = if f_mode & FMODE_WRITE != 0 {\n            northnarrow_common::window_tree::BDEV_ACCESS_WRITE",
+            "if crate::window_tree::opaque(nn_bdev_raw(inode as u64, u64::from(access), 0)) != 0 {\n            return -EPERM;\n        }",
             "if f_mode & FMODE_WRITE == 0 {",
+            // lot 2.3a (D7, the review of #647): a member's cgroup.kill/freeze
+            "crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open)",
+            "if crate::window_tree::opaque(crate::window_tree::nn_tree_cgroup_file(inode_s)) != 0 {\n            return -EPERM;\n        }",
         ],
     )
     .unwrap();
+    // the review of #647: recorded by default, refused under the option —
+    // one verdict for a block node and its disk's passthrough nodes
     in_order(
-        body(&i, "nn_bdev_open"),
+        body(&i, "nn_bdev_raw"),
         &[
-            "m & S_IFMT == S_IFBLK",
+            "Ok(m) if m & S_IFMT == S_IFBLK => true,",
+            "Ok(m) if m & S_IFMT == S_IFCHR => false,",
             "off_opt!(INODE_I_RDEV_OFFSET)",
             "PROTECTED_BDEVS.get(&rdev)",
             "is_exempt_pid(",
             "KREAD_SLOT_MASK",
-            "bdev_open_refusal(entry, write != 0, mask, override_active())",
+            "northnarrow_common::window_tree::bdev_verdict(",
+            "northnarrow_common::window_tree::bdev_entry_bit(block),",
+            "override_active(),",
             "emit_attempt(op, key);",
+            "u64::from(northnarrow_common::window_tree::bdev_refuses(op))",
+        ],
+    )
+    .unwrap();
+    // a passthrough command judged before the chattr family's fast return
+    in_order(
+        body(&i, "try_file_ioctl"),
+        &[
+            "if northnarrow_common::window_tree::is_passthrough_ioctl(cmd) {",
+            "nn_bdev_raw(inode, access, u64::from(cmd))",
+            "return -EPERM;",
+            "if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {",
+        ],
+    )
+    .unwrap();
+    // our units' links, by name, in their directories: removed or renamed
+    in_order(
+        body(&i, "try_inode_unlink"),
+        &["nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))", "return -EPERM;"],
+    )
+    .unwrap();
+    in_order(
+        body(&i, "try_inode_rename"),
+        &[
+            "nn_unit_link(crate::window_tree::raw_arg(ctx, 0), old_s, rename)",
+            "nn_unit_link(crate::window_tree::raw_arg(ctx, 2), new_s, rename)",
+            "return -EPERM;",
+            "nn_ancestor_rename(old_s)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&i, "nn_unit_link"),
+        &[
+            "INODE_EXT.get(&key)",
+            "Ok(i) if i != 0 => {}",
+            "is_unit_link_name(&w)",
+            "unit_link_verdict(Some(ext), ours, override_active(), family)",
+            "emit_attempt(FS_OP_UNLINK, key);",
+            "emit_attempt(FS_OP_RENAME, key);",
         ],
     )
     .unwrap();
@@ -965,7 +1014,7 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
         body(&t, "try_task_kill"),
         &[
             "let registered = is_protected_pid(target_tgid);",
-            "let is_protected = registered || new_instance(target as *const u8, target_tgid);",
+            "registered || new_instance(target as *const u8, crate::window_tree::raw_arg(ctx, 0), target_tgid);",
             "if !is_protected {",
             "crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(crate::window_tree::raw_arg(ctx, 0))) != 0",
             "&& !(caller_tgid == 1 && pid1_is_final_shutdown())",
@@ -988,7 +1037,10 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
             "let holder = crate::bpf_defense::ROLE_TGIDS.get(u32::from(role - 1)).copied();",
             "task.add(off!(TASK_STRUCT_START_TIME_OFFSET))",
             ".map(|start| bpf_ktime_get_ns().saturating_sub(start));",
-            "northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, age)",
+            // the review of #647: systemd's start of the role's unit only
+            "== Ok(1)",
+            "crate::bpf_defense::nn_in_role_unit(raw, u64::from(role - 1))) == 1;",
+            "northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, for_role, age)",
         ],
     )
     .unwrap();
@@ -1017,11 +1069,18 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
     in_order(
         body(&w, "nn_tree_target_guarded"),
         &[
-            "TREE_MEMBERS.get(&ttgid)",
-            "!tree_open(&g, bpf_ktime_get_boot_ns(), s) || m.generation != g.generation",
-            "entry_is_process(&m, st)",
-            "if caller == ttgid || crate::task_kill::is_exempt_pid(caller) || caller_is_member(&g) {",
+            "!tree_open(&g, bpf_ktime_get_boot_ns(), s)",
+            "if caller == ttgid || crate::task_kill::is_exempt_pid(caller) {",
+            // a member of this generation, its own process, or in the fork span
+            "!holds_entry(ttgid, target, generation)",
+            // the review of #647: the caller judged by the lift test
+            "u64::from(member_now() != MEMBER_LIFT)",
         ],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "holds_entry"),
+        &["TREE_MEMBERS.get(&tgid)", "m.generation == generation", "entry_is_process(m, st)"],
     )
     .unwrap();
 }
@@ -1074,8 +1133,13 @@ fn the_tree_s_global_functions_are_called_with_scalars_and_read_opaque() {
     for (file, call) in [
         ("agent-ebpf/src/inode_protect.rs", "nn_window_lift("),
         ("agent-ebpf/src/inode_protect.rs", "nn_ancestor_rename("),
-        ("agent-ebpf/src/inode_protect.rs", "nn_bdev_open("),
+        ("agent-ebpf/src/inode_protect.rs", "nn_bdev_raw("),
+        ("agent-ebpf/src/inode_protect.rs", "nn_unit_link("),
+        ("agent-ebpf/src/inode_protect.rs", "nn_tree_cgroup_file("),
         ("agent-ebpf/src/task_kill.rs", "nn_tree_target_guarded("),
+        ("agent-ebpf/src/task_kill.rs", "nn_in_role_unit("),
+        ("agent-ebpf/src/task_limits.rs", "nn_tree_target_guarded("),
+        ("agent-ebpf/src/cgroup_guard.rs", "nn_tree_target_guarded("),
         ("agent-ebpf/src/sigio_guard.rs", "nn_tree_member_target("),
     ] {
         let c = code(file);
@@ -1128,4 +1192,125 @@ fn the_tree_programs_are_listed() {
         assert!(names.lines().any(|l| l == p), "{p}");
     }
     assert!(code("agent-ebpf/src/main.rs").contains("mod window_tree;"));
+}
+
+/// Lot 2.3a (the review of #647): the fork span — a member's child is a
+/// member from `task_alloc` on (by its `task_struct`), confirmed at
+/// `sched_process_fork`, its span dropped at the free; the guards also hold
+/// a task in `TASK_NEW` and a member's child; the caller is judged by the
+/// lift test (a traced member is an outsider); a record of what was let
+/// through takes no window class; an executable SysV segment is judged.
+#[test]
+fn the_fork_span_and_a_traced_caller_are_guarded_and_let_throughs_take_no_class() {
+    let w = code("agent-ebpf/src/window_tree.rs");
+    in_order(
+        body(&w, "tree_task_alloc"),
+        &["TREE_MEMBERS.get(&ptgid).is_none()", "nn_tree_pending(raw_arg(&ctx, 0), raw_arg(&ctx, 1))"],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "nn_tree_pending"),
+        &[
+            "clone_flags & CLONE_THREAD != 0",
+            "nn_tree_member_now() != MEMBER_LIFT",
+            "TREE_PENDING.insert(&child, &g.generation, 0)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "try_fork"),
+        &[
+            "let _ = TREE_PENDING.remove(&(child as u64));",
+            "let v = nn_tree_member_now();",
+            "TREE_MEMBERS.insert(&ctgid, &entry, 0)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "tree_task_free"),
+        &["let _ = TREE_PENDING.remove(&(task as u64));", "read_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)))"],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "target_in_span"),
+        &[
+            "TREE_PENDING.get(&(target as u64))",
+            "off_opt!(TASK_STRUCT_STATE_OFFSET)",
+            "TASK_STRUCT_REAL_PARENT_OFFSET",
+            "holds_entry(ptgid, p, generation)",
+            "in_tree_span(pending, state, parent_member)",
+        ],
+    )
+    .unwrap();
+    let g = body(&w, "nn_tree_target_guarded");
+    in_order(
+        g,
+        &[
+            "caller == ttgid || crate::task_kill::is_exempt_pid(caller)",
+            "!holds_entry(ttgid, target, generation) && !target_in_span(target, generation, true)",
+            "u64::from(member_now() != MEMBER_LIFT)",
+        ],
+    )
+    .unwrap();
+    assert!(!g.contains("caller_is_member"), "the caller is judged by the lift test");
+    assert!(body(&w, "nn_tree_member_target").contains("target_in_span(target, g.generation, false)"));
+    in_order(
+        body(&w, "tree_shmat"),
+        &["raw_arg(&ctx, 2) & SHM_EXEC != 0", "nn_tree_judge_file(0, EVICT_MAP)"],
+    )
+    .unwrap();
+    in_order(
+        body(&w, "nn_tree_cgroup_file"),
+        &[
+            "TREE_CGROUP_FILES.get(&key)",
+            "generation != g.generation || !tree_open(g, bpf_ktime_get_boot_ns(), session())",
+            "crate::task_kill::is_exempt_pid(caller) || member_now() == MEMBER_LIFT",
+            "emit_attempt(FS_OP_CGROUP_FREEZE, key);",
+            "emit_attempt(FS_OP_CGROUP_KILL, key);",
+        ],
+    )
+    .unwrap();
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    in_order(
+        body(&i, "emit_denial"),
+        &[
+            "if northnarrow_common::window_tree::window_classes(operation) {",
+            "crate::window_tree::nn_window_class(u64::from(operation), key.ino) as u8",
+            "northnarrow_common::wire::DENIAL_WINDOW_NONE",
+            "FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0)",
+        ],
+    )
+    .unwrap();
+    // D7: a member's limits and its cgroup move, from outside its tree
+    let l = code("agent-ebpf/src/task_limits.rs");
+    in_order(
+        body(&l, "task_setrlimit_deny"),
+        &[
+            "refuse_task_change(task, FS_OP_RLIMIT, resource as u64, hook::TASK_SETRLIMIT)",
+            "nn_tree_target_guarded(crate::window_tree::raw_arg(&ctx, 0))",
+            "emit_task_denial(FS_OP_RLIMIT, resource as u64, tgid);\n            return -EPERM;",
+        ],
+    )
+    .unwrap();
+    let c = code("agent-ebpf/src/cgroup_guard.rs");
+    in_order(
+        body(&c, "try_cgroup_move_stash"),
+        &[
+            "if crate::task_kill::is_protected_pid(tgid) {",
+            "} else if crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(task)) == 0 {",
+            "CGROUP_MOVES.insert(&pid_tgid, &rec, 0)",
+        ],
+    )
+    .unwrap();
+    // the tree's programs and the manifest's fields, in the attach list
+    let a = code("crates/nn-linux/src/anti_tamper/window_tree.rs");
+    for p in [
+        "(\"tree_task_alloc\", Kind::Lsm, \"task_alloc\")",
+        "(\"tree_shmat\", Kind::Lsm, \"shm_shmat\")",
+        "\"TASK_STRUCT_STATE_OFFSET\"",
+        "\"VM_AREA_STRUCT_VM_FLAGS_OFFSET\"",
+        "super::filesystem::key_files_not_kept(root)",
+    ] {
+        assert!(a.contains(p), "{p}");
+    }
 }

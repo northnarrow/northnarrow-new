@@ -3142,7 +3142,7 @@ mod tests {
     /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
     /// of the agent's programs is its own; anything else named `link_*` is
     /// reported, not registered — 70 of them no longer overflow the
-    /// 64-entry `OWN_PIN_NAMES` and refuse the start. Lot 301: every entry
+    /// `OWN_PIN_NAMES` (64 entries then, 128 since lot 2.3a) and refuse the start. Lot 301: every entry
     /// of the pin directories is judged, whatever its name (the root's
     /// `prog_task_kill` that is no BPF object is reported too), a directory
     /// is walked, not reported.

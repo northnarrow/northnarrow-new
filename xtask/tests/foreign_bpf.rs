@@ -1717,3 +1717,27 @@ fn a_shared_writable_mapping_of_a_protected_file_is_refused_in_a_window_too() {
         "if file != 0 && matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE) && nn_shared_map_refused(file) == 1 {\n            return -EPERM;\n        }"
     ));
 }
+
+/// Lot 2.3a: every pin a start makes under the pin root exists before the
+/// census of the agent's own objects (`register_own_objects`) — the tree
+/// window's programs too. Attached after it, a restart (an upgrade, a
+/// respawn, the privileged suites' second fixture) found the previous
+/// start's `prog_tree_*` and `link_tree_*` pins with their programs not
+/// loaded yet: twenty `foreign_pin` findings held at every restart (the
+/// status's sixteen lines filled, the findings after them only counted),
+/// and the tree's link names missing from `OWN_PIN_NAMES`, frozen there.
+#[test]
+fn the_tree_window_s_pins_exist_before_the_census_of_own_objects() {
+    let at = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        body(&at, "attach_reporting"),
+        &[
+            "bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root)",
+            "bpf_defense::zero_window_maps(ebpf)",
+            "window_tree::attach(ebpf, &btf, pin_root)",
+            "bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root, own)",
+            "filesystem::register_bpffs_pins(ebpf, root)",
+        ],
+    )
+    .unwrap();
+}

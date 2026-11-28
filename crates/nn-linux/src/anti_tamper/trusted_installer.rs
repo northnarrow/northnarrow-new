@@ -880,7 +880,11 @@ impl TrustedInstallerOverride {
         }
         // 1b. (lot 2.3a, D7) the root's cgroup files: an outsider's
         // `cgroup.kill` / `cgroup.freeze` of the members' cgroup refused
-        for (key, op) in reader.cgroup_files(root.0) {
+        let files = match reader.cgroup_files(root.0) {
+            Ok(f) => f,
+            Err(e) => return Err(withdrawn(maps, format!("the root's cgroup files: {e}"))),
+        };
+        for (key, op) in files {
             if let Err(e) = maps.put_cgroup_file(key, [generation, u64::from(op)]) {
                 return Err(withdrawn(
                     maps,
@@ -1138,9 +1142,10 @@ pub trait LineReader {
     /// `cgroup.freeze` of its cgroup of the unified hierarchy and of every
     /// cgroup above it but the root ([`cgroup_file_plan`]), by inode, each
     /// with its operation (`FS_OP_CGROUP_KILL`, `FS_OP_CGROUP_FREEZE`); a
-    /// file this kernel does not have is skipped.
-    fn cgroup_files(&self, _pid: u32) -> Vec<(InodeKey, u8)> {
-        Vec::new()
+    /// file this kernel does not have is skipped; its `cgroup` file not
+    /// read is an error (the grant refused: fail closed).
+    fn cgroup_files(&self, _pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -1188,14 +1193,14 @@ impl LineReader for ProcFs<'_> {
         parse_guards(&status).ok_or_else(|| format!("/proc/{pid}/status: no TracerPid or Seccomp"))
     }
 
-    fn cgroup_files(&self, pid: u32) -> Vec<(InodeKey, u8)> {
-        let Ok(text) = crate::state_read::read_state(self.0.join(pid.to_string()).join("cgroup")) else {
-            return Vec::new();
-        };
+    fn cgroup_files(&self, pid: u32) -> std::result::Result<Vec<(InodeKey, u8)>, String> {
+        let text = crate::state_read::read_state(self.0.join(pid.to_string()).join("cgroup"))
+            .map_err(|e| format!("/proc/{pid}/cgroup: {e}"))?;
+        // no unified hierarchy: no cgroup.kill nor cgroup.freeze to guard
         let Some(cg) = unified_cgroup(&text) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        cgroup_file_plan(Path::new("/sys/fs/cgroup"), cg)
+        Ok(cgroup_file_plan(Path::new("/sys/fs/cgroup"), cg)
             .into_iter()
             .filter_map(|(p, op)| {
                 let m = antitamper_bpf::kernel_roots::metadata(&p).ok()?;
@@ -1207,7 +1212,7 @@ impl LineReader for ProcFs<'_> {
                     op,
                 ))
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -2402,4 +2407,33 @@ mod tests {
         assert_eq!(rows[3]["result"], "closed: ttl_expired");
         assert_eq!(rows[3]["extra"]["members_cleared"], 3);
     }
+
+    /// Lot 2.3a (D7, the review of #647): the root's cgroup and every cgroup
+    /// above it but the hierarchy's root, `cgroup.kill` and `cgroup.freeze`.
+    #[test]
+    fn the_root_s_cgroup_files_are_its_cgroup_s_and_its_ancestors() {
+        let root = Path::new("/sys/fs/cgroup");
+        let plan = cgroup_file_plan(root, "/user.slice/user-0.slice/session-3.scope\n");
+        let kill = common::wire::FS_OP_CGROUP_KILL;
+        let freeze = common::wire::FS_OP_CGROUP_FREEZE;
+        let p = |s: &str| PathBuf::from(format!("/sys/fs/cgroup/{s}"));
+        assert_eq!(
+            plan,
+            vec![
+                (p("user.slice/user-0.slice/session-3.scope/cgroup.kill"), kill),
+                (p("user.slice/user-0.slice/session-3.scope/cgroup.freeze"), freeze),
+                (p("user.slice/user-0.slice/cgroup.kill"), kill),
+                (p("user.slice/user-0.slice/cgroup.freeze"), freeze),
+                (p("user.slice/cgroup.kill"), kill),
+                (p("user.slice/cgroup.freeze"), freeze),
+            ]
+        );
+        assert!(cgroup_file_plan(root, "/").is_empty(), "the root has neither file");
+        assert_eq!(
+            unified_cgroup("12:pids:/x\n0::/system.slice/apt.service\n"),
+            Some("/system.slice/apt.service")
+        );
+        assert_eq!(unified_cgroup("1:name=systemd:/x\n"), None);
+    }
+
 }

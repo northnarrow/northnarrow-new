@@ -57,7 +57,10 @@ fn the_move_guard_records_only_a_refusable_move_and_refuses_its_check() {
             "args.add(CGROUP_MOVE_RET_ARG)",
             "task >= 0u64.wrapping_sub(MAX_ERRNO)",
             "off!(TASK_STRUCT_TGID_OFFSET)",
-            "if !crate::task_kill::is_protected_pid(tgid)\n            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)\n            || crate::inode_protect::override_active()\n        {\n            return;\n        }",
+            // lot 2.3a (D7, the review of #647): a protected process moved
+            // by a caller outside the family, outside a window; or a member of
+            // an open tree window moved from outside its tree
+            "if crate::task_kill::is_protected_pid(tgid) {\n            if crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32) || crate::inode_protect::override_active() {\n                return;\n            }\n        } else if crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(task)) == 0 {\n            return;\n        }",
             "if CGROUP_MOVES.insert(&pid_tgid, &rec, 0).is_err() {",
             "crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);",
         ],

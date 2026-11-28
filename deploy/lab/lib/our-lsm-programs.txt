@@ -81,4 +81,6 @@ tree_fd_receive
 tree_mmap_file
 tree_mprotect
 tree_ptrace
+tree_shmat
+tree_task_alloc
 tree_task_free

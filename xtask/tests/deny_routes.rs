@@ -385,6 +385,38 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         "try_file_ioctl",
         1,
         Enforced(
+            "a passthrough command (SG_IO, an NVMe command) to a disk under the agent's files or its sg, bsg or NVMe node, under the kernel-read option's block-device class — a write of any block past the descriptor's mode; recorded otherwise (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_unlink",
+        1,
+        Enforced(
+            "the removal of an entry named after our units in a directory of their enablement links, a link made after the start included: the units not started at the next boot (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rename",
+        1,
+        Enforced(
+            "the rename, out of or over, of an entry named after our units in a directory of their enablement links (lot 2.3a, the review of #647)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Enforced(
+            "an outsider's write-open of the cgroup.kill or cgroup.freeze of an open tree window's root's cgroup or one above it: its members killed or frozen with their cgroup, no task_kill sees it (lot 2.3a, D7)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_file_ioctl",
+        1,
+        Enforced(
             "a perf event's PERF_EVENT_IOC_SET_BPF, outside a window, of a program held at a window's load: a kprobe calling bpf_send_signal attached with no bpf(2) command (the review of #558, F1)",
         ),
     ),
@@ -405,7 +437,7 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         "try_protected_open_deny",
         1,
         Enforced(
-            "a foreign write-open of a block device that backs the agent's files (its key's blocks under the page cache), a read-open under the kernel-read option (lot 2.3a)",
+            "a foreign write-open of a block device that backs the agent's files (its key's blocks under the page cache), or of its disk's sg node, refused under the kernel-read option's block-device class as its read-open is, recorded otherwise (lot 2.3a, the review of #647)",
         ),
     ),
     (
@@ -502,6 +534,14 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         ),
     ),
     ("task_limits.rs", "task_setrlimit_deny", 1, Enforced(AGENT)),
+    (
+        "task_limits.rs",
+        "task_setrlimit_deny",
+        1,
+        Enforced(
+            "an outsider's resource limit on a member of an open tree window: an RLIMIT_CPU below its use is a SIGKILL no task_kill sees, mid-install (lot 2.3a, D7)",
+        ),
+    ),
     (
         "task_limits.rs",
         "task_setscheduler_deny",

@@ -959,7 +959,11 @@ pub extern "C" fn nn_unit_link(dir: u64, dentry: u64, operation: u64) -> u64 {
         if !northnarrow_common::window_tree::unit_link_verdict(Some(ext), ours, override_active(), family) {
             return 0;
         }
-        emit_attempt(operation as u8, key);
+        if operation == u64::from(FS_OP_UNLINK) {
+            emit_attempt(FS_OP_UNLINK, key);
+        } else {
+            emit_attempt(FS_OP_RENAME, key);
+        }
         1
     }
 }
@@ -1338,7 +1342,8 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         }
         // Lot 2.3a (D7, the review of #647): the `cgroup.kill` or
         // `cgroup.freeze` of an open tree window's members, from outside it.
-        if crate::window_tree::opaque(crate::window_tree::nn_tree_cgroup_file(inode as u64)) != 0 {
+        let inode_s = inode as u64;
+        if crate::window_tree::opaque(crate::window_tree::nn_tree_cgroup_file(inode_s)) != 0 {
             return -EPERM;
         }
         0

@@ -2488,4 +2488,21 @@ mod tests {
             assert!(found.iter().any(|x| x.contains(words)), "{line}: {found:?}");
         }
     }
+
+    /// Lot 2.3a (K4, the review of #647): the key files' directory is kept
+    /// by any window (`MG_KEPT`), on top of being the agent's own; no other
+    /// point is.
+    #[test]
+    fn the_key_directory_is_the_only_point_a_window_keeps() {
+        let pts = protected_points(Some(Path::new("/sys/fs/bpf/northnarrow")), &|_| true);
+        let kept: Vec<&str> = pts
+            .iter()
+            .filter(|(_, f)| f & MG_KEPT != 0)
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(kept, vec![CONFIG_DIR]);
+        let f = pts.iter().find(|(p, _)| p == CONFIG_DIR).unwrap().1;
+        assert_eq!(f & (MG_OWN | MG_HOLD | MG_KEPT), MG_OWN | MG_HOLD | MG_KEPT);
+    }
+
 }
