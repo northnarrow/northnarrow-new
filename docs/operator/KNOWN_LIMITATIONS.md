@@ -1387,6 +1387,21 @@ lists the known false positives of each rule.
   acts on the `modprobe`). *Evidence:* lot 1.10;
   `deploy/lab/expected-failures.tsv`; internal check Phase 8 §7 (residual
   R066).
+- **AlmaLinux 9: a module the kernel asks for after the agent's start is
+  refused, the isolation's own included.** For the same reason (kmod hands
+  the kernel a buffer), the module-load judge's default mode refuses every
+  module loaded on demand once the agent runs, outside a trusted-installer
+  window (`RULE_POLICY.md` §2.4: an `init_module` buffer is never trusted).
+  COMBAT's isolation needs netfilter modules that a host with no firewall
+  running has not loaded since its boot — on 5.14 el9 at least
+  `nft_counter`, for every rule `iptables-restore` writes — and without
+  them it fails: `isolation NOT in place`, the host not isolated, signed,
+  the ladder retrying. *For you:* on such a host load them at boot, before
+  the agent starts (`/etc/modules-load.d/`; a running `firewalld` loads
+  them too). *Evidence:* lot M9 (the AlmaLinux 9 lab: after a cold boot
+  with only `nf_tables` loaded, `e2e_force_combat_then_unlock_via_cli`
+  never reached ISOLATE on `v0.1.1-alpha`'s tree and on the lot's; with
+  `nft_counter` loaded beforehand it passed).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
   active LSM list, bpffs at `/sys/fs/bpf`, systemd, `nft`. Without the BPF
   LSM the agent refuses to start. Only the override
