@@ -15431,3 +15431,22 @@ no level changed.
   flows keep the host-wide window until lots 2.3b and 2.4. The lot's full
   note, its lab and its gates are in its PR, for the stage's documents
   lot.
+- **Lot 2.3b — the trusted-installer window per process tree, the user
+  flows (stage S2, lane K; no level change).** `nn-admin window-run --
+  <command>` opens a window for that command's process tree only (its
+  environment sanitised, stdin `/dev/null` unless `--interactive`, which is
+  refused where `TIOCSTI` is open to everyone and degraded elsewhere); the
+  agent admits only three kinds of root (the installed `nn-admin`, our
+  `install.sh` by its signed digest, a package manager running our
+  scriptlet), through pidfds, each refusal signed. Inside the window a
+  member stops or restarts the agent through the agent (`window-stop`; the
+  watchdog stands down on the window's signed grant) and leases PID 1 one
+  removal of an enablement link (`window-lease`); the system's code is
+  frozen against outsiders (programs, libraries, the loader's
+  configuration, the package managers' hooks, systemd's configuration,
+  `binfmt_misc`), PID 1's environment is watched, and foreign hooks or
+  loader configuration refuse the window before it opens. Two new
+  programs: the eBPF object holds 148. `trusted-installer-grant` (the
+  host-wide window) is deprecated; `install.sh` and the package scriptlets
+  move in lot 2.4. The lot's full note, its lab and its gates are in its
+  PR, for the stage's documents lot.

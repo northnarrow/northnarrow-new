@@ -1140,8 +1140,7 @@ impl TrustedInstallerOverride {
     fn pid1_env_at_close(&self, reader: &dyn LineReader, at_grant: &[String]) {
         match reader.pid1_env() {
             Ok(now) if nn_core::anti_tamper::trusted_installer::pid1_env_changed(at_grant, &now) => {
-                self.report_high(
-                    PID1_ENV_CHANGED,
+                self.report_pid1_env(
                     &format!(
                         "PID 1's manager environment changed during the window (seen at its \
                          close): {} variable(s) at the grant, {} now",
@@ -1292,17 +1291,18 @@ impl TrustedInstallerOverride {
             ),
             Err(e) => format!("PID 1's manager environment could not be read at {when}: {e}"),
         };
-        self.report_high(PID1_ENV_CHANGED, &why);
+        self.report_pid1_env(&why);
         self.close_tree_with(maps, "pid1_environment_changed")
     }
 
-    /// A High finding of the window (`kind`), signed in the audit chain.
-    fn report_high(&self, kind: &'static str, detail: &str) {
+    /// PID 1's environment changed during the window: a High finding
+    /// ([`PID1_ENV_CHANGED`]), signed in the audit chain.
+    fn report_pid1_env(&self, detail: &str) {
         let audit = self.audit.lock().clone();
         crate::self_integrity::report_event(
             audit.as_ref(),
             &crate::self_integrity::Finding {
-                kind,
+                kind: PID1_ENV_CHANGED,
                 detail: detail.to_string(),
             },
         );
@@ -1826,12 +1826,12 @@ impl LineReader for ProcFs<'_> {
     }
 
     fn ns_initial(&self, pid: u32) -> std::result::Result<bool, String> {
-        use std::os::unix::fs::MetadataExt;
         for ns in ["pid", "user", "mnt"] {
+            // the namespace's own inode, through the link (lot 366's reader)
             let id = |p: &str| {
-                std::fs::metadata(self.0.join(p).join("ns").join(ns))
-                    .map(|m| (m.dev(), m.ino()))
-                    .map_err(|e| format!("/proc/{p}/ns/{ns}: {e}"))
+                antitamper_bpf::kernel_roots::link_target(&self.0.join(p).join("ns").join(ns))
+                    .map(|(_, c)| (c.dev, c.ino))
+                    .map_err(|e| format!("process {p}'s {ns} namespace: {e}"))
             };
             if id(&pid.to_string())? != id("1")? {
                 return Ok(false);
@@ -1841,35 +1841,41 @@ impl LineReader for ProcFs<'_> {
     }
 
     fn exe(&self, pid: u32) -> std::result::Result<((u64, u64), String), String> {
-        use std::os::unix::fs::MetadataExt;
         let link = self.0.join(pid.to_string()).join("exe");
-        let m = std::fs::metadata(&link).map_err(|e| format!("/proc/{pid}/exe: {e}"))?;
-        let path = std::fs::read_link(&link).map_err(|e| format!("/proc/{pid}/exe: {e}"))?;
-        Ok(((m.dev(), m.ino()), path.to_string_lossy().into_owned()))
+        let (_, c) = antitamper_bpf::kernel_roots::link_target(&link)
+            .map_err(|e| format!("process {pid}'s executable: {e}"))?;
+        let path = antitamper_bpf::kernel_roots::read_link(&link)
+            .map_err(|e| format!("process {pid}'s executable: {e}"))?;
+        Ok(((c.dev, c.ino), path.to_string_lossy().into_owned()))
     }
 
     fn cmdline(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
-        let raw = std::fs::read(self.0.join(pid.to_string()).join("cmdline"))
-            .map_err(|e| format!("/proc/{pid}/cmdline: {e}"))?;
+        let raw = antitamper_bpf::kernel_roots::read(self.0.join(pid.to_string()).join("cmdline"), 64 * 1024)
+            .map_err(|e| format!("process {pid}'s command line: {e}"))?;
         Ok(nul_split(&raw))
     }
 
     fn environ(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
-        use std::io::Read;
-        let mut raw = Vec::new();
-        std::fs::File::open(self.0.join(pid.to_string()).join("environ"))
-            .and_then(|f| f.take(64 * 1024).read_to_end(&mut raw))
-            .map_err(|e| format!("/proc/{pid}/environ: {e}"))?;
+        let raw = antitamper_bpf::kernel_roots::read(self.0.join(pid.to_string()).join("environ"), 64 * 1024)
+            .map_err(|e| format!("process {pid}'s environment: {e}"))?;
         Ok(nul_split(&raw))
     }
 
     fn open_file_digests(&self, pid: u32) -> std::result::Result<Vec<[u8; 32]>, String> {
         let dir = self.0.join(pid.to_string()).join("fd");
-        let entries = std::fs::read_dir(&dir).map_err(|e| format!("/proc/{pid}/fd: {e}"))?;
-        Ok(entries
-            .flatten()
-            .take(MAX_DIGESTED_FDS)
-            .filter_map(|e| file_digest(&e.path()))
+        let names = antitamper_bpf::kernel_roots::read_dir_max(&dir, MAX_DIGESTED_FDS)
+            .map_err(|e| format!("process {pid}'s descriptors: {e}"))?;
+        Ok(names
+            .iter()
+            .filter_map(|n| {
+                // the descriptor's file through its link, reopened to read
+                let (f, c) = antitamper_bpf::kernel_roots::link_target(&dir.join(n)).ok()?;
+                if c.mode & libc::S_IFMT != libc::S_IFREG {
+                    return None;
+                }
+                let f = antitamper_bpf::kernel_roots::reopen_fd(&f, libc::O_RDONLY).ok()?;
+                file_digest_of(&f)
+            })
             .collect())
     }
 
@@ -1878,9 +1884,11 @@ impl LineReader for ProcFs<'_> {
         let path = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.0.join(pid.to_string()).join("cwd").join(p)
+            let cwd = antitamper_bpf::kernel_roots::read_link(self.0.join(pid.to_string()).join("cwd")).ok()?;
+            cwd.join(p)
         };
-        file_digest(&path)
+        let f = antitamper_bpf::kernel_roots::open(&path, libc::O_RDONLY | libc::O_CLOEXEC).ok()?;
+        file_digest_of(&f)
     }
 
     fn freeze_plan(&self) -> std::result::Result<Vec<FreezeMark>, String> {
@@ -1907,18 +1915,15 @@ fn nul_split(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The SHA-256 of the regular file at `path` (followed), when it is at
-/// most [`MAX_SCRIPT_BYTES`].
-fn file_digest(path: &Path) -> Option<[u8; 32]> {
+/// The SHA-256 of the regular file `f`, when it is at most
+/// [`MAX_SCRIPT_BYTES`].
+fn file_digest_of(f: &std::fs::File) -> Option<[u8; 32]> {
     use sha2::Digest;
-    use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
     let m = f.metadata().ok()?;
     if !m.is_file() || m.len() > MAX_SCRIPT_BYTES {
         return None;
     }
-    let mut buf = Vec::new();
-    f.take(MAX_SCRIPT_BYTES + 1).read_to_end(&mut buf).ok()?;
+    let buf = antitamper_bpf::kernel_roots::read_file_bounded(f, MAX_SCRIPT_BYTES + 1).ok()?;
     if buf.len() as u64 > MAX_SCRIPT_BYTES {
         return None;
     }
@@ -2072,7 +2077,7 @@ fn walk_line(
 pub struct TreeRoot {
     pub pid: u32,
     pub start_ticks: u64,
-    pub kind: TreeRootKind,
+    pub root_kind: TreeRootKind,
     pub script_sha256: [u8; 32],
 }
 
@@ -2108,8 +2113,8 @@ pub fn admit_line(
     };
     let mut pins = Vec::new();
     let line = walk_line(reader, requester, (root.pid, root.start_ticks), own, &mut pins)?;
-    let kind = root.kind.as_str();
-    match root.kind {
+    let kind = root.root_kind.as_str();
+    match root.root_kind {
         TreeRootKind::WindowRun => {
             if line.len() != 1 {
                 return Err(format!(
@@ -3690,11 +3695,11 @@ mod tests {
         f
     }
 
-    fn root(pid: u32, start_ticks: u64, kind: TreeRootKind) -> TreeRoot {
+    fn root(pid: u32, start_ticks: u64, root_kind: TreeRootKind) -> TreeRoot {
         TreeRoot {
             pid,
             start_ticks,
-            kind,
+            root_kind,
             script_sha256: SCRIPT,
         }
     }

@@ -212,6 +212,28 @@ fn sites(text: &str) -> Vec<String> {
 /// option read.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-admin/src/admin_cli.rs",
+        3,
+        "lot 2.3b: `/proc/<pid>/stat`'s start and parent (fields 22 and 4) and a package \
+         manager's command line (`/proc/<pid>/cmdline`, NUL-separated) read to find a \
+         trusted-installer window's root, whose program the agent judges again — no \
+         interpreter's option read",
+    ),
+    (
+        "crates/nn-core/src/anti_tamper/trusted_installer.rs",
+        1,
+        "lot 2.3b: dnf's and yum's program, the Python interpreter's first argument, compared \
+         with their packaged paths (the admission policy's package-manager root) — no option \
+         read",
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/trusted_installer.rs",
+        2,
+        "lot 2.3b: a process's command line and environment (`/proc/<pid>/cmdline`, `environ`, \
+         NUL-separated) for the admission policy: a script root's arguments, each judged by its \
+         file's digest, a scriptlet's package by its manager's variables — no option read",
+    ),
+    (
         "antitamper-bpf/src/start_check.rs",
         1,
         "lot 374: an environment block's variable names (`/proc/<pid>/environ`, NUL-separated \

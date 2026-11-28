@@ -84,6 +84,65 @@ pub const REQUIRED_FIELDS: [&str; 16] = [
     "VM_AREA_STRUCT_VM_FILE_OFFSET",
 ];
 
+/// Lot 2.3b (D9, the design's section 8): the kernels a tree window is
+/// built for — AlmaLinux 9's 5.14 el9 to 7.0 — in [`KERNEL_MANIFEST`]'s
+/// columns.
+pub const MANIFEST_KERNELS: [&str; 6] = ["5.14 el9", "5.15", "6.1", "6.8", "6.12", "7.0"];
+
+/// Lot 2.3b (D9): how a kernel has one of the tree window's hooks or
+/// facilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Has {
+    /// Present: the window uses it.
+    Yes,
+    /// Absent, and the window works without it in the way the row says
+    /// (never a host-wide window instead).
+    Without,
+}
+
+/// Lot 2.3b (D9): every hook and facility a tree window needs, per kernel
+/// of [`MANIFEST_KERNELS`] — `(hook or facility, what for, per kernel)`.
+/// A program of [`PROGRAMS`] or a field of [`REQUIRED_FIELDS`] the running
+/// kernel lacks refuses tree windows ([`manifest_missing`]); the rows whose
+/// column says [`Has::Without`] name the fallback the window itself takes.
+/// The lab's verifier rounds confirm each column (5.14 el9, 5.15, 6.1, 7.0
+/// for lot 2.3b).
+pub const KERNEL_MANIFEST: &[(&str, &str, [Has; 6])] = {
+    use Has::{Without as N, Yes as Y};
+    &[
+        ("sched_process_fork", "a member's child joins the tree", [Y; 6]),
+        ("sched_process_exit", "an entry leaves with its process", [Y; 6]),
+        ("sched_process_exec", "the eviction rule's environment", [Y; 6]),
+        ("task_alloc", "the fork span", [Y; 6]),
+        ("task_free", "an entry leaves with its leader", [Y; 6]),
+        ("bprm_check_security", "the exec rule, a script's own file", [Y; 6]),
+        ("bprm_committed_creds", "the exec rule's final file", [Y; 6]),
+        ("mmap_file", "the mapping rule", [Y; 6]),
+        ("file_mprotect", "the mapping rule", [Y; 6]),
+        ("shm_shmat", "an executable System V segment", [Y; 6]),
+        ("ptrace_access_check", "the members' ptrace, kcmp, pidfd_getfd", [Y; 6]),
+        ("file_receive", "descriptors across the tree's boundary", [Y; 6]),
+        ("sb_mount", "the freeze: a mount on or over the system code", [Y; 6]),
+        ("move_mount", "the freeze: a moved mount onto the system code", [Y; 6]),
+        ("file_open, inode_* (the deny hooks)", "the freeze of the system code, PID 1's leased link removal", [Y; 6]),
+        ("task_struct.start_boottime, ptrace, seccomp.mode, __state", "identity and the per-lift test", [Y; 6]),
+        ("cred.user_ns, nsproxy.pid_ns_for_children, ns inums", "the per-lift namespaces", [Y; 6]),
+        ("mm_struct.env_start, env_end", "the eviction rule's environment", [Y; 6]),
+        ("vm_area_struct.vm_flags, vm_file", "the mprotect judge", [Y; 6]),
+        ("pidfd_open, pidfd_send_signal", "the admission's pidfds (taken before each read)", [Y; 6]),
+        (
+            "SO_PEERPIDFD (6.5)",
+            "the requester's pidfd: without it, a pidfd of the SO_PEERCRED pid, its start compared",
+            [N, N, N, Y, Y, Y],
+        ),
+        (
+            "dev.tty.legacy_tiocsti (6.2)",
+            "window-run --interactive: refused without it (and where it is 1)",
+            [N, N, N, Y, Y, Y],
+        ),
+    ]
+};
+
 /// The pinned slot of the window the kernel closed
 /// (`agent-ebpf/src/window_tree.rs`'s `TREE_CLOSED`).
 pub const TREE_CLOSED_MAP_NAME: &str = "TREE_CLOSED";
@@ -248,6 +307,31 @@ mod tests {
             assert!(seen.insert(short), "{name}");
             assert!(name.starts_with("tree_"), "{name}");
         }
+    }
+
+    /// Lot 2.3b (D9): the manifest names every program's hook, and every
+    /// one of them, and every field the per-lift test reads, is present on
+    /// each kernel the window is built for — a kernel without one refuses
+    /// tree windows, never falls back to the host-wide one.
+    #[test]
+    fn the_manifest_names_every_hook_and_each_is_on_every_supported_kernel() {
+        for (name, _, hook) in PROGRAMS {
+            let row = KERNEL_MANIFEST
+                .iter()
+                .find(|(h, _, _)| h == &hook)
+                .unwrap_or_else(|| panic!("{name}'s hook {hook} is not in the manifest"));
+            assert_eq!(row.2, [Has::Yes; 6], "{hook}");
+        }
+        for (h, why, cols) in KERNEL_MANIFEST {
+            assert!(!why.is_empty(), "{h}");
+            if cols.contains(&Has::Without) {
+                assert!(
+                    h.contains("SO_PEERPIDFD") || h.contains("legacy_tiocsti"),
+                    "{h}: only the two optional facilities may be absent"
+                );
+            }
+        }
+        assert_eq!(MANIFEST_KERNELS.len(), 6);
     }
 
     #[test]

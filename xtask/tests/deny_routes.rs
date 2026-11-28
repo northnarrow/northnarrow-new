@@ -79,6 +79,9 @@ const GATE_SWITCHES: &[(&str, &str)] = &[
 /// Every deny site of `agent-ebpf/src`, by file and function: `(file,
 /// function, sites, route)`. A function may hold sites of two routes (one
 /// row each).
+/// Lot 2.3b (D5): why the freeze of the system code refuses.
+const FROZEN_SYSTEM_CODE: &str = "the system's code frozen against outsiders while a trusted-installer window per process tree is open (D5): a write-open, truncate, rename, removal, link, attribute change, new entry or mount by a process outside the tree on the default PATH's programs, the loader's and the interpreters' libraries, the loader's configuration, the package managers' hook and maintainer-script directories, systemd's manager configuration or binfmt_misc — nothing outside the tree replaces what the tree executes, loads or is configured by (lot 2.3b)";
+
 const SITES: &[(&str, &str, usize, Route)] = &[
     (
         "bpf_defense.rs",
@@ -565,6 +568,55 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         Enforced(
             "while a tree window is open, an io_uring ring's or a protected inode's descriptor received outside the agent's family: no descriptor crosses the tree's boundary (lot 2.3a, D7)",
         ),
+    ),
+    // lot 2.3b (D5): the freeze of the system code, one site per hook
+    (
+        "inode_protect.rs",
+        "try_inode_unlink",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rmdir",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rename",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_setattr",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "deny_new_frozen",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
+        "deny_xattr",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "window_tree.rs",
+        "frozen_path",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
     ),
 ];
 

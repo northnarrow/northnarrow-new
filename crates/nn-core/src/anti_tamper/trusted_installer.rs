@@ -335,9 +335,9 @@ pub fn frozen_names() -> Vec<(&'static str, &'static str, Freeze)> {
         .filter_map(|(path, how)| {
             let (parent, name) = path.rsplit_once('/')?;
             let parent = if parent.is_empty() { "/" } else { parent };
+            // component by component (`/usr/lib64` is not below `/usr/lib`)
             let under_subtree = FROZEN.iter().any(|(p, h)| {
-                *h == Freeze::Subtree
-                    && (parent == *p || parent.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
+                *h == Freeze::Subtree && std::path::Path::new(parent).starts_with(p)
             });
             (!under_subtree && !name.is_empty()).then_some((parent, name, *how))
         })

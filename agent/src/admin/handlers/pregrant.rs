@@ -72,13 +72,29 @@ pub(in crate::admin) struct HostDatabase {
 }
 
 impl HostDatabase {
-    /// The database under `root` (`/` in production).
-    pub(in crate::admin) fn open(root: &Path) -> Self {
-        let status = std::fs::read(root.join("var/lib/dpkg/status")).unwrap_or_default();
+    /// The database under `root` (a test's tree), the host's with `None`.
+    /// A `status` that cannot be read lists no conffile: each is then
+    /// judged owned by no package, and the window refused (fails closed).
+    pub(in crate::admin) fn open(root: Option<&Path>) -> Self {
+        let status = match std::fs::read(host_path(root, "var/lib/dpkg/status")) {
+            Ok(s) => String::from_utf8_lossy(&s).into_owned(),
+            Err(_) => String::new(),
+        };
         Self {
-            trust: PackageTrust::new(root, true),
-            conffiles: dpkg_conffiles(&String::from_utf8_lossy(&status)),
+            trust: match root {
+                Some(r) => PackageTrust::new(r, true),
+                None => PackageTrust::default(),
+            },
+            conffiles: dpkg_conffiles(&status),
         }
+    }
+}
+
+/// `rel` under `root` (a test's tree), or the host's absolute path.
+fn host_path(root: Option<&Path>, rel: &str) -> PathBuf {
+    match root {
+        Some(r) => r.join(rel),
+        None => PathBuf::from(format!("/{rel}")),
     }
 }
 
@@ -144,25 +160,29 @@ fn digest<D: Digest>(file: &File) -> Option<Vec<u8>> {
 /// target) and each of [`CHECKED_FILES`]; foreign are those the database
 /// does not vouch for, and those not read (larger than the bound, past
 /// [`MAX_CHECKED`]).
-pub(in crate::admin) fn check(root: &Path, db: &dyn Vouch) -> PregrantReport {
+pub(in crate::admin) fn check(root: Option<&Path>, db: &dyn Vouch) -> PregrantReport {
     let started = Instant::now();
     let mut paths: Vec<PathBuf> = Vec::new();
     for d in CHECKED_DIRS {
-        if let Ok(entries) = std::fs::read_dir(root.join(d)) {
+        if let Ok(entries) = std::fs::read_dir(host_path(root, d)) {
             let mut v: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
             v.sort();
             paths.extend(v);
         }
     }
     for f in CHECKED_FILES {
-        let p = root.join(f);
+        let p = host_path(root, f);
         if std::fs::symlink_metadata(&p).is_ok() {
             paths.push(p);
         }
     }
+    let shown_of = |p: &Path| match root {
+        Some(r) => format!("/{}", p.strip_prefix(r).unwrap_or(p).display()),
+        None => p.display().to_string(),
+    };
     let mut report = PregrantReport::default();
     for (i, p) in paths.iter().enumerate() {
-        let shown = format!("/{}", p.strip_prefix(root).unwrap_or(p).display());
+        let shown = shown_of(p);
         if i >= MAX_CHECKED {
             report.foreign.push(Foreign {
                 path: shown,
@@ -191,7 +211,7 @@ pub(in crate::admin) fn check(root: &Path, db: &dyn Vouch) -> PregrantReport {
         // the database names the file by its own path: the link's target
         let real = std::fs::canonicalize(p)
             .ok()
-            .map(|r| format!("/{}", r.strip_prefix(root).unwrap_or(&r).display()))
+            .map(|r| shown_of(&r))
             .unwrap_or_else(|| shown.clone());
         let Ok(file) = File::open(p) else {
             continue;
@@ -243,7 +263,7 @@ mod tests {
             ("/etc/apt/apt.conf.d/01autoremove".to_string(), PkgOutcome::Trusted { manager: "dpkg" }),
             ("/etc/apt/apt.conf.d/50edited".to_string(), PkgOutcome::Modified { manager: "dpkg" }),
         ]));
-        let r = check(root, &db);
+        let r = check(Some(root), &db);
         assert_eq!(r.checked, 4);
         let named: Vec<(&str, &str)> = r.foreign.iter().map(|f| (f.path.as_str(), f.why)).collect();
         assert_eq!(

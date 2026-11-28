@@ -113,11 +113,82 @@ under `enforcing`.
 | `nn-admin policy show` | the per-rule response policy in force and the held responses | none |
 | `nn-admin policy set` | validate, sign and apply a new per-rule policy ([`RULE_POLICY.md`](RULE_POLICY.md)) | `config-manage` |
 | `nn-admin policy test` | replay sample events under a candidate policy, offline; nothing is signed or applied | none |
-| `nn-admin trusted-installer-grant` | open a trusted-installer window (at most 600 s, ended by an agent restart): what an upgrade, an uninstall or a restart needs ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.7) | `trusted-installer` |
+| `nn-admin window-run -- <command>` | run one command inside a trusted-installer window for its own process tree (at most 600 s): the agent's protections are lifted for that command and what it starts, and for nothing else on the host ([the window per process tree](#the-window-per-process-tree)) | `trusted-installer` |
+| `nn-admin installer-window` | the same window for the script that runs it (`--script`, what `install.sh` and `uninstall.sh` pass) or for the package manager running a maintainer script (`--for-package`); prints `NN_WINDOW_GENERATION=<number>` | `trusted-installer` |
+| `nn-admin window-stop` | inside such a window: stop the agent and the watchdog (both stand down), or `--restart` the agent (the watchdog starts it again) | none: a process inside the window |
+| `nn-admin window-lease` | inside such a window: let systemd remove one of the units' enablement links, once, within 5 s (`--link`; run it just before `systemctl disable`) | none: a process inside the window |
+| `nn-admin trusted-installer-grant` | deprecated: open the host-wide trusted-installer window (at most 600 s, ended by an agent restart), kept for the install, upgrade and removal scripts that still ask for it ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.7); use `window-run` | `trusted-installer` |
 | `nn-admin shutdown` | stop the agent with a request signed by two distinct keys; the watchdog stands down | `shutdown` on one of the two keys |
 | `nn-admin init` | generate a new admin keypair and append its public half to `admin.pub` (from a root shell, before the agent protects the file) | none |
 | `nn-admin rotate-keys add` | add an admin key, with the roles one of the two signers holds | two keys, one with `rotate-keys` |
 | `nn-admin rotate-keys revoke` | remove an admin key by its fingerprint (never the last one) | two keys, one with `rotate-keys` |
+
+### The window per process tree
+
+`nn-admin window-run --key <key> -- <command> [args…]` opens a
+trusted-installer window for one process tree, and runs `<command>` in it:
+
+- **The tree.** The window's root is that `nn-admin` process, the one
+  installed beside the agent. `<command>` is its child; every process
+  `<command>` starts while the window is open is in the tree, a daemon it
+  starts included. A process started by systemd (`systemctl start`) is not.
+  The window ends when `<command>` exits (and with it `nn-admin`), at
+  `--window-secs` (600 s at most), or at the agent's next start.
+- **What the command gets.** Its input is `/dev/null`; with `--interactive`
+  it is the terminal, which is refused where any process may type into a
+  terminal (`dev.tty.legacy_tiocsti` is 1, or a kernel before 6.2) and is
+  recorded as degraded elsewhere. Its environment is rebuilt from a short
+  list: `PATH` set to `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+  `HOME`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LANGUAGE`, the `LC_*`
+  variables, `TZ`, `NO_COLOR`, `NN_GRANT_KEY` (the key `install.sh` signs a
+  rollback's window with), `DEBIAN_FRONTEND`, `DEBIAN_PRIORITY`,
+  `DEBCONF_NONINTERACTIVE_SEEN`, and `NN_WINDOW_GENERATION`, the window's
+  number. Every other variable is dropped: a root login shell's exported
+  shell functions (`BASH_FUNC_which%%` on RHEL), the loader's and the
+  interpreters' variables would otherwise take a process out of the tree
+  at its next program.
+- **Who stays out.** A process of the tree that runs a program from a
+  directory others can write (`/tmp`), a program that is not root's, or a
+  program with one of the loader's or the interpreters' variables in its
+  environment, leaves the tree: what it does next is refused, signed High.
+- **The system's code is frozen.** While the window is open, a process
+  outside the tree cannot write, truncate, rename, remove, link, chmod,
+  chown or set an attribute on, create, or mount on: the programs and
+  libraries of `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`,
+  `/usr/local/sbin`, `/usr/lib`, `/usr/lib64`, `/usr/libexec`, `/lib`,
+  `/lib64`, `/usr/local/lib`, the Perl library directories; the loader's
+  configuration (`/etc/ld.so.preload`, `ld.so.cache`, `ld.so.conf`,
+  `ld.so.conf.d`); the package managers' hooks and scripts
+  (`/etc/apt/apt.conf.d`, `/etc/dpkg/dpkg.cfg.d`, `/var/lib/dpkg/info`,
+  `/etc/dnf/plugins`, `/etc/yum/pluginconf.d`, `/etc/rpm`); systemd's
+  `system.conf` and `system.conf.d`; `binfmt_misc`. Each attempt is refused
+  and signed High. A package update that runs outside the window meanwhile
+  (an unattended upgrade) fails and is retried later. systemd's global
+  environment (`systemctl set-environment`) cannot be refused: a change
+  closes the window, signed High.
+- **What is checked first.** Before the window opens, the agent compares
+  the files of those hook directories and the loader's configuration with
+  the package database (dpkg's digests, rpm's): a file no package owns, or
+  one that differs from it, refuses the window. The refusal names each
+  with its SHA-256; once you have checked such a file, accept it with
+  `--accept-foreign <sha256>` (repeatable). The check reads a few hundred
+  small files at each grant.
+- **Inside the window**, `nn-admin window-stop` stops the agent and the
+  watchdog (both stand down; nothing starts them again until
+  `systemctl start northnarrow-agent`), or with `--restart` restarts the
+  agent. systemd's own stop signals stay refused. `nn-admin window-lease
+  --link <path>` lets systemd remove one of the units' enablement links
+  (`/etc/systemd/system/multi-user.target.wants/northnarrow-agent.service`),
+  once, within 5 s: run it just before `systemctl disable`, once per link.
+  Both take the window's number from `NN_WINDOW_GENERATION` (or
+  `--generation`). A process outside the window is refused.
+- **Exit status:** the command's; 9 when the agent refused the window (the
+  reason is printed, nothing was armed), and the shared codes below for a
+  key, a role or the socket.
+
+Only one window is open at a time: a host-wide grant
+(`trusted-installer-grant`, deprecated) is refused while a window per
+process tree is open, and the reverse.
 
 ## 4. Exit codes
 
@@ -137,7 +208,7 @@ which of them it uses.
 | 6 | `shutdown`, `rotate-keys`: the quorum was not met (two distinct valid keys are needed) |
 | 7 | the key is valid but lacks the role the command needs |
 | 8 | evidence missing or altered: `audit verify`, `chain verify` (a `BROKEN` chain), `audit read` (lines that are not rows were skipped) — [`EVIDENCE_CHAINS.md`](EVIDENCE_CHAINS.md#exit-codes-of-the-verifiers) |
-| 9 | the agent verified the request and did nothing: no such canary (`canary burn` / `refresh`), nothing to release or restore (`response`), the isolation could not be released (`unlock`, `force-posture` out of COMBAT: the posture stays COMBAT), nothing held at or before the row, or a row not signed yet (`integrity acknowledge`) — the reason is printed |
+| 9 | the agent verified the request and did nothing: no such canary (`canary burn` / `refresh`), nothing to release or restore (`response`), the isolation could not be released (`unlock`, `force-posture` out of COMBAT: the posture stays COMBAT), nothing held at or before the row, or a row not signed yet (`integrity acknowledge`), a window refused (`window-run`, `installer-window`) or a request of a process outside it (`window-stop`, `window-lease`) — the reason is printed |
 | 10 | `detection-set-status`: the change was not recorded (the agent could not append its chain: disk full?) |
 | 17 | the host refused this user the agent's admin socket, a key, the agent id or (`chain verify`) a chain (permission denied): run it with `sudo`. It says nothing about whether the agent runs, nor about the chains. 11 to 16 and 18 are left to the alerts of `heartbeat watch` and `export verify` |
 | 141 | the output was closed before everything was written (`nn-admin status \| head -1`) |

@@ -3276,7 +3276,10 @@ where it starts.
 ## Trusted-installer window per process tree (design, stage S2)
 
 **Status.** Design of the per-tree window, written in lot 2.1 before the code of lot
-2.3, which implements it. Lots 2.2, 2.4, 2.5, 2.6 and 2.7 take the parts named below.
+2.3, which implements it (2.3a the kernel side, 2.3b the user flows: `nn-admin
+window-run`, the admission policy, the controlled stop, the leases, the freeze, the
+pre-grant check, the kernel manifest's table in `nn_linux::anti_tamper::window_tree`).
+Lots 2.2, 2.4, 2.5, 2.6 and 2.7 take the parts named below.
 Lot 2.1 declares the types only (listed at the end of this section); no hook reads
 them yet. This revision takes in an independent review, an adversarial brainstorm
 and a cross-model check. Each of their points is handled below, given to a named

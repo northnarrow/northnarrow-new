@@ -90,8 +90,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         ("role_maps.rs", 0, 2),
         // lot 2.3a: the outsider signalling or tracing a member, the
         // receiver of a descriptor, the writer of a member's cgroup.kill or
-        // cgroup.freeze — callers
-        ("window_tree.rs", 0, 3),
+        // cgroup.freeze — callers; lot 2.3b: the outsider changing the
+        // system code frozen while a window is open — a caller
+        ("window_tree.rs", 0, 4),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(

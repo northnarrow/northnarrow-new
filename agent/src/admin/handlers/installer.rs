@@ -133,10 +133,12 @@ pub(in crate::admin) fn interactive_refusal(sysctl: Option<&str>) -> Option<Stri
 /// The installed `nn-admin` a `window-run` root must run: the one beside
 /// the agent's own binary, by its `(st_dev, st_ino)`.
 fn installed_admin() -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let exe = antitamper_bpf::kernel_roots::current_exe().ok()?;
-    let m = std::fs::metadata(exe.parent()?.join("nn-admin")).ok()?;
-    Some((m.dev(), m.ino()))
+    let f = antitamper_bpf::kernel_roots::open(exe.parent()?.join("nn-admin"), libc::O_PATH | libc::O_CLOEXEC)
+        .ok()?;
+    // the kernel's identity, as a process's executable link gives it
+    let c = antitamper_bpf::kernel_roots::cached(&f).ok()?;
+    Some((c.dev, c.ino))
 }
 
 /// What a tree grant reads of its host besides `/proc` (the tests' fakes).
@@ -167,16 +169,13 @@ pub(in crate::admin) fn dispatch_tree_grant(
         |r| WindowReply::new(r, 0, ""),
         |v| {
             let sigs: Vec<[u8; 64]> = v.request().signatures.iter().map(|s| s.signature).collect();
-            let pregrant = || {
-                super::pregrant::check(
-                    Path::new("/"),
-                    &super::pregrant::HostDatabase::open(Path::new("/")),
-                )
-            };
+            let pregrant =
+                || super::pregrant::check(None, &super::pregrant::HostDatabase::open(None));
             let host = TreeHost {
                 reader: &ProcFs(Path::new("/proc")),
                 installed_admin: installed_admin(),
-                legacy_tiocsti: std::fs::read_to_string(LEGACY_TIOCSTI).ok(),
+                // unreadable: refused as absent (fails closed)
+                legacy_tiocsti: antitamper_bpf::kernel_roots::read_to_string(LEGACY_TIOCSTI).ok(),
                 pregrant: &pregrant,
             };
             let reply = tree_grant(v.extra(), installer_override, requester, &host);
@@ -229,7 +228,7 @@ pub(in crate::admin) fn tree_grant(
     let root = TreeRoot {
         pid: extra.root_pid,
         start_ticks: extra.root_start_ticks,
-        kind: extra.root_kind,
+        root_kind: extra.root_kind,
         script_sha256: extra.script_sha256,
     };
     let line = match ov

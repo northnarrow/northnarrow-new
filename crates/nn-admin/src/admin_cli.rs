@@ -3171,24 +3171,22 @@ pub fn run_window_lease(
 /// Lot 2.3b: this process (`window-run`'s root): its pid and its start.
 pub fn self_root() -> Result<(u32, u64)> {
     let pid = std::process::id();
-    Ok((pid, proc_start(pid)?))
+    Ok((pid, proc_stat(pid)?.1))
 }
 
-/// `/proc/<pid>/stat`'s start (field 22).
-fn proc_start(pid: u32) -> Result<u64> {
-    let path = format!("/proc/{pid}/stat");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-    stat_start_ticks(&String::from_utf8_lossy(&bytes)).ok_or_else(|| anyhow!("{path}: no start"))
+/// Lot 2.3b: one file of `/proc/<pid>` (`stat`, `cmdline`), read once — a
+/// CLI process of its own that anchors no root, never the agent; a read
+/// that fails fails the request (the agent checks the root again).
+fn proc_file(pid: u32, name: &str) -> Result<Vec<u8>> {
+    let path = format!("/proc/{pid}/{name}");
+    std::fs::read(&path).with_context(|| format!("reading {path}"))
 }
 
-/// `/proc/<pid>/stat`'s parent (field 4).
-fn proc_parent(pid: u32) -> Result<u32> {
-    let path = format!("/proc/{pid}/stat");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-    String::from_utf8_lossy(&bytes)
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
-        .ok_or_else(|| anyhow!("{path}: no parent"))
+/// `/proc/<pid>/stat`'s parent and start (fields 4 and 22), counted after
+/// the `(comm)` field (which may hold spaces or parentheses).
+fn proc_stat(pid: u32) -> Result<(u32, u64)> {
+    let text = String::from_utf8_lossy(&proc_file(pid, "stat")?).into_owned();
+    stat_fields(&text).ok_or_else(|| anyhow!("/proc/{pid}/stat: no parent or start"))
 }
 
 /// Lot 2.3b (`installer-window --for-package`): the package manager's
@@ -3202,18 +3200,19 @@ pub fn package_manager_root() -> Result<(u32, u64)> {
             break;
         }
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let cmdline: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
-            .unwrap_or_default()
+            .with_context(|| format!("process {pid}'s executable"))?
+            .to_string_lossy()
+            .into_owned();
+        let words: Vec<String> = proc_file(pid, "cmdline")?
             .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter(|w| !w.is_empty())
+            .map(|w| String::from_utf8_lossy(w).into_owned())
             .collect();
-        if nn_core::anti_tamper::trusted_installer::package_manager(&exe, &cmdline).is_some() {
-            return Ok((pid, proc_start(pid)?));
+        let (ppid, start) = proc_stat(pid)?;
+        if nn_core::anti_tamper::trusted_installer::package_manager(&exe, &words).is_some() {
+            return Ok((pid, start));
         }
-        pid = proc_parent(pid)?;
+        pid = ppid;
     }
     bail!("no package manager's process above this command: no window is rooted there")
 }
@@ -3234,29 +3233,27 @@ pub fn parse_sha256(hex_digest: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("--accept-foreign {hex_digest}: not a SHA-256 (64 hex characters)"))
 }
 
-/// Lot 2.3a's minimal path: the root of `--tree`, this process's parent —
-/// its pid and its start (`/proc/<ppid>/stat`, field 22), read once.
+/// Lot 2.3a, lot 2.3b (`installer-window --script`): this process's
+/// parent — its pid and its start (`/proc/<ppid>/stat`, field 22), read
+/// once.
 pub fn parent_root() -> Result<(u32, u64)> {
     let ppid = std::os::unix::process::parent_id();
     if ppid <= 1 {
         bail!("this command's parent is PID {ppid}: no window is rooted there");
     }
-    let path = format!("/proc/{ppid}/stat");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-    let start = stat_start_ticks(&String::from_utf8_lossy(&bytes))
-        .ok_or_else(|| anyhow!("{path}: no start"))?;
-    Ok((ppid, start))
+    Ok((ppid, proc_stat(ppid)?.1))
 }
 
-/// `/proc/<pid>/stat`'s start (field 22), counted after the `(comm)` field
-/// (which may hold spaces or parentheses).
+/// `/proc/<pid>/stat`'s parent and start (fields 4 and 22).
+fn stat_fields(stat: &str) -> Option<(u32, u64)> {
+    let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
+}
+
+/// `/proc/<pid>/stat`'s start (field 22).
+#[cfg(test)]
 fn stat_start_ticks(stat: &str) -> Option<u64> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    stat_fields(stat).map(|(_, s)| s)
 }
 
 fn grant_with(

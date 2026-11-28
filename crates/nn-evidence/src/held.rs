@@ -191,6 +191,10 @@ pub const EVENT_KINDS: &[&str] = &[
     // shutdown (`run_exec_at_shutdown`) whose shutdown did not come — the
     // host ran on; `/run` may be back by then, nothing checks it again
     "run_exec_without_shutdown",
+    // lot 2.3b (D5): PID 1's global environment changed while a
+    // trusted-installer window per process tree was open (the window was
+    // closed); an event, which no later state undoes
+    "window_pid1_environment_changed",
 ];
 
 /// The degradations held while found ([`Hold::WhileFound`]): a state of the

@@ -1336,3 +1336,156 @@ fn the_fork_span_and_a_traced_caller_are_guarded_and_let_throughs_take_no_class(
         assert!(a.contains(p), "{p}");
     }
 }
+
+/// Lot 2.3b (D5, the freeze of the system code): every mutation hook of
+/// `inode_protect` asks the freeze after its own refusals — the write-open,
+/// the removals, the renames (both entries), the attribute changes, the
+/// new entries (through one helper every creating program calls) and the
+/// extended attributes — and two programs of the tree ask it for a mount
+/// on or over a frozen object. The freeze judges only an outsider: the
+/// agent's family and a member the window lifts for come first; then the
+/// object's name in its directory and a bounded walk of its directories,
+/// each mark of the window's generation.
+#[test]
+fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
+    let ip = code("agent-ebpf/src/inode_protect.rs");
+    for (f, needle) in [
+        ("try_inode_unlink", "frozen(dentry_s, FS_OP_UNLINK)"),
+        ("try_inode_rmdir", "frozen(crate::window_tree::raw_arg(ctx, 1), FS_OP_RMDIR)"),
+        ("try_inode_rename", "frozen(old_s, FS_OP_RENAME) || frozen(new_s, FS_OP_RENAME)"),
+        ("try_inode_setattr", "frozen(dentry as u64, FS_OP_SETATTR)"),
+        ("try_protected_open_deny", "frozen(dentry, FS_OP_WRITE)"),
+        ("deny_xattr", "frozen(dentry as u64, FS_OP_XATTR)"),
+        ("deny_new_frozen", "frozen(crate::window_tree::raw_arg(ctx, dentry_arg), operation)"),
+    ] {
+        assert!(body(&ip, f).contains(needle), "{f}: {needle}");
+    }
+    for p in [
+        "protected_create_deny",
+        "protected_mkdir_deny",
+        "protected_mknod_deny",
+        "protected_symlink_deny",
+        "protected_link_deny",
+    ] {
+        assert!(body(&ip, p).contains("deny_new_frozen(&ctx,"), "{p}");
+    }
+    assert!(body(&ip, "protected_link_deny").contains(", 2, hook::INODE_LINK"), "the new name");
+    assert!(body(&ip, "frozen").contains("nn_tree_frozen(dentry, u64::from(operation))"));
+    let w = code("agent-ebpf/src/window_tree.rs");
+    in_order(
+        body(&w, "nn_tree_frozen"),
+        &[
+            "tree_open(g,",
+            "is_exempt_pid(",
+            "member_now() == MEMBER_LIFT",
+            "name_frozen(d0, parent, generation)",
+            "while level < FREEZE_WALK",
+            "frozen_verdict(FROZEN_INODES.get(&key), generation, level)",
+            "emit_attempt(op, key)",
+        ],
+    )
+    .unwrap();
+    assert!(body(&w, "name_frozen").contains("frozen_verdict(FROZEN_NAMES.get(&key), generation, 0)"));
+    for p in ["tree_frz_mount", "tree_frz_move"] {
+        assert!(body(&w, p).contains("frozen_path(raw_arg(&ctx, 1))"), "{p}");
+    }
+    assert!(body(&w, "frozen_path").contains("nn_tree_frozen(dentry as u64, u64::from(FS_OP_MOUNT))"));
+    let names =
+        fs::read_to_string(repo_root().join("deploy/lab/lib/our-lsm-programs.txt")).unwrap();
+    for p in ["tree_frz_mount", "tree_frz_move"] {
+        assert!(names.lines().any(|l| l == p), "{p}");
+    }
+    let linux = code("crates/nn-linux/src/anti_tamper/window_tree.rs");
+    assert!(linux.contains("(\"tree_frz_mount\", Kind::Lsm, \"sb_mount\")"));
+    assert!(linux.contains("(\"tree_frz_move\", Kind::Lsm, \"move_mount\")"));
+}
+
+/// Lot 2.3b (the single-use leases): a lease is consumed in the unlink hook
+/// only, before its other refusals, for PID 1 only, in a directory of our
+/// units' links and for one of their names; the slot is the window's,
+/// unused, before its deadline, for that very link and the removal; it is
+/// marked used and its use signed in the PID-1-lease class.
+#[test]
+fn a_lease_is_consumed_once_by_pid1_s_removal_of_our_link_only() {
+    let ip = code("agent-ebpf/src/inode_protect.rs");
+    in_order(
+        body(&ip, "try_inode_unlink"),
+        &["nn_tree_lease(", "return 0;", "deny_if_protected(FS_OP_UNLINK, parent"],
+    )
+    .unwrap();
+    let mut callers = 0;
+    for (f, src) in ebpf_files() {
+        callers += src.matches("nn_tree_lease(").count();
+        if f != "inode_protect.rs" && f != "window_tree.rs" {
+            assert!(!src.contains("nn_tree_lease("), "{f}");
+        }
+    }
+    // its definition and its one call
+    assert_eq!(callers, 2);
+    let w = code("agent-ebpf/src/window_tree.rs");
+    in_order(
+        body(&w, "nn_tree_lease"),
+        &[
+            "if caller != 1",
+            "tree_open(g, now, s)",
+            "INODE_EXT.get(&key)",
+            "lease_applies(caller, ext, &w)",
+            "usable_for(g, key, hash, LEASE_REMOVE, now, s)",
+            "(*l).used = 1;",
+            "WINDOW_EVENT_LEASE_USED",
+            "DENIAL_WINDOW_PID1_LEASE",
+            "return 1;",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 2.3b (D2, D1): `window-run` starts its command with the sanitised
+/// environment only (cleared, then the allowlist and the window's number)
+/// and `/dev/null` as stdin unless `--interactive`; the tree grant's
+/// handler arms the tree only, never the host-wide window nor PID 1's stop
+/// grant; and a member's request is authenticated before it acts.
+#[test]
+fn window_run_sanitises_and_the_member_requests_are_authenticated_first() {
+    let cli = code("crates/nn-admin/src/cli.rs");
+    in_order(
+        body(&cli, "run_window_run_cmd"),
+        &[
+            "tree_grant_reply(\"window-run\"",
+            "window_run_env(",
+            ".env_clear()",
+            ".envs(env)",
+            ".env(\"NN_WINDOW_GENERATION\"",
+            "if !interactive",
+            "Stdio::null()",
+            "cmd.status()",
+        ],
+    )
+    .unwrap();
+    let inst = code("agent/src/admin/handlers/installer.rs");
+    let tg = body(&inst, "tree_grant");
+    in_order(tg, &["interactive_refusal(", "admit_line(", "(host.pregrant)()", "ov.arm_tree("]).unwrap();
+    for host_wide in ["arm_for(", "arm_by(", ".arm(", "write_kill_grant", "legacy_arming"] {
+        assert!(!tg.contains(host_wide), "the tree grant arms {host_wide}");
+    }
+    let win = code("agent/src/admin/handlers/window.rs");
+    in_order(
+        body(&win, "dispatch_window_control"),
+        &["ov.window_member(requester, req.generation)", "ov.controlled_stop(", "write_marker(", ".fire()"],
+    )
+    .unwrap();
+    in_order(
+        body(&win, "dispatch_window_lease"),
+        &["ov.window_member(requester, req.generation)", "ov.arm_lease("],
+    )
+    .unwrap();
+    let ti = code("crates/nn-linux/src/anti_tamper/trusted_installer.rs");
+    in_order(
+        body(&ti, "window_member_with"),
+        &["reader.pin(requester)", "reader.hop(requester)", "maps.member(requester)", "reader.guards(requester)", "reader.ns_initial(requester)", "pin.alive()"],
+    )
+    .unwrap();
+    // the admission pins each process before it reads it, and checks them after
+    in_order(body(&ti, "walk_line"), &["pins.push((pid, reader.pin(pid)?))", "reader.hop(pid)?"]).unwrap();
+    assert!(body(&ti, "admit_line").contains("check_pins(&line, &pins)?"));
+}

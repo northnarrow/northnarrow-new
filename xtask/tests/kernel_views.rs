@@ -1591,11 +1591,12 @@ const NOT_VIEWS: &[&str] = &[
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-admin/src/admin_cli.rs",
-        1,
-        "lot 2.3a: `trusted-installer-grant --tree`'s root (the minimal path's grant for one tree): \
-         the operator's nn-admin reads its parent's start once from /proc/<ppid>/stat — a CLI \
-         process of its own that anchors no root, never the agent; a read that fails fails the \
-         request, nothing is granted",
+        2,
+        "lot 2.3a, lot 2.3b: a window per process tree's root (`window-run`'s own process, \
+         `installer-window`'s parent or package manager): the operator's nn-admin reads \
+         /proc/<pid>/stat, cmdline and exe once each (`proc_file`, the one read_link) — a CLI \
+         process of its own that anchors no root, never the agent, which reads the root again \
+         through pidfds; a read that fails fails the request, nothing is granted",
     ),
     (
         "crates/nn-linux/src/sandbox/mod.rs",

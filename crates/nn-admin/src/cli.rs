@@ -5826,7 +5826,8 @@ fn window_generation(given: Option<u64>) -> std::result::Result<u64, ExitCode> {
 }
 
 /// Lot 2.3b: a window member's request answered: its detail, and exit 0 on
-/// `Success`, 5 when refused (the agent's reason printed).
+/// `Success`, 9 when refused (verified, nothing done: the agent's reason
+/// printed).
 fn window_member_reply(
     what: &str,
     reply: anyhow::Result<nn_proto::admin_protocol::WindowReply>,
@@ -5838,7 +5839,7 @@ fn window_member_reply(
         }
         Ok(r) => {
             eprintln!("{what}: refused ({:?}): {}", r.result, r.detail);
-            ExitCode::from(5)
+            ExitCode::from(9)
         }
         Err(e) => exit_from_request_error(what, &e),
     }
@@ -5862,7 +5863,9 @@ fn accepted_digests(what: &str, given: &[String]) -> std::result::Result<Vec<[u8
 }
 
 /// Lot 2.3b: a tree grant asked: the agent's reply printed — its detail on
-/// success, its reason on a refusal (exit 5) — and the window's number.
+/// success, its reason on a refusal (exit 9: verified, nothing armed; a
+/// signature, role or protocol failure keeps its own code) — and the
+/// window's number.
 fn tree_grant_reply(
     what: &str,
     socket: &std::path::Path,
@@ -5880,10 +5883,26 @@ fn tree_grant_reply(
                 "{what}: the agent refused the window ({:?}), nothing armed: {}",
                 r.result, r.detail
             );
-            Err(ExitCode::from(5))
+            Err(window_refusal_code(&r.result))
         }
         Err(e) => Err(exit_from_request_error(what, &e)),
     }
+}
+
+/// Lot 2.3b: the exit status of a refused tree grant, by the agent's
+/// result — the shared table's (NN_ADMIN.md, "Exit codes"): 9 when it
+/// verified the grant and armed nothing.
+fn window_refusal_code(r: &nn_proto::admin_protocol::AdminResult) -> ExitCode {
+    use nn_proto::admin_protocol::AdminResult as R;
+    ExitCode::from(match r {
+        R::InvalidSignature => 2,
+        R::NoPendingChallenge => 3,
+        R::RateLimited { .. } => 4,
+        R::QuorumNotMet { .. } => 6,
+        R::RoleDenied => 7,
+        R::ActionFailed => 9,
+        _ => 5,
+    })
 }
 
 /// Lot 2.3b (D2): `nn-admin window-run -- <command>` — this process is the
