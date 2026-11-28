@@ -2724,11 +2724,12 @@ mod tests {
         );
         #[cfg(feature = "debug-trigger")]
         {
+            // lot 2.3b: after the window's three appended variants
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                62
+                65
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 63);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 66);
         }
     }
 

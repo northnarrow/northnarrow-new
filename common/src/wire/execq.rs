@@ -224,7 +224,12 @@ pub struct ExecqStopped {
 /// root — from anyone but the agent's family (`family`), so that only the
 /// agent's verdict resumes it. An entry of another process (a pid reused) is
 /// none.
-pub const fn execq_resume_refused(sig: i32, held: Option<&ExecqStopped>, target_start_ns: u64, family: bool) -> bool {
+pub const fn execq_resume_refused(
+    sig: i32,
+    held: Option<&ExecqStopped>,
+    target_start_ns: u64,
+    family: bool,
+) -> bool {
     match held {
         Some(h) => sig == 18 && h.start_ns == target_start_ns && !family,
         None => false,
@@ -779,10 +784,18 @@ mod resume_tests {
             stop_ns: 800,
         };
         assert!(execq_resume_refused(18, Some(&h), 777, false));
-        assert!(!execq_resume_refused(18, Some(&h), 777, true), "the agent's verdict");
-        assert!(!execq_resume_refused(18, Some(&h), 778, false), "a reused pid");
-        assert!(!execq_resume_refused(15, Some(&h), 777, false), "not a resume");
+        assert!(
+            !execq_resume_refused(18, Some(&h), 777, true),
+            "the agent's verdict"
+        );
+        assert!(
+            !execq_resume_refused(18, Some(&h), 778, false),
+            "a reused pid"
+        );
+        assert!(
+            !execq_resume_refused(15, Some(&h), 777, false),
+            "not a resume"
+        );
         assert!(!execq_resume_refused(18, None, 777, false), "not held");
     }
 }
-

@@ -107,13 +107,13 @@ use super::{
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
-pub use nn_proto::admin_signed_payload::TreeRootKind;
 use common::wire::{
     FROZEN_INODES_MAP_NAME, FROZEN_NAMES_MAP_NAME, FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2,
     INODE_EXT_MAP_NAME, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBER_ROOT,
     TREE_MEMBERS_MAP_NAME, TreeMember, WINDOW_LEASES_MAP_NAME, WINDOW_LEASES_MAX, WINDOW_MAX_NS,
     WindowLease,
 };
+pub use nn_proto::admin_signed_payload::TreeRootKind;
 
 // R08b (lab PR 251): the agent's own units and a window's grant are the
 // window's vocabulary, which the rules moving to nn-core read (NN-L-FIM-009,
@@ -974,7 +974,9 @@ impl TrustedInstallerOverride {
             Err(e) => {
                 return Err(withdrawn(
                     maps,
-                    format!("PID 1's environment could not be read, so the window could not watch it: {e}"),
+                    format!(
+                        "PID 1's environment could not be read, so the window could not watch it: {e}"
+                    ),
                 ));
             }
         };
@@ -1090,7 +1092,11 @@ impl TrustedInstallerOverride {
         };
         if let Some(reason) = reason {
             // lot 2.3b: PID 1's environment, at the close too
-            let at_grant = tree.open.as_ref().map(|w| w.pid1_env.clone()).unwrap_or_default();
+            let at_grant = tree
+                .open
+                .as_ref()
+                .map(|w| w.pid1_env.clone())
+                .unwrap_or_default();
             let closed = close_tree_locked(&mut tree, &self.tree_armed, maps);
             drop(tree);
             self.pid1_env_at_close(reader, &at_grant);
@@ -1163,15 +1169,15 @@ impl TrustedInstallerOverride {
     /// `at_grant`; a change is signed High (the window is closing anyway).
     fn pid1_env_at_close(&self, reader: &dyn LineReader, at_grant: &[String]) {
         match reader.pid1_env() {
-            Ok(now) if nn_core::anti_tamper::trusted_installer::pid1_env_changed(at_grant, &now) => {
-                self.report_pid1_env(
-                    &format!(
-                        "PID 1's manager environment changed during the window (seen at its \
+            Ok(now)
+                if nn_core::anti_tamper::trusted_installer::pid1_env_changed(at_grant, &now) =>
+            {
+                self.report_pid1_env(&format!(
+                    "PID 1's manager environment changed during the window (seen at its \
                          close): {} variable(s) at the grant, {} now",
-                        at_grant.len(),
-                        now.len()
-                    ),
-                );
+                    at_grant.len(),
+                    now.len()
+                ));
             }
             Ok(_) => {}
             Err(e) => warn!(
@@ -1304,7 +1310,9 @@ impl TrustedInstallerOverride {
             None => return false,
         };
         let why = match reader.pid1_env() {
-            Ok(now) if !nn_core::anti_tamper::trusted_installer::pid1_env_changed(&at_grant, &now) => {
+            Ok(now)
+                if !nn_core::anti_tamper::trusted_installer::pid1_env_changed(&at_grant, &now) =>
+            {
                 return false;
             }
             Ok(now) => format!(
@@ -1399,7 +1407,9 @@ impl TrustedInstallerOverride {
         };
         // a slot of this window is never taken again, used or expired: at
         // most WINDOW_LEASES_MAX leases a window
-        let Some(slot) = leases.iter().position(|l| !live(l) && l.generation != generation)
+        let Some(slot) = leases
+            .iter()
+            .position(|l| !live(l) && l.generation != generation)
         else {
             return Err(format!(
                 "no lease slot is free: this window armed its {WINDOW_LEASES_MAX} already"
@@ -1872,14 +1882,20 @@ impl LineReader for ProcFs<'_> {
     }
 
     fn cmdline(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
-        let raw = antitamper_bpf::kernel_roots::read(self.0.join(pid.to_string()).join("cmdline"), 64 * 1024)
-            .map_err(|e| format!("process {pid}'s command line: {e}"))?;
+        let raw = antitamper_bpf::kernel_roots::read(
+            self.0.join(pid.to_string()).join("cmdline"),
+            64 * 1024,
+        )
+        .map_err(|e| format!("process {pid}'s command line: {e}"))?;
         Ok(nul_split(&raw))
     }
 
     fn environ(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
-        let raw = antitamper_bpf::kernel_roots::read(self.0.join(pid.to_string()).join("environ"), 64 * 1024)
-            .map_err(|e| format!("process {pid}'s environment: {e}"))?;
+        let raw = antitamper_bpf::kernel_roots::read(
+            self.0.join(pid.to_string()).join("environ"),
+            64 * 1024,
+        )
+        .map_err(|e| format!("process {pid}'s environment: {e}"))?;
         Ok(nul_split(&raw))
     }
 
@@ -1906,7 +1922,9 @@ impl LineReader for ProcFs<'_> {
         let path = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            let cwd = antitamper_bpf::kernel_roots::read_link(self.0.join(pid.to_string()).join("cwd")).ok()?;
+            let cwd =
+                antitamper_bpf::kernel_roots::read_link(self.0.join(pid.to_string()).join("cwd"))
+                    .ok()?;
             cwd.join(p)
         };
         let f = antitamper_bpf::kernel_roots::open(&path, libc::O_RDONLY | libc::O_CLOEXEC).ok()?;
@@ -2001,7 +2019,10 @@ pub fn line_to_root(
 
 /// Every pinned process of the line still alive (lot 2.3b: the pidfds
 /// taken before the reads; a pid reused meanwhile is another process).
-fn check_pins(line: &[(u32, u64)], pins: &[(u32, Box<dyn ProcPin>)]) -> std::result::Result<(), String> {
+fn check_pins(
+    line: &[(u32, u64)],
+    pins: &[(u32, Box<dyn ProcPin>)],
+) -> std::result::Result<(), String> {
     for (pid, pin) in pins {
         if !pin.alive() {
             return Err(format!(
@@ -2134,7 +2155,13 @@ pub fn admit_line(
         is_our_scriptlet_env, is_system_shell, package_manager,
     };
     let mut pins = Vec::new();
-    let line = walk_line(reader, requester, (root.pid, root.start_ticks), own, &mut pins)?;
+    let line = walk_line(
+        reader,
+        requester,
+        (root.pid, root.start_ticks),
+        own,
+        &mut pins,
+    )?;
     let kind = root.root_kind.as_str();
     match root.root_kind {
         TreeRootKind::WindowRun => {
@@ -2154,7 +2181,9 @@ pub fn admit_line(
                     ));
                 }
                 None => {
-                    return Err("the installed nn-admin could not be read: no window-run".to_string());
+                    return Err(
+                        "the installed nn-admin could not be read: no window-run".to_string()
+                    );
                 }
             }
         }
@@ -2167,7 +2196,10 @@ pub fn admit_line(
             }
             let (_, exe) = reader.exe(root.pid)?;
             if !is_system_shell(&exe) {
-                return Err(format!("the {kind} root {} runs {exe}, not a system shell", root.pid));
+                return Err(format!(
+                    "the {kind} root {} runs {exe}, not a system shell",
+                    root.pid
+                ));
             }
             if root.script_sha256 == [0; 32] {
                 return Err(format!("an {kind} grant names no script digest"));
@@ -2184,7 +2216,10 @@ pub fn admit_line(
                     root.pid
                 ));
             }
-            if !reader.open_file_digests(root.pid)?.contains(&root.script_sha256) {
+            if !reader
+                .open_file_digests(root.pid)?
+                .contains(&root.script_sha256)
+            {
                 return Err(format!(
                     "the {kind} root {} does not hold the signed script open",
                     root.pid
@@ -3676,7 +3711,10 @@ mod tests {
             Ok(!self.foreign_ns.contains(&pid))
         }
         fn exe(&self, pid: u32) -> std::result::Result<((u64, u64), String), String> {
-            self.exe.get(&pid).cloned().ok_or_else(|| format!("{pid}: no exe"))
+            self.exe
+                .get(&pid)
+                .cloned()
+                .ok_or_else(|| format!("{pid}: no exe"))
         }
         fn cmdline(&self, pid: u32) -> std::result::Result<Vec<String>, String> {
             Ok(self.cmdline.get(&pid).cloned().unwrap_or_default())
@@ -3708,11 +3746,14 @@ mod tests {
     /// window-run: nn-admin (700, started 7000) under a login shell (600).
     fn window_run_host() -> FlowProc {
         let mut f = FlowProc {
-            base: FakeProc::default().with(600, 1, 6_000).with(700, 600, 7_000),
+            base: FakeProc::default()
+                .with(600, 1, 6_000)
+                .with(700, 600, 7_000),
             pid1_env: RefCell::new(Ok(strs(&["LANG=C.UTF-8"]))),
             ..FlowProc::default()
         };
-        f.exe.insert(700, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        f.exe
+            .insert(700, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
         f.exe.insert(600, ((0x803, 1), "/usr/bin/bash".to_string()));
         f
     }
@@ -3733,7 +3774,10 @@ mod tests {
     fn a_window_run_root_is_the_installed_nn_admin_requesting_itself() {
         let host = window_run_host();
         let r = root(700, 7_000, TreeRootKind::WindowRun);
-        assert_eq!(admit_line(&host, 700, &r, &[], Some(ADMIN)), Ok(vec![(700, 7_000)]));
+        assert_eq!(
+            admit_line(&host, 700, &r, &[], Some(ADMIN)),
+            Ok(vec![(700, 7_000)])
+        );
         assert_eq!(host.pins.get(), 1, "pinned before it is read");
         // another nn-admin (a copy elsewhere), no installed one, a root that
         // is not the requester (the login shell)
@@ -3741,8 +3785,14 @@ mod tests {
         assert!(e.contains("not the installed nn-admin"), "{e}");
         let e = admit_line(&host, 700, &r, &[], None).unwrap_err();
         assert!(e.contains("could not be read"), "{e}");
-        let e = admit_line(&host, 700, &root(600, 6_000, TreeRootKind::WindowRun), &[], Some(ADMIN))
-            .unwrap_err();
+        let e = admit_line(
+            &host,
+            700,
+            &root(600, 6_000, TreeRootKind::WindowRun),
+            &[],
+            Some(ADMIN),
+        )
+        .unwrap_err();
         assert!(e.contains("requesting nn-admin itself"), "{e}");
         // its pidfd names no live process after the reads
         let mut dying = window_run_host();
@@ -3772,8 +3822,10 @@ mod tests {
             ..FlowProc::default()
         };
         f.exe.insert(501, ((0x803, 2), "/usr/bin/bash".to_string()));
-        f.exe.insert(502, ((0x803, 3), "/opt/release/nn-admin".to_string()));
-        f.cmdline.insert(501, strs(&["bash", "./install.sh", "--upgrade"]));
+        f.exe
+            .insert(502, ((0x803, 3), "/opt/release/nn-admin".to_string()));
+        f.cmdline
+            .insert(501, strs(&["bash", "./install.sh", "--upgrade"]));
         f.args.insert((501, "./install.sh".to_string()), SCRIPT);
         f.digests.insert(501, vec![[1; 32], SCRIPT]);
         f
@@ -3799,11 +3851,29 @@ mod tests {
         let e = admit_line(&c, 502, &r, &[], None).unwrap_err();
         assert!(e.contains("does not hold the signed script open"), "{e}");
         // another digest signed, none signed
-        let e = admit_line(&script_host(), 502, &TreeRoot { script_sha256: [2; 32], ..r }, &[], None)
-            .unwrap_err();
+        let e = admit_line(
+            &script_host(),
+            502,
+            &TreeRoot {
+                script_sha256: [2; 32],
+                ..r
+            },
+            &[],
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("not started with the signed script"), "{e}");
-        let e = admit_line(&script_host(), 502, &TreeRoot { script_sha256: [0; 32], ..r }, &[], None)
-            .unwrap_err();
+        let e = admit_line(
+            &script_host(),
+            502,
+            &TreeRoot {
+                script_sha256: [0; 32],
+                ..r
+            },
+            &[],
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("no script digest"), "{e}");
         // not a system shell (sshd, tmux, a shell copied to /tmp)
         for exe in ["/usr/sbin/sshd", "/usr/bin/tmux", "/tmp/bash"] {
@@ -3813,8 +3883,14 @@ mod tests {
             assert!(e.contains("not a system shell"), "{exe}: {e}");
         }
         // the grandparent instead of the parent
-        let e = admit_line(&script_host(), 502, &root(400, 100, TreeRootKind::InstallScript), &[], None)
-            .unwrap_err();
+        let e = admit_line(
+            &script_host(),
+            502,
+            &root(400, 100, TreeRootKind::InstallScript),
+            &[],
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("requester's parent"), "{e}");
     }
 
@@ -3830,13 +3906,20 @@ mod tests {
                 .with(330, 320, 3_300),
             ..FlowProc::default()
         };
-        f.exe.insert(300, ((0x803, 10), "/usr/bin/dpkg".to_string()));
-        f.cmdline.insert(300, strs(&["dpkg", "-i", "northnarrow.deb"]));
-        f.exe.insert(310, ((0x803, 11), "/usr/bin/dash".to_string()));
-        f.exe.insert(320, ((0x803, 12), "/usr/bin/bash".to_string()));
+        f.exe
+            .insert(300, ((0x803, 10), "/usr/bin/dpkg".to_string()));
+        f.cmdline
+            .insert(300, strs(&["dpkg", "-i", "northnarrow.deb"]));
+        f.exe
+            .insert(310, ((0x803, 11), "/usr/bin/dash".to_string()));
+        f.exe
+            .insert(320, ((0x803, 12), "/usr/bin/bash".to_string()));
         f.environ.insert(
             310,
-            strs(&["DPKG_MAINTSCRIPT_PACKAGE=northnarrow", "DPKG_MAINTSCRIPT_NAME=preinst"]),
+            strs(&[
+                "DPKG_MAINTSCRIPT_PACKAGE=northnarrow",
+                "DPKG_MAINTSCRIPT_NAME=preinst",
+            ]),
         );
         f
     }
@@ -3846,15 +3929,20 @@ mod tests {
     #[test]
     fn a_package_manager_root_runs_its_packaged_program_for_our_scriptlet() {
         let r = root(300, 3_000, TreeRootKind::PackageManager);
-        assert_eq!(admit_line(&package_host(), 330, &r, &[], None).map(|l| l.len()), Ok(4));
+        assert_eq!(
+            admit_line(&package_host(), 330, &r, &[], None).map(|l| l.len()),
+            Ok(4)
+        );
         // another package's scriptlet
         let mut o = package_host();
-        o.environ.insert(310, strs(&["DPKG_MAINTSCRIPT_PACKAGE=other"]));
+        o.environ
+            .insert(310, strs(&["DPKG_MAINTSCRIPT_PACKAGE=other"]));
         let e = admit_line(&o, 330, &r, &[], None).unwrap_err();
         assert!(e.contains("our package's scriptlet"), "{e}");
         // a process between them that is not a shell (a terminal multiplexer)
         let mut m = package_host();
-        m.exe.insert(320, ((0x803, 13), "/usr/bin/tmux".to_string()));
+        m.exe
+            .insert(320, ((0x803, 13), "/usr/bin/tmux".to_string()));
         let e = admit_line(&m, 330, &r, &[], None).unwrap_err();
         assert!(e.contains("not a system shell"), "{e}");
         // not a package manager (cron, a user's copy of dpkg)
@@ -3866,8 +3954,18 @@ mod tests {
         }
         // the scriptlet's parent's parent (the session above dpkg)
         let mut s = package_host();
-        s.exe.insert(290, ((0x803, 14), "/usr/sbin/sshd".to_string()));
-        assert!(admit_line(&s, 330, &root(290, 50, TreeRootKind::PackageManager), &[], None).is_err());
+        s.exe
+            .insert(290, ((0x803, 14), "/usr/sbin/sshd".to_string()));
+        assert!(
+            admit_line(
+                &s,
+                330,
+                &root(290, 50, TreeRootKind::PackageManager),
+                &[],
+                None
+            )
+            .is_err()
+        );
         // the line's processes are pinned, each before its read
         let p = package_host();
         admit_line(&p, 330, &r, &[], None).unwrap();
@@ -3907,12 +4005,18 @@ mod tests {
         assert!(inodes.contains(&(key(10), FROZEN_SUBTREE)));
         assert!(inodes.contains(&(key(2), FROZEN_SELF)));
         assert!(inodes.contains(&(key(30), FROZEN_SUBTREE)));
-        assert!(inodes.contains(&(key(40), FROZEN_SUBTREE | FROZEN_SELF)), "{inodes:?}");
+        assert!(
+            inodes.contains(&(key(40), FROZEN_SUBTREE | FROZEN_SELF)),
+            "{inodes:?}"
+        );
         let name = |dir, n: &str| common::wire::FrozenName {
             dir,
             name: common::window_tree::name_words4(n.as_bytes()),
         };
-        assert!(plan.contains(&FreezeMark::Name(name(key(3), "ld.so.preload"), FROZEN_SUBTREE)));
+        assert!(plan.contains(&FreezeMark::Name(
+            name(key(3), "ld.so.preload"),
+            FROZEN_SUBTREE
+        )));
         assert!(plan.contains(&FreezeMark::Name(name(key(1), "bin"), FROZEN_SUBTREE)));
         assert!(plan.contains(&FreezeMark::Name(name(key(1), "usr"), FROZEN_SELF)));
         assert!(plan.contains(&FreezeMark::Name(name(key(2), "bin"), FROZEN_SUBTREE)));
@@ -3945,8 +4049,15 @@ mod tests {
         fn zero_closed(&mut self) -> std::result::Result<(), String> {
             self.base.zero_closed()
         }
-        fn put_frozen_inode(&mut self, k: InodeKey, v: [u64; 2]) -> std::result::Result<(), String> {
-            self.base.ops.push(format!("frozen inode {} gen {} reach {}", k.ino, v[0], v[1]));
+        fn put_frozen_inode(
+            &mut self,
+            k: InodeKey,
+            v: [u64; 2],
+        ) -> std::result::Result<(), String> {
+            self.base.ops.push(format!(
+                "frozen inode {} gen {} reach {}",
+                k.ino, v[0], v[1]
+            ));
             self.frozen.push(FreezeMark::Inode(k, v[1]));
             Ok(())
         }
@@ -3955,7 +4066,9 @@ mod tests {
             n: common::wire::FrozenName,
             v: [u64; 2],
         ) -> std::result::Result<(), String> {
-            self.base.ops.push(format!("frozen name in {} gen {}", n.dir.ino, v[0]));
+            self.base
+                .ops
+                .push(format!("frozen name in {} gen {}", n.dir.ino, v[0]));
             self.frozen.push(FreezeMark::Name(n, v[1]));
             Ok(())
         }
@@ -4018,7 +4131,10 @@ mod tests {
         let mut maps = FlowMaps::default();
         let g = arm_window_run(&ov, &mut maps, &host);
         let ops = &maps.base.ops;
-        let frozen = ops.iter().position(|o| o.starts_with("frozen inode 10 gen 1")).unwrap();
+        let frozen = ops
+            .iter()
+            .position(|o| o.starts_with("frozen inode 10 gen 1"))
+            .unwrap();
         let grant = ops.iter().position(|o| o == "grant gen 1").unwrap();
         assert!(frozen < grant, "{ops:?}");
         assert!(ov.close_tree_with(&mut maps, "test"));
@@ -4046,7 +4162,14 @@ mod tests {
         let unread = window_run_host();
         *unread.pid1_env.borrow_mut() = Err("no bus".to_string());
         let e = ov
-            .arm_tree_noted(Some(&mut maps), &unread, &[], NOW, (120, (700, 7_000), &[(700, 7_000)]), serde_json::Value::Null)
+            .arm_tree_noted(
+                Some(&mut maps),
+                &unread,
+                &[],
+                NOW,
+                (120, (700, 7_000), &[(700, 7_000)]),
+                serde_json::Value::Null,
+            )
             .unwrap_err();
         assert!(e.contains("PID 1's environment could not be read"), "{e}");
         assert!(maps.base.members.is_empty() && !ov.tree_window_open());
@@ -4063,11 +4186,14 @@ mod tests {
         assert_eq!(arm_window_run(&ov, &mut maps, &host), 1);
         // the root 700 is gone; nn-admin 701 asks the next window
         let mut next = FlowProc {
-            base: FakeProc::default().with(600, 1, 6_000).with(701, 600, 7_100),
+            base: FakeProc::default()
+                .with(600, 1, 6_000)
+                .with(701, 600, 7_100),
             pid1_env: RefCell::new(Ok(strs(&["LANG=C.UTF-8"]))),
             ..FlowProc::default()
         };
-        next.exe.insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        next.exe
+            .insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
         let g = ov
             .arm_tree_noted(
                 Some(&mut maps),
@@ -4085,7 +4211,8 @@ mod tests {
         arm_window_run(&ov, &mut maps, &host);
         let mut both = window_run_host();
         both.base = both.base.with(701, 600, 7_100);
-        both.exe.insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
+        both.exe
+            .insert(701, (ADMIN, "/usr/local/bin/nn-admin".to_string()));
         let e = ov
             .arm_tree_noted(
                 Some(&mut maps),
@@ -4107,7 +4234,10 @@ mod tests {
         let ov = flow_override();
         let mut maps = FlowMaps::default();
         let g = arm_window_run(&ov, &mut maps, &host);
-        assert_eq!(ov.window_member_with(&mut maps, &host, 700, g), Ok((700, 7_000)));
+        assert_eq!(
+            ov.window_member_with(&mut maps, &host, 700, g),
+            Ok((700, 7_000))
+        );
         // another generation, an outsider, PID 1, a reused pid
         assert!(ov.window_member_with(&mut maps, &host, 700, g + 1).is_err());
         let e = ov.window_member_with(&mut maps, &host, 600, g).unwrap_err();
@@ -4117,7 +4247,9 @@ mod tests {
             base: FakeProc::default().with(700, 600, 7_777),
             ..FlowProc::default()
         };
-        let e = ov.window_member_with(&mut maps, &reused, 700, g).unwrap_err();
+        let e = ov
+            .window_member_with(&mut maps, &reused, 700, g)
+            .unwrap_err();
         assert!(e.contains("another process's start"), "{e}");
         // traced or filtered now, outside the namespaces, gone meanwhile
         let mut t = window_run_host();
@@ -4137,7 +4269,8 @@ mod tests {
     const LINK: &str = "/etc/systemd/system/multi-user.target.wants/northnarrow-agent.service";
 
     fn links_stat(p: &Path) -> Option<InodeKey> {
-        (p == Path::new("/etc/systemd/system/multi-user.target.wants")).then_some(InodeKey { dev: 8, ino: 77 })
+        (p == Path::new("/etc/systemd/system/multi-user.target.wants"))
+            .then_some(InodeKey { dev: 8, ino: 77 })
     }
 
     /// Lot 2.3b (the leases): one lease per link, bound to the registered
@@ -4162,34 +4295,68 @@ mod tests {
         assert_eq!(l.expires_boot_ns, NOW + common::wire::WINDOW_LEASE_TTL_NS);
         // the kernel's test lets that very removal through, once
         let grant = maps.base.grant;
-        assert!(l.usable_for(&grant, l.dir, l.name_hash, common::wire::LEASE_REMOVE, NOW + 1, test_nonce()));
+        assert!(l.usable_for(
+            &grant,
+            l.dir,
+            l.name_hash,
+            common::wire::LEASE_REMOVE,
+            NOW + 1,
+            test_nonce()
+        ));
         // a second lease takes another slot
-        let other = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap();
+        let other = ov
+            .arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+            .unwrap();
         assert_ne!(other, slot);
         // not one of our links, a directory not registered, another window
         for bad in [
             "/etc/systemd/system/multi-user.target.wants/sshd.service",
             "/etc/systemd/system/northnarrow-agent.service",
         ] {
-            assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, bad).is_err(), "{bad}");
+            assert!(
+                ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, bad)
+                    .is_err(),
+                "{bad}"
+            );
         }
         maps.ext.clear();
-        let e = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap_err();
+        let e = ov
+            .arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+            .unwrap_err();
         assert!(e.contains("not a directory of our units' links"), "{e}");
         maps.ext.insert((8, 77), common::wire::INODE_EXT_UNIT_LINKS);
-        assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g + 1, LINK).is_err());
+        assert!(
+            ov.arm_lease_with(
+                &mut maps,
+                &host,
+                &links_stat,
+                NOW,
+                (700, 7_000),
+                g + 1,
+                LINK
+            )
+            .is_err()
+        );
         // at most WINDOW_LEASES_MAX a window
         let mut armed = 2;
-        while ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).is_ok() {
+        while ov
+            .arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+            .is_ok()
+        {
             armed += 1;
         }
         assert_eq!(armed, WINDOW_LEASES_MAX as usize);
         // a slot this window used (or let expire) is not armed again
         maps.leases[0].used = 1;
-        let e = ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).unwrap_err();
+        let e = ov
+            .arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+            .unwrap_err();
         assert!(e.contains("no lease slot is free"), "{e}");
         let late = NOW + 2 * common::wire::WINDOW_LEASE_TTL_NS;
-        assert!(ov.arm_lease_with(&mut maps, &host, &links_stat, late, (700, 7_000), g, LINK).is_err());
+        assert!(
+            ov.arm_lease_with(&mut maps, &host, &links_stat, late, (700, 7_000), g, LINK)
+                .is_err()
+        );
     }
 
     /// Lot 2.3b (D5, refinement 2): PID 1's environment changed since the
@@ -4205,7 +4372,8 @@ mod tests {
             let g = arm_window_run(&ov, &mut maps, &host);
             *host.pid1_env.borrow_mut() = Ok(strs(&["LANG=C.UTF-8", "LD_PRELOAD=/tmp/x.so"]));
             let r = if lease {
-                ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK).map(|_| "")
+                ov.arm_lease_with(&mut maps, &host, &links_stat, NOW, (700, 7_000), g, LINK)
+                    .map(|_| "")
             } else {
                 ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g, false)
             };
@@ -4225,7 +4393,10 @@ mod tests {
         let ov = flow_override();
         let mut maps = FlowMaps::default();
         let g = arm_window_run(&ov, &mut maps, &host);
-        assert!(ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g + 1, true).is_err());
+        assert!(
+            ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g + 1, true)
+                .is_err()
+        );
         assert_eq!(ov.take_controlled_stop(), None);
         assert_eq!(
             ov.controlled_stop_with(&mut maps, &host, (700, 7_000), g, true),
@@ -4242,4 +4413,3 @@ mod tests {
         assert!(!ov.is_window_open());
     }
 }
-

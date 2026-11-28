@@ -239,10 +239,15 @@ pub async fn serve_with_marker_path(
     // Lot 2.3b (scaffold+): the socket in the protected set, its directory
     // never renamed; the watch's rebind below stays the fallback
     let protect = |p: &std::path::Path| {
-        let root = installer_override.as_ref().and_then(|o| o.bpffs_root().map(std::path::Path::to_path_buf));
+        let root = installer_override
+            .as_ref()
+            .and_then(|o| o.bpffs_root().map(std::path::Path::to_path_buf));
         if let Some(root) = root {
             if let Err(e) = nn_linux::anti_tamper::filesystem::protect_admin_socket(&root, p) {
-                warn!(error = format!("{e:#}"), "admin socket not added to the protected set");
+                warn!(
+                    error = format!("{e:#}"),
+                    "admin socket not added to the protected set"
+                );
             }
         }
     };

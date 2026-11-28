@@ -1351,12 +1351,21 @@ fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
     let ip = code("agent-ebpf/src/inode_protect.rs");
     for (f, needle) in [
         ("try_inode_unlink", "frozen(dentry_s, FS_OP_UNLINK)"),
-        ("try_inode_rmdir", "frozen(crate::window_tree::raw_arg(ctx, 1), FS_OP_RMDIR)"),
-        ("try_inode_rename", "frozen(old_s, FS_OP_RENAME) || frozen(new_s, FS_OP_RENAME)"),
+        (
+            "try_inode_rmdir",
+            "frozen(crate::window_tree::raw_arg(ctx, 1), FS_OP_RMDIR)",
+        ),
+        (
+            "try_inode_rename",
+            "frozen(old_s, FS_OP_RENAME) || frozen(new_s, FS_OP_RENAME)",
+        ),
         ("try_inode_setattr", "frozen(dentry as u64, FS_OP_SETATTR)"),
         ("try_protected_open_deny", "frozen(dentry, FS_OP_WRITE)"),
         ("deny_xattr", "frozen(dentry as u64, FS_OP_XATTR)"),
-        ("deny_new_frozen", "frozen(crate::window_tree::raw_arg(ctx, dentry_arg), operation)"),
+        (
+            "deny_new_frozen",
+            "frozen(crate::window_tree::raw_arg(ctx, dentry_arg), operation)",
+        ),
     ] {
         assert!(body(&ip, f).contains(needle), "{f}: {needle}");
     }
@@ -1369,9 +1378,13 @@ fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
     ] {
         assert!(body(&ip, p).contains("deny_new_frozen(&ctx,"), "{p}");
     }
-    assert!(body(&ip, "protected_link_deny").contains(", 2, hook::INODE_LINK"), "the new name");
     assert!(
-        body(&ip, "protected_link_deny").contains("frozen(crate::window_tree::raw_arg(&ctx, 0), FS_OP_LINK)"),
+        body(&ip, "protected_link_deny").contains(", 2, hook::INODE_LINK"),
+        "the new name"
+    );
+    assert!(
+        body(&ip, "protected_link_deny")
+            .contains("frozen(crate::window_tree::raw_arg(&ctx, 0), FS_OP_LINK)"),
         "the linked object: no new name for a frozen file"
     );
     assert!(body(&ip, "frozen").contains("nn_tree_frozen(dentry, u64::from(operation))"));
@@ -1389,11 +1402,15 @@ fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
         ],
     )
     .unwrap();
-    assert!(body(&w, "name_frozen").contains("frozen_verdict(FROZEN_NAMES.get(&key), generation, 0)"));
+    assert!(
+        body(&w, "name_frozen").contains("frozen_verdict(FROZEN_NAMES.get(&key), generation, 0)")
+    );
     for p in ["tree_frz_mount", "tree_frz_move"] {
         assert!(body(&w, p).contains("frozen_path(raw_arg(&ctx, 1))"), "{p}");
     }
-    assert!(body(&w, "frozen_path").contains("nn_tree_frozen(dentry as u64, u64::from(FS_OP_MOUNT))"));
+    assert!(
+        body(&w, "frozen_path").contains("nn_tree_frozen(dentry as u64, u64::from(FS_OP_MOUNT))")
+    );
     let names =
         fs::read_to_string(repo_root().join("deploy/lab/lib/our-lsm-programs.txt")).unwrap();
     for p in ["tree_frz_mount", "tree_frz_move"] {
@@ -1477,29 +1494,63 @@ fn window_run_sanitises_and_the_member_requests_are_authenticated_first() {
     .unwrap();
     let inst = code("agent/src/admin/handlers/installer.rs");
     let tg = body(&inst, "tree_grant");
-    in_order(tg, &["interactive_refusal(", "admit_line(", "(host.pregrant)()", "ov.arm_tree("]).unwrap();
-    for host_wide in ["arm_for(", "arm_by(", ".arm(", "write_kill_grant", "legacy_arming"] {
+    in_order(
+        tg,
+        &[
+            "interactive_refusal(",
+            "admit_line(",
+            "(host.pregrant)()",
+            "ov.arm_tree(",
+        ],
+    )
+    .unwrap();
+    for host_wide in [
+        "arm_for(",
+        "arm_by(",
+        ".arm(",
+        "write_kill_grant",
+        "legacy_arming",
+    ] {
         assert!(!tg.contains(host_wide), "the tree grant arms {host_wide}");
     }
     let win = code("agent/src/admin/handlers/window.rs");
     in_order(
         body(&win, "dispatch_window_control"),
-        &["ov.window_member(requester, req.generation)", "ov.controlled_stop(", "write_marker(", ".fire()"],
+        &[
+            "ov.window_member(requester, req.generation)",
+            "ov.controlled_stop(",
+            "write_marker(",
+            ".fire()",
+        ],
     )
     .unwrap();
     in_order(
         body(&win, "dispatch_window_lease"),
-        &["ov.window_member(requester, req.generation)", "ov.arm_lease("],
+        &[
+            "ov.window_member(requester, req.generation)",
+            "ov.arm_lease(",
+        ],
     )
     .unwrap();
     let ti = code("crates/nn-linux/src/anti_tamper/trusted_installer.rs");
     in_order(
         body(&ti, "window_member_with"),
-        &["reader.pin(requester)", "reader.hop(requester)", "maps.member(requester)", "reader.guards(requester)", "reader.ns_initial(requester)", "pin.alive()"],
+        &[
+            "reader.pin(requester)",
+            "reader.hop(requester)",
+            "maps.member(requester)",
+            "reader.guards(requester)",
+            "reader.ns_initial(requester)",
+            "pin.alive()",
+        ],
     )
     .unwrap();
     // the admission pins each process before it reads it, and checks them after
-    in_order(body(&ti, "walk_line"), &["pins.push((pid, reader.pin(pid)?))", "reader.hop(pid)?"]).unwrap();
+    in_order(
+        body(&ti, "walk_line"),
+        &["pins.push((pid, reader.pin(pid)?))", "reader.hop(pid)?"],
+    )
+    .unwrap();
     assert!(body(&ti, "admit_line").contains("check_pins(&line, &pins)?"));
 }
 
@@ -1513,22 +1564,36 @@ fn a_held_process_is_resumed_by_the_agent_only_and_the_socket_is_protected() {
     let k = code("agent-ebpf/src/task_kill.rs");
     in_order(
         body(&k, "try_task_kill"),
-        &["execq_held_resume(target as *const u8, target_tgid, sig, caller_tgid)", "return -EPERM;", "observe_defender(target_tgid, sig);"],
+        &[
+            "execq_held_resume(target as *const u8, target_tgid, sig, caller_tgid)",
+            "return -EPERM;",
+            "observe_defender(target_tgid, sig);",
+        ],
     )
     .unwrap();
     in_order(
         body(&k, "execq_held_resume"),
-        &["EXECQ_STOPPED.get(&tgid)", "TASK_STRUCT_GROUP_LEADER_OFFSET", "execq_resume_refused(sig, held, start, is_exempt_pid(caller))"],
+        &[
+            "EXECQ_STOPPED.get(&tgid)",
+            "TASK_STRUCT_GROUP_LEADER_OFFSET",
+            "execq_resume_refused(sig, held, start, is_exempt_pid(caller))",
+        ],
     )
     .unwrap();
     let t = code("agent/src/admin/transport.rs");
-    assert_eq!(t.matches("protect(&socket_path);").count(), 2, "at the bind and at each rebind");
+    assert_eq!(
+        t.matches("protect(&socket_path);").count(),
+        2,
+        "at the bind and at each rebind"
+    );
     let f = code("crates/nn-linux/src/anti_tamper/filesystem.rs");
     in_order(
         body(&f, "protect_admin_socket"),
         &["FS_PROTECT_MUTATE", "INODE_EXT_NO_RENAME"],
     )
     .unwrap();
-    assert!(code("crates/nn-linux/src/anti_tamper/mount_guard.rs").contains("\"/run/northnarrow\".to_string(),"));
+    assert!(
+        code("crates/nn-linux/src/anti_tamper/mount_guard.rs")
+            .contains("\"/run/northnarrow\".to_string(),")
+    );
 }
-

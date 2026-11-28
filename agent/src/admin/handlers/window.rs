@@ -69,7 +69,8 @@ pub(in crate::admin) fn dispatch_window_control(
                 return refused(
                     ov,
                     what,
-                    "the window's signed grant is not held: no stand-down can be written".to_string(),
+                    "the window's signed grant is not held: no stand-down can be written"
+                        .to_string(),
                 );
             }
         }

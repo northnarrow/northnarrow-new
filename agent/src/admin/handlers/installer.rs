@@ -104,7 +104,9 @@ fn trusted_installer_grant(
 use nn_proto::admin_protocol::{TrustedInstallerTreeGrantRequest, WindowReply};
 use nn_proto::admin_signed_payload::{MAX_ACCEPTED_FOREIGN, TrustedInstallerTreeGrantExtra};
 
-use crate::anti_tamper::trusted_installer::{LineReader, ProcFs, TreeRoot, TreeRootKind, admit_line};
+use crate::anti_tamper::trusted_installer::{
+    LineReader, ProcFs, TreeRoot, TreeRootKind, admit_line,
+};
 
 /// Where `--interactive` reads whether an unprivileged `TIOCSTI` is open.
 const LEGACY_TIOCSTI: &str = "/proc/sys/dev/tty/legacy_tiocsti";
@@ -134,8 +136,11 @@ pub(in crate::admin) fn interactive_refusal(sysctl: Option<&str>) -> Option<Stri
 /// the agent's own binary, by its `(st_dev, st_ino)`.
 fn installed_admin() -> Option<(u64, u64)> {
     let exe = antitamper_bpf::kernel_roots::current_exe().ok()?;
-    let f = antitamper_bpf::kernel_roots::open(exe.parent()?.join("nn-admin"), libc::O_PATH | libc::O_CLOEXEC)
-        .ok()?;
+    let f = antitamper_bpf::kernel_roots::open(
+        exe.parent()?.join("nn-admin"),
+        libc::O_PATH | libc::O_CLOEXEC,
+    )
+    .ok()?;
     // the kernel's identity, as a process's executable link gives it
     let c = antitamper_bpf::kernel_roots::cached(&f).ok()?;
     Some((c.dev, c.ino))
@@ -290,7 +295,9 @@ pub(in crate::admin) fn tree_grant(
                 line.len()
             );
             if extra.interactive {
-                detail.push_str("; DEGRADED: interactive (the terminal's other end is outside the tree)");
+                detail.push_str(
+                    "; DEGRADED: interactive (the terminal's other end is outside the tree)",
+                );
             }
             if !accepted.is_empty() {
                 detail.push_str(&format!("; {} foreign file(s) accepted", accepted.len()));
@@ -393,7 +400,11 @@ mod tree_tests {
         i.interactive = true;
         for t in [None, Some("1")] {
             let r = tree_grant(&i, Some(&ov), 301, &host(&clean, t));
-            assert!(r.detail.contains("--interactive is refused"), "{}", r.detail);
+            assert!(
+                r.detail.contains("--interactive is refused"),
+                "{}",
+                r.detail
+            );
         }
         // a script root is never interactive
         let mut s = i.clone();

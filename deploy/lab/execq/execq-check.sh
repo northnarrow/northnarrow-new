@@ -279,8 +279,10 @@ fi
 # ── 6c. lot 2.3b: a held process is resumed by the agent's verdict only — a
 # SIGCONT from its own session (this shell, its parent) and from root refused
 spid=$(scanner_pid)
-C=$WORK/nn-cont
-{ cat /usr/bin/true; head -c 32 /dev/urandom; } > "$C" && chmod 0755 "$C"
+# (its own name kept: uutils' multicall binary runs no utility under another)
+mkdir -p "$WORK/nn-cont"
+{ cat /usr/bin/true; head -c 32 /dev/urandom; } > "$WORK/nn-cont/true" && chmod 0755 "$WORK/nn-cont/true"
+C=$WORK/nn-cont/true
 if [[ -n $spid ]]; then
     sudo kill -STOP "$spid"
     "$C" </dev/null >/dev/null 2>&1 & cp=$!

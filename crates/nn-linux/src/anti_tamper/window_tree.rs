@@ -110,26 +110,82 @@ pub enum Has {
 pub const KERNEL_MANIFEST: &[(&str, &str, [Has; 6])] = {
     use Has::{Without as N, Yes as Y};
     &[
-        ("sched_process_fork", "a member's child joins the tree", [Y; 6]),
-        ("sched_process_exit", "an entry leaves with its process", [Y; 6]),
-        ("sched_process_exec", "the eviction rule's environment", [Y; 6]),
+        (
+            "sched_process_fork",
+            "a member's child joins the tree",
+            [Y; 6],
+        ),
+        (
+            "sched_process_exit",
+            "an entry leaves with its process",
+            [Y; 6],
+        ),
+        (
+            "sched_process_exec",
+            "the eviction rule's environment",
+            [Y; 6],
+        ),
         ("task_alloc", "the fork span", [Y; 6]),
         ("task_free", "an entry leaves with its leader", [Y; 6]),
-        ("bprm_check_security", "the exec rule, a script's own file", [Y; 6]),
+        (
+            "bprm_check_security",
+            "the exec rule, a script's own file",
+            [Y; 6],
+        ),
         ("bprm_committed_creds", "the exec rule's final file", [Y; 6]),
         ("mmap_file", "the mapping rule", [Y; 6]),
         ("file_mprotect", "the mapping rule", [Y; 6]),
         ("shm_shmat", "an executable System V segment", [Y; 6]),
-        ("ptrace_access_check", "the members' ptrace, kcmp, pidfd_getfd", [Y; 6]),
-        ("file_receive", "descriptors across the tree's boundary", [Y; 6]),
-        ("sb_mount", "the freeze: a mount on or over the system code", [Y; 6]),
-        ("move_mount", "the freeze: a moved mount onto the system code", [Y; 6]),
-        ("file_open, inode_* (the deny hooks)", "the freeze of the system code, PID 1's leased link removal", [Y; 6]),
-        ("task_struct.start_boottime, ptrace, seccomp.mode, __state", "identity and the per-lift test", [Y; 6]),
-        ("cred.user_ns, nsproxy.pid_ns_for_children, ns inums", "the per-lift namespaces", [Y; 6]),
-        ("mm_struct.env_start, env_end", "the eviction rule's environment", [Y; 6]),
-        ("vm_area_struct.vm_flags, vm_file", "the mprotect judge", [Y; 6]),
-        ("pidfd_open, pidfd_send_signal", "the admission's pidfds (taken before each read)", [Y; 6]),
+        (
+            "ptrace_access_check",
+            "the members' ptrace, kcmp, pidfd_getfd",
+            [Y; 6],
+        ),
+        (
+            "file_receive",
+            "descriptors across the tree's boundary",
+            [Y; 6],
+        ),
+        (
+            "sb_mount",
+            "the freeze: a mount on or over the system code",
+            [Y; 6],
+        ),
+        (
+            "move_mount",
+            "the freeze: a moved mount onto the system code",
+            [Y; 6],
+        ),
+        (
+            "file_open, inode_* (the deny hooks)",
+            "the freeze of the system code, PID 1's leased link removal",
+            [Y; 6],
+        ),
+        (
+            "task_struct.start_boottime, ptrace, seccomp.mode, __state",
+            "identity and the per-lift test",
+            [Y; 6],
+        ),
+        (
+            "cred.user_ns, nsproxy.pid_ns_for_children, ns inums",
+            "the per-lift namespaces",
+            [Y; 6],
+        ),
+        (
+            "mm_struct.env_start, env_end",
+            "the eviction rule's environment",
+            [Y; 6],
+        ),
+        (
+            "vm_area_struct.vm_flags, vm_file",
+            "the mprotect judge",
+            [Y; 6],
+        ),
+        (
+            "pidfd_open, pidfd_send_signal",
+            "the admission's pidfds (taken before each read)",
+            [Y; 6],
+        ),
         (
             "SO_PEERPIDFD (6.5)",
             "the requester's pidfd: without it, a pidfd of the SO_PEERCRED pid, its start compared",

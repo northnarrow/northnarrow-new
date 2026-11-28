@@ -3125,11 +3125,7 @@ fn member_request(socket: &Path, msg: AdminMessage) -> Result<WindowReply> {
 /// Lot 2.3b (D1): `nn-admin window-stop` — the controlled stop (both roles
 /// stand down) or restart of the agent, asked by a member of the window
 /// `generation`.
-pub fn run_window_control(
-    socket: &Path,
-    generation: u64,
-    restart: bool,
-) -> Result<WindowReply> {
+pub fn run_window_control(socket: &Path, generation: u64, restart: bool) -> Result<WindowReply> {
     use nn_proto::admin_protocol::{WindowAction, WindowControlRequest};
     member_request(
         socket,
@@ -4250,9 +4246,13 @@ mod tests {
                     &AdminMessage::WindowReply(WindowReply::new(reply, generation, "why")),
                 );
             });
-            let outcome =
-                run_trusted_installer_tree_grant(&socket, &priv_path, &agent_id_path, extra.clone())
-                    .expect("tree grant");
+            let outcome = run_trusted_installer_tree_grant(
+                &socket,
+                &priv_path,
+                &agent_id_path,
+                extra.clone(),
+            )
+            .expect("tree grant");
             assert_eq!(outcome, WindowReply::new(reply, generation, "why"));
             server.join().unwrap();
         }

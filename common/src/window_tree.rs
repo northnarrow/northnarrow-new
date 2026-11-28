@@ -633,7 +633,8 @@ const fn name_hash(n: &[u8]) -> u64 {
 }
 
 /// The lease key of each of [`UNIT_LINK_NAMES`] (`WindowLease::name_hash`).
-pub const UNIT_LINK_HASHES: [u64; 2] = [name_hash(UNIT_LINK_NAMES[0]), name_hash(UNIT_LINK_NAMES[1])];
+pub const UNIT_LINK_HASHES: [u64; 2] =
+    [name_hash(UNIT_LINK_NAMES[0]), name_hash(UNIT_LINK_NAMES[1])];
 
 /// The lease key of an entry named `w` ([`name_words4`]): one of our units'
 /// enablement links' hashes ([`UNIT_LINK_HASHES`]), or `None` for any other
@@ -685,7 +686,8 @@ pub const fn frozen_verdict(value: Option<&[u64; 2]>, generation: u64, level: u3
     };
     generation != 0
         && v[0] == generation
-        && (v[1] & crate::wire::FROZEN_SUBTREE != 0 || (level == 0 && v[1] & crate::wire::FROZEN_SELF != 0))
+        && (v[1] & crate::wire::FROZEN_SUBTREE != 0
+            || (level == 0 && v[1] & crate::wire::FROZEN_SELF != 0))
 }
 
 // ── records ────────────────────────────────────────────────────────────
@@ -1517,7 +1519,11 @@ mod tests {
         let ext = Some(INODE_EXT_UNIT_LINKS);
         assert_eq!(lease_applies(1, ext, &ours), Some(UNIT_LINK_HASHES[0]));
         assert_eq!(lease_applies(2, ext, &ours), None, "not PID 1");
-        assert_eq!(lease_applies(1, Some(INODE_EXT_NO_RENAME), &ours), None, "not a links directory");
+        assert_eq!(
+            lease_applies(1, Some(INODE_EXT_NO_RENAME), &ours),
+            None,
+            "not a links directory"
+        );
         assert_eq!(lease_applies(1, None, &ours), None);
         assert_eq!(lease_applies(1, ext, &other), None, "not our link");
     }
@@ -1531,9 +1537,15 @@ mod tests {
         let own = [5u64, FROZEN_SELF];
         assert!(frozen_verdict(Some(&sub), 5, 0) && frozen_verdict(Some(&sub), 5, 7));
         assert!(frozen_verdict(Some(&own), 5, 0));
-        assert!(!frozen_verdict(Some(&own), 5, 1), "an ancestor's own mark binds itself only");
+        assert!(
+            !frozen_verdict(Some(&own), 5, 1),
+            "an ancestor's own mark binds itself only"
+        );
         assert!(!frozen_verdict(Some(&sub), 6, 0), "another window's mark");
-        assert!(!frozen_verdict(Some(&[0, FROZEN_SUBTREE]), 0, 0), "no window");
+        assert!(
+            !frozen_verdict(Some(&[0, FROZEN_SUBTREE]), 0, 0),
+            "no window"
+        );
         assert!(!frozen_verdict(None, 5, 0));
         assert!(!frozen_verdict(Some(&[5, 0]), 5, 0), "no flag");
     }

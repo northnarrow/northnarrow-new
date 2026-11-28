@@ -2861,14 +2861,20 @@ pub fn protect_admin_socket(pin_root: &Path, path: &Path) -> Result<()> {
     let key_of = |p: &Path| -> Result<InodeKey> {
         let m = antitamper_bpf::kernel_roots::symlink_metadata(p)
             .with_context(|| format!("stat {}", p.display()))?;
-        Ok(InodeKey { dev: stat_dev_to_kernel_dev(m.dev()), ino: m.ino() })
+        Ok(InodeKey {
+            dev: stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+        })
     };
     let sock = key_of(path)?;
     register_runtime_inodes(pin_root, &[((sock.dev, sock.ino), FS_PROTECT_MUTATE)])?;
-    let Some(dir) = path.parent() else { return Ok(()) };
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
     let dir = AyaInodeKey(key_of(dir)?);
     let name = common::wire::INODE_EXT_MAP_NAME;
-    let md = MapData::from_pin(pin_root.join(name)).with_context(|| format!("opening pinned {name}"))?;
+    let md =
+        MapData::from_pin(pin_root.join(name)).with_context(|| format!("opening pinned {name}"))?;
     let mut ext: AyaHashMap<MapData, AyaInodeKey, u8> = AyaHashMap::try_from(AyaMap::HashMap(md))?;
     let have = ext.get(&dir, 0).unwrap_or(0);
     ext.insert(&dir, &(have | common::wire::INODE_EXT_NO_RENAME), 0)

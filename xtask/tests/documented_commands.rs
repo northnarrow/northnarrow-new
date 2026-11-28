@@ -631,7 +631,10 @@ fn the_checker_reads_commands_and_refuses_wrong_ones() {
     assert!(say(&["nosuch"]).unwrap().contains("no command"));
     // lot 2.3b: `--` ends the options, the command after it is checked as
     // nothing of nn-admin's; an option before it still is
-    assert_eq!(say(&["window-run", "--key", "k", "--", "apt", "--yes"]), None);
+    assert_eq!(
+        say(&["window-run", "--key", "k", "--", "apt", "--yes"]),
+        None
+    );
     assert!(
         say(&["window-run", "--key", "k", "--nosuch", "--", "apt"])
             .unwrap()

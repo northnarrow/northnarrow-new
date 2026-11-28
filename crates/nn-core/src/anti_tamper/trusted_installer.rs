@@ -225,7 +225,11 @@ const PYTHON_PACKAGE_MANAGERS: &[&str] = &[
 /// The package manager `exe` (resolved) running `cmdline` is, by its
 /// packaged program: `dpkg`, `rpm`, … — `None` for any other process.
 pub fn package_manager(exe: &str, cmdline: &[String]) -> Option<&'static str> {
-    let usr = |p: &str| p.strip_prefix("/usr").filter(|r| r.starts_with('/')).map(str::to_string);
+    let usr = |p: &str| {
+        p.strip_prefix("/usr")
+            .filter(|r| r.starts_with('/'))
+            .map(str::to_string)
+    };
     if let Some(m) = PACKAGE_MANAGERS
         .iter()
         .find(|m| **m == exe || usr(m).as_deref() == Some(exe))
@@ -234,8 +238,7 @@ pub fn package_manager(exe: &str, cmdline: &[String]) -> Option<&'static str> {
     }
     let python = ["/usr/bin/", "/usr/libexec/"].iter().any(|d| {
         exe.strip_prefix(d).is_some_and(|n| {
-            (n.starts_with("python3") || n.starts_with("platform-python"))
-                && !n.contains('/')
+            (n.starts_with("python3") || n.starts_with("platform-python")) && !n.contains('/')
         })
     });
     if !python {
@@ -353,9 +356,9 @@ fn frozen_names_of(frozen: &[(&'static str, Freeze)]) -> Vec<(&'static str, &'st
             let (parent, name) = path.rsplit_once('/')?;
             let parent = if parent.is_empty() { "/" } else { parent };
             // component by component (`/usr/lib64` is not below `/usr/lib`)
-            let under_subtree = frozen.iter().any(|(p, h)| {
-                *h == Freeze::Subtree && std::path::Path::new(parent).starts_with(p)
-            });
+            let under_subtree = frozen
+                .iter()
+                .any(|(p, h)| *h == Freeze::Subtree && std::path::Path::new(parent).starts_with(p));
             (!under_subtree && !name.is_empty()).then_some((parent, name, *how))
         })
         .collect()
@@ -390,9 +393,11 @@ pub fn lease_link(path: &str) -> Option<(&str, &str)> {
     if !is_unit_link_name(name) {
         return None;
     }
-    let target = UNIT_LINK_ROOTS
-        .iter()
-        .find_map(|r| format!("{dir}/").strip_prefix(r).map(|t| t.trim_end_matches('/').to_string()))?;
+    let target = UNIT_LINK_ROOTS.iter().find_map(|r| {
+        format!("{dir}/")
+            .strip_prefix(r)
+            .map(|t| t.trim_end_matches('/').to_string())
+    })?;
     let unit = target
         .strip_suffix(".wants")
         .or_else(|| target.strip_suffix(".requires"))?;
@@ -423,7 +428,9 @@ mod window_flow_tests {
     use super::*;
 
     fn s(v: &[(&str, &str)]) -> Vec<(String, String)> {
-        v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// Lot 2.3b (the re-check of #647): `window-run`'s command gets the
@@ -434,7 +441,10 @@ mod window_flow_tests {
     fn window_run_keeps_the_allowlist_and_the_system_path_only() {
         let env = window_run_env(s(&[
             ("PATH", "/home/u/bin:/usr/bin"),
-            ("BASH_FUNC_which%%", "() { ( alias; eval ${which_declare} ) | /usr/bin/which }"),
+            (
+                "BASH_FUNC_which%%",
+                "() { ( alias; eval ${which_declare} ) | /usr/bin/which }",
+            ),
             ("LD_PRELOAD", "/tmp/x.so"),
             ("SHELLOPTS", "xtrace"),
             ("PS4", "$(id)"),
@@ -467,9 +477,19 @@ mod window_flow_tests {
         assert!(env.contains(&("PATH".to_string(), WINDOW_RUN_PATH.to_string())));
         // a zone by its name is kept, by a path it is not
         let tz = window_run_env(s(&[("TZ", "Europe/Rome"), ("LANGUAGE", "it:en")]));
-        assert!(tz.contains(&("TZ".to_string(), "Europe/Rome".to_string())), "{tz:?}");
-        assert!(tz.contains(&("LANGUAGE".to_string(), "it:en".to_string())), "{tz:?}");
-        assert!(window_run_env(s(&[("TZ", "/etc/x")])).iter().all(|(k, _)| k != "TZ"));
+        assert!(
+            tz.contains(&("TZ".to_string(), "Europe/Rome".to_string())),
+            "{tz:?}"
+        );
+        assert!(
+            tz.contains(&("LANGUAGE".to_string(), "it:en".to_string())),
+            "{tz:?}"
+        );
+        assert!(
+            window_run_env(s(&[("TZ", "/etc/x")]))
+                .iter()
+                .all(|(k, _)| k != "TZ")
+        );
     }
 
     /// Lot 2.3b: no name `window-run` keeps is one the kernel's eviction
@@ -499,14 +519,26 @@ mod window_flow_tests {
     fn the_admission_shapes_are_told_by_their_program() {
         assert!(is_system_shell("/usr/bin/bash") && is_system_shell("/bin/sh"));
         assert!(is_system_shell("/usr/bin/dash"));
-        for not in ["/tmp/bash", "/usr/local/bin/bash", "/usr/bin/zsh", "/usr/bin/bash5", "/usr/bin/"] {
+        for not in [
+            "/tmp/bash",
+            "/usr/local/bin/bash",
+            "/usr/bin/zsh",
+            "/usr/bin/bash5",
+            "/usr/bin/",
+        ] {
             assert!(!is_system_shell(not), "{not}");
         }
         let cmd = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(package_manager("/usr/bin/dpkg", &cmd(&["dpkg"])), Some("dpkg"));
+        assert_eq!(
+            package_manager("/usr/bin/dpkg", &cmd(&["dpkg"])),
+            Some("dpkg")
+        );
         assert_eq!(package_manager("/bin/rpm", &cmd(&["rpm"])), Some("rpm"));
         assert_eq!(
-            package_manager("/usr/bin/python3.9", &cmd(&["/usr/bin/python3", "/usr/bin/dnf", "install"])),
+            package_manager(
+                "/usr/bin/python3.9",
+                &cmd(&["/usr/bin/python3", "/usr/bin/dnf", "install"])
+            ),
             Some("dnf")
         );
         assert_eq!(
@@ -528,11 +560,18 @@ mod window_flow_tests {
         ] {
             assert_eq!(package_manager(exe, &c), None, "{exe} {c:?}");
         }
-        assert!(is_our_scriptlet_env(["A=1", "DPKG_MAINTSCRIPT_PACKAGE=northnarrow"]));
+        assert!(is_our_scriptlet_env([
+            "A=1",
+            "DPKG_MAINTSCRIPT_PACKAGE=northnarrow"
+        ]));
         assert!(is_our_scriptlet_env(["RPM_PACKAGE_NAME=northnarrow"]));
         assert!(!is_our_scriptlet_env(["DPKG_MAINTSCRIPT_PACKAGE=other"]));
-        assert!(!is_our_scriptlet_env(["DPKG_MAINTSCRIPT_PACKAGE=northnarrow-extra"]));
-        assert!(!is_our_scriptlet_env(["XDPKG_MAINTSCRIPT_PACKAGE=northnarrow"]));
+        assert!(!is_our_scriptlet_env([
+            "DPKG_MAINTSCRIPT_PACKAGE=northnarrow-extra"
+        ]));
+        assert!(!is_our_scriptlet_env([
+            "XDPKG_MAINTSCRIPT_PACKAGE=northnarrow"
+        ]));
     }
 
     /// Lot 2.3b (D5): the frozen set holds every class the design names,
@@ -573,7 +612,8 @@ mod window_flow_tests {
             let mut cur = *p;
             while let Some((parent, _)) = cur.rsplit_once('/') {
                 if parent.is_empty()
-                    || ["/etc", "/proc", "/proc/sys", "/proc/sys/fs", "/run", "/var"].contains(&parent)
+                    || ["/etc", "/proc", "/proc/sys", "/proc/sys/fs", "/run", "/var"]
+                        .contains(&parent)
                 {
                     break;
                 }
@@ -591,8 +631,14 @@ mod window_flow_tests {
         assert!(names.contains(&("/", "usr", Freeze::SelfOnly)));
         // `/usr` is rename-only, not a subtree: `/usr/bin` is named there
         assert!(names.contains(&("/usr", "bin", Freeze::Subtree)));
-        assert!(names.contains(&("/", "bin", Freeze::Subtree)), "merged-/usr's link");
-        assert!(!names.iter().any(|(p, _, _)| *p == "/usr/lib"), "below /usr/lib");
+        assert!(
+            names.contains(&("/", "bin", Freeze::Subtree)),
+            "merged-/usr's link"
+        );
+        assert!(
+            !names.iter().any(|(p, _, _)| *p == "/usr/lib"),
+            "below /usr/lib"
+        );
         for (_, n, _) in &names {
             assert!(n.len() <= FROZEN_NAME_MAX && !n.contains('/'), "{n}");
         }
@@ -602,8 +648,14 @@ mod window_flow_tests {
             ("/usr/lib/x", Freeze::Subtree),
             ("/usr/lib64", Freeze::Subtree),
         ]);
-        assert!(!below.iter().any(|(p, n, _)| *p == "/usr/lib" && *n == "x"), "{below:?}");
-        assert!(below.contains(&("/usr", "lib64", Freeze::Subtree)), "not below /usr/lib: {below:?}");
+        assert!(
+            !below.iter().any(|(p, n, _)| *p == "/usr/lib" && *n == "x"),
+            "{below:?}"
+        );
+        assert!(
+            below.contains(&("/usr", "lib64", Freeze::Subtree)),
+            "not below /usr/lib: {below:?}"
+        );
     }
 
     /// Lot 2.3b: a lease names one of our units' enablement links and
@@ -618,8 +670,16 @@ mod window_flow_tests {
             ))
         );
         assert!(lease_link("/etc/systemd/system/northnarrow-agent.service.requires/northnarrow-watchdog.service").is_some());
-        assert_eq!(lease_link("/etc/systemd/system/multi-user.target.wants/northnarrow.slice"), None);
-        assert!(lease_link("/usr/lib/systemd/system/sysinit.target.requires/northnarrow-watchdog.service").is_some());
+        assert_eq!(
+            lease_link("/etc/systemd/system/multi-user.target.wants/northnarrow.slice"),
+            None
+        );
+        assert!(
+            lease_link(
+                "/usr/lib/systemd/system/sysinit.target.requires/northnarrow-watchdog.service"
+            )
+            .is_some()
+        );
         for not in [
             "/etc/systemd/system/northnarrow-agent.service",
             "/etc/systemd/system/multi-user.target.wants/sshd.service",
@@ -640,7 +700,10 @@ mod window_flow_tests {
     fn pid1_s_environment_is_compared_as_a_set() {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(!pid1_env_changed(&v(&["A=1", "B=2"]), &v(&["B=2", "A=1"])));
-        assert!(pid1_env_changed(&v(&["A=1"]), &v(&["A=1", "LD_PRELOAD=/x.so"])));
+        assert!(pid1_env_changed(
+            &v(&["A=1"]),
+            &v(&["A=1", "LD_PRELOAD=/x.so"])
+        ));
         assert!(pid1_env_changed(&v(&["A=1"]), &v(&["A=2"])));
         assert!(pid1_env_changed(&v(&["A=1", "B=2"]), &v(&["A=1"])));
     }

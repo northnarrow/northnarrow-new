@@ -145,7 +145,10 @@ pub(in crate::admin) fn dpkg_conffiles(status: &str) -> HashMap<String, [u8; 16]
         let Ok(bytes) = hex::decode(sum) else {
             continue;
         };
-        if let (true, Ok(md5)) = (path.starts_with('/'), <[u8; 16]>::try_from(bytes.as_slice())) {
+        if let (true, Ok(md5)) = (
+            path.starts_with('/'),
+            <[u8; 16]>::try_from(bytes.as_slice()),
+        ) {
             out.insert(path.to_string(), md5);
         }
     }
@@ -268,8 +271,14 @@ mod tests {
         std::fs::create_dir_all(root.join("etc")).unwrap();
         std::fs::write(root.join("etc/ld.so.preload"), b"/tmp/x.so\n").unwrap();
         let db = Db(HashMap::from([
-            ("/etc/apt/apt.conf.d/01autoremove".to_string(), PkgOutcome::Trusted { manager: "dpkg" }),
-            ("/etc/apt/apt.conf.d/50edited".to_string(), PkgOutcome::Modified { manager: "dpkg" }),
+            (
+                "/etc/apt/apt.conf.d/01autoremove".to_string(),
+                PkgOutcome::Trusted { manager: "dpkg" },
+            ),
+            (
+                "/etc/apt/apt.conf.d/50edited".to_string(),
+                PkgOutcome::Modified { manager: "dpkg" },
+            ),
         ]));
         let r = check(Some(root), &db);
         assert_eq!(r.checked, 4);
@@ -277,7 +286,10 @@ mod tests {
         assert_eq!(
             named,
             [
-                ("/etc/apt/apt.conf.d/50edited", "differs from the package database"),
+                (
+                    "/etc/apt/apt.conf.d/50edited",
+                    "differs from the package database"
+                ),
                 ("/etc/apt/apt.conf.d/99planted", "owned by no package"),
                 ("/etc/ld.so.preload", "owned by no package"),
             ]
@@ -291,10 +303,21 @@ mod tests {
     /// path set there runs as the window's code).
     #[test]
     fn the_package_managers_main_configuration_is_checked() {
-        for f in ["etc/apt/apt.conf", "etc/dpkg/dpkg.cfg", "etc/dnf/dnf.conf", "etc/yum.conf", "etc/ld.so.preload"] {
+        for f in [
+            "etc/apt/apt.conf",
+            "etc/dpkg/dpkg.cfg",
+            "etc/dnf/dnf.conf",
+            "etc/yum.conf",
+            "etc/ld.so.preload",
+        ] {
             assert!(CHECKED_FILES.contains(&f), "{f}");
         }
-        for d in ["etc/apt/apt.conf.d", "etc/dpkg/dpkg.cfg.d", "etc/ld.so.conf.d", "etc/dnf/plugins"] {
+        for d in [
+            "etc/apt/apt.conf.d",
+            "etc/dpkg/dpkg.cfg.d",
+            "etc/ld.so.conf.d",
+            "etc/dnf/plugins",
+        ] {
             assert!(CHECKED_DIRS.contains(&d), "{d}");
         }
     }

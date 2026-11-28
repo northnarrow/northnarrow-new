@@ -652,7 +652,12 @@ enum Cmd {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
         /// The script this command's parent runs.
-        #[arg(long, value_name = "PATH", conflicts_with = "for_package", required_unless_present = "for_package")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "for_package",
+            required_unless_present = "for_package"
+        )]
         script: Option<PathBuf>,
         /// The window is for the package manager's process that runs this
         /// package's maintainer script.
@@ -5813,7 +5818,10 @@ fn window_generation(given: Option<u64>) -> std::result::Result<u64, ExitCode> {
     if let Some(g) = given {
         return Ok(g);
     }
-    match std::env::var("NN_WINDOW_GENERATION").ok().and_then(|v| v.trim().parse().ok()) {
+    match std::env::var("NN_WINDOW_GENERATION")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
         Some(g) => Ok(g),
         None => {
             eprintln!(
@@ -5951,7 +5959,8 @@ fn run_window_run_cmd(
         Err(code) => return code,
     };
     let env = nn_core::anti_tamper::trusted_installer::window_run_env(
-        std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
     );
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
@@ -5972,7 +5981,11 @@ fn run_window_run_cmd(
         }
         Err(e) => {
             eprintln!("window-run: running {program}: {e}");
-            ExitCode::from(if e.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 })
+            ExitCode::from(if e.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            })
         }
     }
 }
@@ -6003,7 +6016,11 @@ fn run_installer_window_cmd(
                     return ExitCode::from(1);
                 }
             };
-            (crate::admin_cli::parent_root(), TreeRootKind::InstallScript, digest)
+            (
+                crate::admin_cli::parent_root(),
+                TreeRootKind::InstallScript,
+                digest,
+            )
         }
         None => (
             crate::admin_cli::package_manager_root(),
@@ -8247,9 +8264,20 @@ mod window_verb_tests {
             other => panic!("{other:?}"),
         }
         assert!(parse(&["window-run", "--key", "/k"]).is_err(), "no command");
-        assert!(parse(&["installer-window", "--key", "/k"]).is_err(), "neither root");
         assert!(
-            parse(&["installer-window", "--key", "/k", "--script", "/s", "--for-package"]).is_err(),
+            parse(&["installer-window", "--key", "/k"]).is_err(),
+            "neither root"
+        );
+        assert!(
+            parse(&[
+                "installer-window",
+                "--key",
+                "/k",
+                "--script",
+                "/s",
+                "--for-package"
+            ])
+            .is_err(),
             "both roots"
         );
         assert!(parse(&["installer-window", "--key", "/k", "--for-package"]).is_ok());
@@ -8264,7 +8292,10 @@ mod window_verb_tests {
 
     #[test]
     fn a_digest_to_accept_is_64_hex_characters() {
-        assert_eq!(crate::admin_cli::parse_sha256(&"0f".repeat(32)).unwrap(), [0x0f; 32]);
+        assert_eq!(
+            crate::admin_cli::parse_sha256(&"0f".repeat(32)).unwrap(),
+            [0x0f; 32]
+        );
         assert!(crate::admin_cli::parse_sha256("0f").is_err());
         assert!(crate::admin_cli::parse_sha256(&"zz".repeat(32)).is_err());
     }

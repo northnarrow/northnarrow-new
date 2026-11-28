@@ -387,10 +387,7 @@ pub(super) fn emit_audit_for(
         // Lot 2.3b: replied to with `WindowReply`; the row also names the
         // root's kind, the interactive mark and the accepted foreign files'
         // count, and the window's generation when it opened.
-        (
-            AdminMessage::TrustedInstallerTreeGrantRequest(req),
-            AdminMessage::WindowReply(r),
-        ) => {
+        (AdminMessage::TrustedInstallerTreeGrantRequest(req), AdminMessage::WindowReply(r)) => {
             let extra = match &req.payload.extra {
                 OperationExtra::TrustedInstallerTreeGrant(e) => serde_json::json!({
                     "window_secs": e.window_secs,
