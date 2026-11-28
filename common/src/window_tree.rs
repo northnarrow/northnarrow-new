@@ -440,10 +440,8 @@ pub const fn new_instance_protected(
     if role == 0 {
         return false;
     }
-    if let Some(h) = holder {
-        if h == tgid {
-            return false;
-        }
+    if matches!(holder, Some(h) if h == tgid) {
+        return false;
     }
     match age_ns {
         Some(a) => a < NEW_INSTANCE_NS,
