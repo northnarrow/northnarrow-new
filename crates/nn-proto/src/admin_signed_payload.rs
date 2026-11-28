@@ -585,11 +585,61 @@ pub struct TrustedInstallerGrantExtra {
 /// package scriptlet, an operator's shell given by its pid); the agent
 /// checks that it still is when it arms the window, and refuses PID 1, a
 /// kernel thread and its own processes as roots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Lot 2.3b (the admission policy, the design's section 1): the signed
+/// scope also names what the root is ([`TreeRootKind`]), whether the
+/// command of an `nn-admin window-run` reads a terminal (`interactive`: the
+/// window is then degraded, and the grant record says so), and the digest
+/// of the script a script root runs (`script_sha256`, SHA-256; zeros for
+/// the other kinds): the agent admits only these roots. And the SHA-256 of
+/// each file the operator accepts in the package managers' hook
+/// directories or the loader's configuration although no package's
+/// database vouches for it (`accepted_foreign`, at most
+/// [`MAX_ACCEPTED_FOREIGN`]): the pre-grant check refuses the window for
+/// any other such file (the design's section 3, "Code planted before the
+/// window").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedInstallerTreeGrantExtra {
     pub window_secs: u32,
     pub root_pid: u32,
     pub root_start_ticks: u64,
+    pub root_kind: TreeRootKind,
+    pub interactive: bool,
+    pub script_sha256: [u8; 32],
+    pub accepted_foreign: Vec<[u8; 32]>,
+}
+
+/// Lot 2.3b: the most digests [`TrustedInstallerTreeGrantExtra::accepted_foreign`]
+/// carries (the agent refuses a request with more).
+pub const MAX_ACCEPTED_FOREIGN: usize = 64;
+
+/// Lot 2.3b: the kinds of root the agent admits for a window per process
+/// tree (the design's section 1, "The admission policy"); anything else is
+/// refused, signed with its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeRootKind {
+    /// `nn-admin window-run -- <command>`: the root is that `nn-admin`
+    /// process, the installed one (its image's `(dev, ino)`), and the
+    /// requester.
+    WindowRun,
+    /// Our `install.sh` (or `uninstall.sh`): a shell that runs the script
+    /// whose SHA-256 the request names, the requester's parent.
+    InstallScript,
+    /// A package manager (`dpkg`, `rpm`, `dnf`, `apt`) running a scriptlet
+    /// of our package: the root runs that manager's packaged binary, and a
+    /// process on the line is our package's scriptlet.
+    PackageManager,
+}
+
+impl TreeRootKind {
+    /// The kind's name, as the records and `nn-admin` print it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowRun => "window-run",
+            Self::InstallScript => "install-script",
+            Self::PackageManager => "package-manager",
+        }
+    }
 }
 
 /// Op-specific signed-scope fields for [`OperationCode::Detections`]
@@ -1551,16 +1601,36 @@ impl SignedPayload {
         root_pid: u32,
         root_start_ticks: u64,
     ) -> Self {
+        Self::new_trusted_installer_tree_grant_for(
+            nonce,
+            ts,
+            agent_id,
+            TrustedInstallerTreeGrantExtra {
+                window_secs,
+                root_pid,
+                root_start_ticks,
+                root_kind: TreeRootKind::WindowRun,
+                interactive: false,
+                script_sha256: [0; 32],
+                accepted_foreign: Vec::new(),
+            },
+        )
+    }
+
+    /// Lot 2.3b — a tree grant payload for `extra` (its root, the root's
+    /// kind, the interactive mark, the script's digest).
+    pub fn new_trusted_installer_tree_grant_for(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        extra: TrustedInstallerTreeGrantExtra,
+    ) -> Self {
         Self {
             op: OperationCode::TrustedInstallerTreeGrant,
             nonce,
             ts,
             agent_id,
-            extra: OperationExtra::TrustedInstallerTreeGrant(TrustedInstallerTreeGrantExtra {
-                window_secs,
-                root_pid,
-                root_start_ticks,
-            }),
+            extra: OperationExtra::TrustedInstallerTreeGrant(extra),
         }
     }
 
@@ -1917,6 +1987,12 @@ mod tests {
             tampered(|e| e.root_pid = 1),
             tampered(|e| e.root_start_ticks += 1),
             tampered(|e| e.window_secs = 600),
+            // lot 2.3b: the root's kind, the interactive mark and the
+            // script's digest are signed too
+            tampered(|e| e.root_kind = TreeRootKind::PackageManager),
+            tampered(|e| e.interactive = true),
+            tampered(|e| e.script_sha256[0] ^= 1),
+            tampered(|e| e.accepted_foreign.push([7; 32])),
         ] {
             assert!(matches!(
                 verify(&p, &sig, &verifying),

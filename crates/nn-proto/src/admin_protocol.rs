@@ -1691,6 +1691,83 @@ pub struct TrustedInstallerTreeGrantRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Lot 2.3b (the design's section 2): what a member asks of the agent
+/// inside its window ([`WindowControlRequest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowAction {
+    /// Both roles stand down: the agent signs the record, writes the
+    /// watchdog's stand-down and exits; nothing restarts them.
+    Stop,
+    /// The agent exits with the controlled-restart reason, and the
+    /// watchdog starts it again at once.
+    Restart,
+}
+
+/// Lot 2.3b — the controlled stop or restart of the agent, asked by a
+/// member of the open window per process tree. Not signed: the agent
+/// authenticates the asker by its pidfd (the socket's peer, its start),
+/// its member entry and the window's `generation`. Replied to with
+/// [`AdminMessage::WindowReply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowControlRequest {
+    pub generation: u64,
+    pub action: WindowAction,
+}
+
+/// Lot 2.3b: the action a lease lets PID 1 perform on one of our units'
+/// enablement links ([`WindowLeaseRequest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseAction {
+    /// The link's removal (`systemctl disable`).
+    Remove,
+    /// The link's creation (`systemctl enable`): never refused, so no lease
+    /// is armed for it (the reply says so).
+    Create,
+}
+
+/// Lot 2.3b — a single-use lease for PID 1's action on one of our units'
+/// enablement links (`link`: its absolute path, in a `*.wants` or
+/// `*.requires` directory), asked by a member of the open window and
+/// authenticated as [`WindowControlRequest`]. Bound to that link, that
+/// action and `generation`, consumed by its first use, void after a few
+/// seconds. Replied to with [`AdminMessage::WindowReply`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLeaseRequest {
+    pub generation: u64,
+    pub link: String,
+    pub action: LeaseAction,
+}
+
+/// Lot 2.3b: the longest [`WindowReply::detail`] the agent sends.
+pub const MAX_WINDOW_DETAIL: usize = 4096;
+
+/// Lot 2.3b — the agent's reply to a tree grant, a controlled stop or
+/// restart, and a lease: the result, the window's generation (0: none),
+/// and what the agent found (a refusal's reason, the files the pre-grant
+/// check named), at most [`MAX_WINDOW_DETAIL`] bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowReply {
+    pub result: AdminResult,
+    pub generation: u64,
+    pub detail: String,
+}
+
+impl WindowReply {
+    /// A reply whose `detail` is cut to [`MAX_WINDOW_DETAIL`] bytes, at a
+    /// character's boundary.
+    pub fn new(result: AdminResult, generation: u64, detail: &str) -> Self {
+        let mut end = detail.len().min(MAX_WINDOW_DETAIL);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            result,
+            generation,
+            detail: detail[..end].to_string(),
+        }
+    }
+}
+
 /// Largest overlay `nn-admin config overlay set` carries (fits the frame
 /// with the payload and two signatures). Overlays are short lists.
 pub const MAX_OVERLAY_BYTES: usize = 32 * 1024;
@@ -2202,6 +2279,16 @@ pub enum AdminMessage {
     /// for one process tree. Replied to with
     /// [`AdminMessage::TrustedInstallerGrantResult`].
     TrustedInstallerTreeGrantRequest(TrustedInstallerTreeGrantRequest),
+    /// Lot 2.3b — a member's controlled stop or restart of the agent.
+    /// Replied to with [`AdminMessage::WindowReply`].
+    WindowControlRequest(WindowControlRequest),
+    /// Lot 2.3b — a member's single-use lease for PID 1's action on one of
+    /// our units' enablement links. Replied to with
+    /// [`AdminMessage::WindowReply`].
+    WindowLeaseRequest(WindowLeaseRequest),
+    /// Lot 2.3b — the reply to a tree grant, a controlled stop or restart,
+    /// and a lease.
+    WindowReply(WindowReply),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -2608,7 +2695,22 @@ mod tests {
                 ),
                 signatures: Vec::new(),
             });
-        assert_eq!(first(&tree), 61, "the last production variant");
+        assert_eq!(first(&tree), 61, "TrustedInstallerTreeGrantRequest");
+        // Lot 2.3b: the window's member requests and their reply, appended
+        // after the tree grant — the last production variant
+        let control = AdminMessage::WindowControlRequest(WindowControlRequest {
+            generation: 1,
+            action: WindowAction::Stop,
+        });
+        assert_eq!(first(&control), 62, "WindowControlRequest");
+        let lease = AdminMessage::WindowLeaseRequest(WindowLeaseRequest {
+            generation: 1,
+            link: String::new(),
+            action: LeaseAction::Remove,
+        });
+        assert_eq!(first(&lease), 63, "WindowLeaseRequest");
+        let reply = AdminMessage::WindowReply(WindowReply::new(AdminResult::Success, 1, ""));
+        assert_eq!(first(&reply), 64, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -3026,7 +3128,10 @@ mod tests {
                 | AdminMessage::RemediateRansomwareResponse(_)
                 | AdminMessage::IntegrityAcknowledgeRequest(_)
                 | AdminMessage::IntegrityAcknowledgeResponse(_)
-                | AdminMessage::TrustedInstallerTreeGrantRequest(_) => {}
+                | AdminMessage::TrustedInstallerTreeGrantRequest(_)
+                | AdminMessage::WindowControlRequest(_)
+                | AdminMessage::WindowLeaseRequest(_)
+                | AdminMessage::WindowReply(_) => {}
             }
         }
     }
@@ -4515,6 +4620,37 @@ mod tests {
                 }],
             },
         ));
+    }
+
+    /// Lot 2.3b: the window's member requests and their reply go and come
+    /// back; a reply's detail is cut to its bound at a character's
+    /// boundary.
+    #[test]
+    fn the_window_requests_and_reply_round_trip_and_the_detail_is_bounded() {
+        for action in [WindowAction::Stop, WindowAction::Restart] {
+            roundtrip(AdminMessage::WindowControlRequest(WindowControlRequest {
+                generation: 7,
+                action,
+            }));
+        }
+        for action in [LeaseAction::Remove, LeaseAction::Create] {
+            roundtrip(AdminMessage::WindowLeaseRequest(WindowLeaseRequest {
+                generation: 7,
+                link: "/etc/systemd/system/multi-user.target.wants/northnarrow-agent.service"
+                    .to_string(),
+                action,
+            }));
+        }
+        roundtrip(AdminMessage::WindowReply(WindowReply::new(
+            AdminResult::ActionFailed,
+            3,
+            "refused: why",
+        )));
+        let long = "é".repeat(MAX_WINDOW_DETAIL);
+        let r = WindowReply::new(AdminResult::Success, 0, &long);
+        assert!(r.detail.len() <= MAX_WINDOW_DETAIL && r.detail.len() >= MAX_WINDOW_DETAIL - 1);
+        assert!(r.detail.chars().all(|c| c == 'é'));
+        assert_eq!(WindowReply::new(AdminResult::Success, 0, "ok").detail, "ok");
     }
 
     /// Lot 2.1 (the S2 scaffold): the three status fields go and come back
