@@ -672,6 +672,10 @@ fn verbs() -> Vec<Verb> {
                     window_secs: 300,
                     root_pid: 4242,
                     root_start_ticks: 77,
+                    root_kind: nn_proto::admin_signed_payload::TreeRootKind::WindowRun,
+                    interactive: false,
+                    script_sha256: [0; 32],
+                    accepted_foreign: Vec::new(),
                 })
             },
             wrap: |payload, signatures| {
@@ -680,10 +684,21 @@ fn verbs() -> Vec<Verb> {
                     signatures,
                 })
             },
-            refused: |r, _| AdminMessage::TrustedInstallerGrantResult(r),
+            // lot 2.3b: a tree grant is replied to with `WindowReply`
+            refused: |r, _| {
+                AdminMessage::WindowReply(nn_proto::admin_protocol::WindowReply::new(r, 0, ""))
+            },
             row: |_, _, own| {
                 if own {
-                    json!({ "window_secs": 300, "root_pid": 4242, "root_start_ticks": 77 })
+                    json!({
+                        "window_secs": 300,
+                        "root_pid": 4242,
+                        "root_start_ticks": 77,
+                        "root_kind": "window-run",
+                        "interactive": false,
+                        "accepted_foreign": 0,
+                        "generation": 0,
+                    })
                 } else {
                     json!({ "window_secs": 0 })
                 }

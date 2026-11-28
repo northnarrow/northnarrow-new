@@ -205,6 +205,9 @@ mod tests {
             "sigterm",
             "sigint",
             "sighup",
+            // lot 2.3b: a member's controlled stop and restart
+            nn_linux::anti_tamper::trusted_installer::CONTROLLED_STOP_REASON,
+            nn_linux::anti_tamper::trusted_installer::CONTROLLED_RESTART_REASON,
         ] {
             assert!(stop_result(r).is_ok(), "{r}");
             assert!(CLEAN_STOP_REASONS.contains(&r), "{r}");

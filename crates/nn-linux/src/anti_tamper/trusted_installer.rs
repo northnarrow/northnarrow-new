@@ -215,6 +215,9 @@ struct TreeWindow {
     /// Lot 2.3b (D5): PID 1's manager environment at the grant, compared at
     /// each controlled stop and lease and at the close.
     pid1_env: Vec<String>,
+    /// Lot 2.3b (D1): the grant as the operator signed it (its payload and
+    /// signatures): the watchdog's stand-down at a controlled stop.
+    proof: Option<(nn_proto::admin_signed_payload::SignedPayload, Vec<[u8; 64]>)>,
 }
 
 impl TrustedInstallerOverride {
@@ -774,6 +777,18 @@ impl TrustedInstallerOverride {
         );
     }
 
+    /// Lot 2.3b: a request of a window's member (`what`: the controlled
+    /// stop or restart, a lease) refused — an outsider's, or one the window
+    /// could not carry out: logged and recorded with its reason.
+    pub fn note_member_refusal(&self, what: &str, why: &str) {
+        self.audit_tree(
+            "trusted_installer_tree_member_refused",
+            serde_json::json!({ "request": what, "reason": why }),
+            format!("refused: {why}"),
+        );
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn arm_tree_with(
         &self,
@@ -1001,6 +1016,7 @@ impl TrustedInstallerOverride {
             grant,
             beat_failed: false,
             pid1_env,
+            proof: None,
         });
         self.tree_armed.store(true, Ordering::SeqCst);
         Ok(grant)
@@ -1452,6 +1468,39 @@ impl TrustedInstallerOverride {
         );
         *self.controlled.lock() = Some(reason);
         Ok(reason)
+    }
+
+    /// Lot 2.3b (D1): the signed grant of the open window `generation` (its
+    /// payload and signatures), kept for the watchdog's stand-down.
+    pub fn set_tree_proof(
+        &self,
+        generation: u64,
+        payload: &nn_proto::admin_signed_payload::SignedPayload,
+        signatures: &[[u8; 64]],
+    ) {
+        if let Some(w) = self.tree.lock().open.as_mut() {
+            if w.grant.generation == generation {
+                w.proof = Some((payload.clone(), signatures.to_vec()));
+            }
+        }
+    }
+
+    /// Lot 2.3b: [`Self::set_tree_proof`]'s, for the open window `generation`.
+    pub fn tree_proof(
+        &self,
+        generation: u64,
+    ) -> Option<(nn_proto::admin_signed_payload::SignedPayload, Vec<[u8; 64]>)> {
+        let tree = self.tree.lock();
+        let w = tree.open.as_ref()?;
+        (w.grant.generation == generation)
+            .then(|| w.proof.clone())
+            .flatten()
+    }
+
+    /// Lot 2.3b: a controlled stop asked and then not carried out (its
+    /// stand-down could not be written): the run loop's reason withdrawn.
+    pub fn withdraw_controlled_stop(&self) {
+        *self.controlled.lock() = None;
     }
 
     /// Lot 2.3b: the controlled stop's reason a member asked for, taken

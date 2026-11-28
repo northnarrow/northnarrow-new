@@ -10,21 +10,22 @@ pub(in crate::admin) mod integrity;
 pub(in crate::admin) mod keys;
 pub(in crate::admin) mod net;
 pub(in crate::admin) mod posture;
+pub(in crate::admin) mod pregrant;
 pub(in crate::admin) mod read;
 pub(in crate::admin) mod response;
 pub(in crate::admin) mod shutdown;
 pub(in crate::admin) mod status;
 pub(in crate::admin) mod unlock;
+pub(in crate::admin) mod window;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use nn_proto::admin_protocol::{
     AdminMessage, AdminResult, Challenge, TrustedInstallerGrantRequest, UnlockResult,
 };
-use nn_proto::admin_signed_payload::TrustedInstallerTreeGrantExtra;
 
 use super::audit::{AuditClient, DispatchNotes};
 use super::{
@@ -33,9 +34,7 @@ use super::{
 };
 use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
-use crate::anti_tamper::trusted_installer::{
-    LineReader, ProcFs, TrustedInstallerOverride, line_to_root,
-};
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::posture::PostureMachine;
 
 use canary::{
@@ -261,28 +260,29 @@ pub(super) fn dispatch(
         }
         // Lot 2.1 (S2 scaffold): the grant for one process tree is declared
         // and verified like the plain grant (the challenge's nonce, the
-        // quorum, the role). Lot 2.3a's minimal path (lot 2.3b replaces it
-        // with the real handler and the admission policy): the verified
-        // grant's root walked to from the requester, then armed
-        // (`tree_grant`). `nn-admin` never falls back to the plain grant on
-        // a refusal (the design's "Trusted-installer window per process
-        // tree", section 5).
-        AdminMessage::TrustedInstallerTreeGrantRequest(req) => {
-            AdminMessage::TrustedInstallerGrantResult(super::verify::signed(
-                &req,
-                auth,
-                fps_out,
-                |r| r,
-                |v| {
-                    tree_grant(
-                        v.extra(),
-                        installer_override,
-                        client.pid,
-                        &ProcFs(Path::new("/proc")),
-                    )
-                },
+        // quorum, the role). `nn-admin` never falls back to the plain grant
+        // on a refusal (the design's "Trusted-installer window per process
+        // tree", section 5). Lot 2.3b: the real handler — the admission policy (pidfds, the
+        // allowlist of roots), the pre-grant check, the frozen system code,
+        // PID 1's environment watched — replying with the reason.
+        AdminMessage::TrustedInstallerTreeGrantRequest(req) => AdminMessage::WindowReply(
+            installer::dispatch_tree_grant(&req, auth, installer_override, client.pid, fps_out),
+        ),
+        // Lot 2.3b (D1): a member's controlled stop or restart, and its
+        // single-use leases for PID 1's link removals — authenticated by
+        // the peer's pidfd, its member entry and the window's generation.
+        AdminMessage::WindowControlRequest(req) => {
+            AdminMessage::WindowReply(window::dispatch_window_control(
+                req,
+                installer_override,
+                client.pid,
+                marker_path,
+                shutdown_signal,
             ))
         }
+        AdminMessage::WindowLeaseRequest(req) => AdminMessage::WindowReply(
+            window::dispatch_window_lease(req, installer_override, client.pid),
+        ),
         AdminMessage::ConfigOverlaySetRequest(req) => {
             AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(
                 req,
@@ -361,7 +361,8 @@ pub(super) fn dispatch(
         | AdminMessage::LoopProgressResponse(_)
         | AdminMessage::SignedUnlockResponse(_)
         | AdminMessage::RemediateRansomwareResponse(_)
-        | AdminMessage::IntegrityAcknowledgeResponse(_) => {
+        | AdminMessage::IntegrityAcknowledgeResponse(_)
+        | AdminMessage::WindowReply(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -432,118 +433,4 @@ fn host_wide_grant(
     let r = dispatch_trusted_installer_grant(req, auth, installer_override, requester, fps_out);
     drop(permit);
     r
-}
-
-/// Lot 2.3a's minimal path, for the tests and the lab only (lot 2.3b
-/// replaces it with the real handler: pidfds, the admission policy, the
-/// leases, the controlled stop): the verified tree grant (`extra`: its
-/// span and its root) armed for the line from the requester (the peer's
-/// `SO_PEERCRED` pid, as `--for-installer` takes it) up to the signed
-/// root, read through `reader` (`/proc`). A refusal — the root not on that
-/// line, its start another, PID 1, a kernel thread or the agent's own; a
-/// window already open; the kernel manifest incomplete — is logged and
-/// recorded, and answered `ActionFailed`: the request verified, nothing
-/// armed.
-fn tree_grant(
-    extra: &TrustedInstallerTreeGrantExtra,
-    installer_override: Option<&TrustedInstallerOverride>,
-    requester: u32,
-    reader: &dyn LineReader,
-) -> AdminResult {
-    let Some(ov) = installer_override else {
-        warn!(
-            target: "admin.trusted_installer_grant",
-            "tree grant verified but no override wired (legacy serve path)"
-        );
-        return AdminResult::UnknownOperation;
-    };
-    let root = (extra.root_pid, extra.root_start_ticks);
-    let line = match ov
-        .own_tgids()
-        .and_then(|own| line_to_root(reader, requester, root, &own))
-    {
-        Ok(line) => line,
-        Err(why) => {
-            ov.note_tree_refusal(&why);
-            return AdminResult::ActionFailed;
-        }
-    };
-    match ov.arm_tree(extra.window_secs, root, &line) {
-        Ok(generation) => {
-            info!(
-                target: "admin.trusted_installer_grant",
-                generation,
-                root_pid = root.0,
-                requester,
-                members = line.len(),
-                "trusted-installer window per process tree ARMED via signed grant"
-            );
-            AdminResult::Success
-        }
-        // logged and recorded by `arm_tree`
-        Err(_) => AdminResult::ActionFailed,
-    }
-}
-
-#[cfg(test)]
-mod tree_grant_tests {
-    use super::*;
-    use crate::anti_tamper::trusted_installer::ProcHop;
-
-    /// A `/proc` of three processes: 300 (started at 30) ran 301 (31),
-    /// which ran the requester 302 (32).
-    struct Fake;
-
-    impl LineReader for Fake {
-        fn hop(&self, pid: u32) -> std::result::Result<ProcHop, String> {
-            let (ppid, start_ticks) = match pid {
-                300 => (1, 30),
-                301 => (300, 31),
-                302 => (301, 32),
-                _ => return Err(format!("{pid}: gone")),
-            };
-            Ok(ProcHop {
-                ppid,
-                start_ticks,
-                kthread: false,
-            })
-        }
-        fn guards(&self, _pid: u32) -> std::result::Result<(u32, u32), String> {
-            Ok((0, 0))
-        }
-    }
-
-    fn extra(root_pid: u32, root_start_ticks: u64) -> TrustedInstallerTreeGrantExtra {
-        TrustedInstallerTreeGrantExtra {
-            window_secs: 60,
-            root_pid,
-            root_start_ticks,
-        }
-    }
-
-    /// Lot 2.3a: a tree grant whose root is not the requester's ancestor,
-    /// whose start is another, or PID 1, is refused (`ActionFailed`), and
-    /// so is one this start cannot arm (no pin root): never a window.
-    #[test]
-    fn a_tree_grant_is_refused_unless_its_root_is_on_the_line_and_armable() {
-        let ov = TrustedInstallerOverride::new(None, 7, None, std::time::Duration::from_secs(600));
-        for e in [extra(999, 1), extra(300, 29), extra(1, 1)] {
-            assert_eq!(
-                tree_grant(&e, Some(&ov), 302, &Fake),
-                AdminResult::ActionFailed
-            );
-        }
-        // on the line, but no pin root (and no kernel manifest) this start
-        assert_eq!(
-            tree_grant(&extra(300, 30), Some(&ov), 302, &Fake),
-            AdminResult::ActionFailed
-        );
-        assert!(!ov.tree_window_open());
-        assert!(!ov.is_window_open());
-        // no override wired: as the plain grant's legacy serve path
-        assert_eq!(
-            tree_grant(&extra(300, 30), None, 302, &Fake),
-            AdminResult::UnknownOperation
-        );
-    }
 }

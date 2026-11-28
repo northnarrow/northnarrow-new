@@ -502,6 +502,13 @@ async fn watch_loop(
             // separate `nn-admin unlock` after restart if they
             // want.
             _ = shutdown_signal.wait() => {
+                // Lot 2.3b (D1): a member's controlled stop or restart
+                // inside a window per process tree woke the loop: its record
+                // is signed, and the watchdog's stand-down written for a stop
+                if let Some(reason) = window.take_controlled_stop() {
+                    info!(reason, "controlled stop asked by a member of the open window; shutting down");
+                    return reason;
+                }
                 info!(
                     target: "admin.shutdown",
                     "admin-authorised shutdown signal received; \

@@ -630,12 +630,16 @@ fn past(age: i64, bound: u64) -> bool {
 /// shutdown, the host's, a signal (only from `systemd-shutdown` or a signed
 /// trusted-installer window). Any other reason — a pump that exited, the
 /// decision or response thread lost — is a failure the watchdog restarts.
-pub const CLEAN_STOP_REASONS: [&str; 5] = [
+pub const CLEAN_STOP_REASONS: [&str; 7] = [
     "admin_shutdown",
     "system_shutdown",
     "sigterm",
     "sigint",
     "sighup",
+    // lot 2.3b: a member's controlled stop or restart inside a window per
+    // process tree (nn-linux's `trusted_installer::CONTROLLED_*_REASON`)
+    "controlled_stop",
+    "controlled_restart",
 ];
 
 /// Lot 353 (pre-alpha Phase 3, X6): the stop reason of an agent the

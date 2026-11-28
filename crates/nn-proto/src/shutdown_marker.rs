@@ -28,6 +28,16 @@
 //!
 //! Anything else is a forgery or a replay: the watchdog respawns the agent
 //! and reports it.
+//!
+//! Lot 2.3b (the controlled stop, the design's "Trusted-installer window
+//! per process tree", section 2): a member of a window per process tree
+//! stands both roles down through the agent. The agent then writes, as the
+//! marker, the window's own signed grant — what the operator signed to
+//! open it, `OperationCode::TrustedInstallerTreeGrant`, one key carrying
+//! `trusted-installer` ([`STAND_DOWN_QUORUM`]) — and the watchdog honours
+//! it like a shutdown's, within the window's longest span
+//! ([`MAX_STAND_DOWN_SECS`]) after it was signed. A window's grant is
+//! honoured once (its nonce, as a shutdown's).
 
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
@@ -67,6 +77,13 @@ pub const MAX_SKEW_SECS: u64 = 60;
 /// agent's exit, whatever the request asked for: the agent exits right
 /// after it replies.
 pub const MAX_GRACE_SECS: u64 = 300;
+
+/// Lot 2.3b: distinct admin keys a controlled stop's stand-down needs —
+/// the window's grant's, 1-of-N carrying `trusted-installer`.
+pub const STAND_DOWN_QUORUM: u8 = 1;
+/// Lot 2.3b: the longest a window's grant stands the roles down after it
+/// was signed (the window's ceiling, 600 s).
+pub const MAX_STAND_DOWN_SECS: u64 = 600;
 
 /// What the agent leaves for the watchdog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,9 +242,16 @@ pub fn verify(
             .map_err(|_| Rejection::Malformed(String::from("signature is not 64 bytes")))?;
         signatures.push(sig);
     }
-    let grace_secs = match (&payload.op, &payload.extra) {
-        (OperationCode::Shutdown, OperationExtra::Shutdown(s)) => {
-            u64::from(s.grace_secs).min(MAX_GRACE_SECS)
+    // lot 2.3b: a window's grant stands the roles down (the controlled
+    // stop), 1-of-N `trusted-installer`, within the window's span
+    let (grace_secs, quorum, role) = match (&payload.op, &payload.extra) {
+        (OperationCode::Shutdown, OperationExtra::Shutdown(s)) => (
+            u64::from(s.grace_secs).min(MAX_GRACE_SECS),
+            SHUTDOWN_QUORUM,
+            Role::Shutdown,
+        ),
+        (OperationCode::TrustedInstallerTreeGrant, OperationExtra::TrustedInstallerTreeGrant(_)) => {
+            (MAX_STAND_DOWN_SECS, STAND_DOWN_QUORUM, Role::TrustedInstaller)
         }
         _ => return Err(Rejection::NotAShutdown),
     };
@@ -266,8 +290,8 @@ pub fn verify(
     match admin_quorum::quorum_decision(
         &per_signature,
         |idx, role| exp.keys[idx].authorizes(role),
-        SHUTDOWN_QUORUM,
-        &[Role::Shutdown],
+        quorum,
+        &[role],
     ) {
         QuorumDecision::Accept => {}
         other => return Err(Rejection::Quorum(other)),
@@ -516,6 +540,47 @@ mod tests {
         let unlock = SignedPayload::new_unlock([9; 32], NOW, AGENT);
         let m = signed(&unlock, &by, 4242);
         assert_eq!(verify(&m, &e, |_| false), Err(Rejection::NotAShutdown));
+    }
+
+    /// Lot 2.3b (the controlled stop): the window's own grant, one
+    /// `trusted-installer` key, stands the roles down within the window's
+    /// span — once; a tree grant of a key without that role, of another
+    /// install, a plain (host-wide) grant, or one older than the span is
+    /// refused.
+    #[test]
+    fn a_window_s_grant_stands_the_roles_down_within_its_span_once() {
+        let installer = SigningKey::from_bytes(&[5; 32]);
+        let mut a = admins();
+        a.keys.push(AdminKey {
+            key: installer.verifying_key(),
+            roles: alloc::vec![Role::TrustedInstaller],
+        });
+        let e = exp(&a.keys);
+        let tree = |ts| SignedPayload::new_trusted_installer_tree_grant([4; 32], ts, AGENT, 300, 700, 7_000);
+        let m = signed(&tree(NOW - 400), &[&installer], 4242);
+        let ok = verify(&m, &e, |_| false).expect("honoured");
+        assert_eq!((ok.nonce, ok.grace_secs), ([4; 32], MAX_STAND_DOWN_SECS));
+        assert_eq!(verify(&m, &e, |_| true), Err(Rejection::Replayed));
+        // past the span
+        let m = signed(&tree(NOW - (MAX_SKEW_SECS + MAX_STAND_DOWN_SECS + 1)), &[&installer], 4242);
+        assert!(matches!(verify(&m, &e, |_| false), Err(Rejection::Expired { .. })));
+        // a key without the role (the shutdown key alone)
+        let m = signed(&tree(NOW), &[&a.sks[0]], 4242);
+        assert!(matches!(
+            verify(&m, &e, |_| false),
+            Err(Rejection::Quorum(QuorumDecision::RoleDenied { .. }))
+        ));
+        // the host-wide grant is no stand-down
+        let plain = SignedPayload::new_trusted_installer_grant([4; 32], NOW, AGENT, 300);
+        let m = signed(&plain, &[&installer], 4242);
+        assert_eq!(verify(&m, &e, |_| false), Err(Rejection::NotAShutdown));
+        // another install, another agent's pid
+        let other = SignedPayload::new_trusted_installer_tree_grant([4; 32], NOW, [1; 16], 300, 700, 7_000);
+        assert_eq!(verify(&signed(&other, &[&installer], 4242), &e, |_| false), Err(Rejection::OtherAgent));
+        assert!(matches!(
+            verify(&signed(&tree(NOW), &[&installer], 9), &e, |_| false),
+            Err(Rejection::WrongPid { .. })
+        ));
     }
 
     /// External audit AUT-005 / AUT-001: a marker is judged as the agent

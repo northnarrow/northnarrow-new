@@ -384,22 +384,29 @@ pub(super) fn emit_audit_for(
         // names the root the signed scope gives, whatever the outcome. Lot
         // 2.3a's minimal path arms it: `success`, or `failure` with
         // `ActionFailed` when it is refused (the reason in its own row).
+        // Lot 2.3b: replied to with `WindowReply`; the row also names the
+        // root's kind, the interactive mark and the accepted foreign files'
+        // count, and the window's generation when it opened.
         (
             AdminMessage::TrustedInstallerTreeGrantRequest(req),
-            AdminMessage::TrustedInstallerGrantResult(r),
+            AdminMessage::WindowReply(r),
         ) => {
             let extra = match &req.payload.extra {
                 OperationExtra::TrustedInstallerTreeGrant(e) => serde_json::json!({
                     "window_secs": e.window_secs,
                     "root_pid": e.root_pid,
                     "root_start_ticks": e.root_start_ticks,
+                    "root_kind": e.root_kind.as_str(),
+                    "interactive": e.interactive,
+                    "accepted_foreign": e.accepted_foreign.len(),
+                    "generation": r.generation,
                 }),
                 _ => serde_json::json!({ "window_secs": 0 }),
             };
             (
                 "trusted_installer_tree_grant",
                 extra,
-                audit_result_str(*r),
+                audit_result_str(r.result),
                 req.signatures.len().saturating_sub(1),
             )
         }
