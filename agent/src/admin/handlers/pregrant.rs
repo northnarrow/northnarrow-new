@@ -286,6 +286,19 @@ mod tests {
         assert_eq!(r.foreign[2].sha256, want);
     }
 
+    /// Lot 2.3b (the mini-hunt): the package managers' main configuration
+    /// files are checked, besides their hook directories (a hook or a plugin
+    /// path set there runs as the window's code).
+    #[test]
+    fn the_package_managers_main_configuration_is_checked() {
+        for f in ["etc/apt/apt.conf", "etc/dpkg/dpkg.cfg", "etc/dnf/dnf.conf", "etc/yum.conf", "etc/ld.so.preload"] {
+            assert!(CHECKED_FILES.contains(&f), "{f}");
+        }
+        for d in ["etc/apt/apt.conf.d", "etc/dpkg/dpkg.cfg.d", "etc/ld.so.conf.d", "etc/dnf/plugins"] {
+            assert!(CHECKED_DIRS.contains(&d), "{d}");
+        }
+    }
+
     /// Lot 2.3b: dpkg's conffiles are read from `status` (`md5sums` does
     /// not list them), each with its MD5; other fields are not.
     #[test]
