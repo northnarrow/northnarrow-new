@@ -1071,12 +1071,20 @@ pub struct InstallerWindowTree {
 }
 
 /// Lot 2.1 (S2 scaffold): [`StatusResponse::role_marks`] — the images the
-/// agent marked as its roles' (`marked`), and the claims of a role refused
-/// for an executable mapping of an unmarked image (`unmarked_refused`).
+/// agent marked as its roles' (`marked`: the main images, lot 2.2's
+/// decision D10), and the role processes alive that lost their role for an
+/// executable mapping that was not trusted code (`unmarked_refused`). Lot
+/// 2.2 (the review of #644, before any release carried the struct): the
+/// preloaded libraries mapped into a role process (`preloaded`, each a
+/// signed High advisory), and the cgroup BPF programs not the agent's on
+/// its cgroups at the last census (`cgroup_bpf_foreign`, each signed High;
+/// `None` before the first census).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleMarks {
     pub marked: u32,
     pub unmarked_refused: u64,
+    pub preloaded: u32,
+    pub cgroup_bpf_foreign: Option<u32>,
 }
 
 /// Lot 369: [`StatusResponse::runtime_clones`] — sealed memfd execs
@@ -4531,8 +4539,10 @@ mod tests {
             left_outside_full: 0,
         });
         with.role_marks = Some(RoleMarks {
-            marked: 6,
+            marked: 2,
             unmarked_refused: 1,
+            preloaded: 1,
+            cgroup_bpf_foreign: Some(3),
         });
         with.kernel_read_refused = Some(vec!["physical-memory".into()]);
         let bytes = postcard::to_allocvec(&with).unwrap();

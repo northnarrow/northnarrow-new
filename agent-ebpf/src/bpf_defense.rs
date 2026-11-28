@@ -78,7 +78,8 @@ use aya_ebpf::{
     programs::{LsmContext, ProbeContext, RawTracePointContext},
 };
 use northnarrow_common::bpf_cmd::{
-    attach_target_offset, judges_attach_target, observed, prog_fd_offset, BPF_LINK_CREATE,
+    attach_target_offset, cgroup_attach_class, judges_attach_target, judges_cgroup_attach, observed,
+    prog_fd_offset, root_attach_signed, BPF_LINK_CREATE,
     BPF_LINK_DETACH, BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_MAP_UPDATE_ELEM,
     BPF_OBJ_GET, BPF_PROG_ATTACH, BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD, BPF_RAW_TRACEPOINT_OPEN,
     MAP_TYPE_PROG_ARRAY, MAP_UPDATE_VALUE_OFFSET, slot_value, SlotValue,
@@ -100,7 +101,12 @@ use northnarrow_common::wire::{
     role_exit_mark,
     BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
+    // lot 2.2: the cgroup BPF guard, the kernel-read option
+    perf_refusal, BPF_CMD_ROOT_CGROUP_ATTACH, FS_OP_BPF_CGROUP_ATTACH, FS_OP_KERNEL_READ,
+    FS_OP_PERF_EVENT, KERNEL_READ_CONF_SLOTS, KERNEL_READ_LOCKDOWN, KERNEL_READ_PERF,
+    KERNEL_READ_PHYSICAL_MEMORY, KREAD_SLOT_MASK, KREAD_SLOT_REASONS, KREAD_SLOT_UPROBE_PMU,
 };
+use northnarrow_common::exec_marks::{agent_slot_open, ARM_MAX_NS, ARM_SLOT_DEADLINE, ARM_SLOT_SUPPORTED};
 
 use crate::btf_offsets::{
     BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, BPF_MAP_MAP_TYPE_OFFSET, BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_OFFSET,
@@ -111,6 +117,8 @@ use crate::btf_offsets::{
     TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
     // lot 374: the successor's cgroup
     CGROUP_KN_OFFSET, CSS_SET_DFL_CGRP_OFFSET, KERNFS_NODE_NAME_OFFSET, KERNFS_NODE_PARENT_OFFSET,
+    // lot 2.2: a cgroup directory's kernfs node
+    INODE_I_PRIVATE_OFFSET,
     TASK_STRUCT_CGROUPS_OFFSET,
 };
 use northnarrow_common::wire::{InodeKey, PIN_NAME_HASH_PRIME, PIN_NAME_HASH_SEED};
@@ -302,6 +310,22 @@ pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);
 /// holder of this role saw it start).
 #[map]
 pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);
+
+/// Lot 2.2 (the watchdog's slot): slot `ARM_SLOT_SUPPORTED` 1 once the
+/// watchdog arms the agent's vacated slot (lot 2.5 writes it), slot
+/// `ARM_SLOT_DEADLINE` the arm's `CLOCK_BOOTTIME` deadline
+/// (`northnarrow_common::exec_marks::agent_slot_open`). Pinned by name: the
+/// watchdog reaches it through the pin root.
+#[map]
+pub static WATCHDOG_ARM: Array<u64> = Array::pinned(2, 0);
+
+/// Lot 2.2 (the kernel-read option): the classes in force and the running
+/// kernel's lockdown values (`northnarrow_common::wire::KERNEL_READ_CONF_MAP_NAME`'s
+/// slots), written by the agent from the signed rule policy whenever it is
+/// applied (the start's, a `policy set`). Pinned by name: the policy's
+/// writer reaches it through the pin root, as the loader opt-outs'.
+#[map]
+pub static KERNEL_READ_CONF: Array<u32> = Array::pinned(KERNEL_READ_CONF_SLOTS, 0);
 
 /// How long after its start a fresh agent or watchdog may take write
 /// handles before it is a protected pid (the agent registers itself in
@@ -787,6 +811,151 @@ unsafe fn fd_is_root_cgroup(fd: u32) -> Result<bool, ()> {
 /// The kernel's inode number of the cgroup v2 hierarchy's root.
 const ROOT_CGROUP_INO: u64 = 1;
 
+/// Lot 2.2 ([`nn_fd_cgroup_place`]): the descriptor names no cgroup v2
+/// directory of ours (another cgroup, another file, out of range).
+const CG_OTHER: u64 = 0;
+/// `northnarrow.slice` (the root's child of that name) or a cgroup below it.
+const CG_OURS: u64 = 1;
+/// The cgroup v2 hierarchy's root.
+const CG_ROOT: u64 = 2;
+/// The file, its node or an offset could not be read.
+const CG_UNREADABLE: u64 = 3;
+/// How many levels above the target the walk looks for our slice (the
+/// units sit one level below it).
+const CG_WALK_DEPTH: u32 = 8;
+
+/// Lot 2.2 ([`nn_cgroup_attach_verdict`]): nothing to say.
+const CGV_NONE: u64 = 0;
+/// The attach targets our slice or below it: refused, signed.
+const CGV_REFUSED: u64 = 1;
+/// A packet or device program on the root cgroup: let through, recorded
+/// High (`BPF_CMD_ROOT_CGROUP_ATTACH`).
+const CGV_ROOT_SIGNED: u64 = 2;
+
+/// Lot 2.2: the cgroup BPF guard's verdict on an attach of type
+/// `attach_type` to the caller's descriptor `fd` (`u64::MAX`: the
+/// attribute could not be read) — [`CGV_REFUSED`] (signed here),
+/// [`CGV_ROOT_SIGNED`] or [`CGV_NONE`]. A target that cannot be read is a
+/// fail-open, counted: every unit's cgroup attach would be refused
+/// otherwise. A global BPF function (scalar arguments): verified once, its
+/// frame off the hook's.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_cgroup_attach_verdict(attach_type: u64, fd: u64) -> u64 {
+    let at = if fd > u64::from(u32::MAX) {
+        CG_UNREADABLE
+    } else {
+        nn_fd_cgroup_place(fd)
+    };
+    let class = cgroup_attach_class(attach_type as u32);
+    if at == CG_OURS {
+        emit_denial_kind(FS_OP_BPF_CGROUP_ATTACH, class, attach_type as u32);
+        return CGV_REFUSED;
+    }
+    if at == CG_UNREADABLE {
+        crate::fail_open::bump(fail_open_hook::BPF);
+    }
+    if at == CG_ROOT && root_attach_signed(class) {
+        CGV_ROOT_SIGNED
+    } else {
+        CGV_NONE
+    }
+}
+
+/// Lot 2.2: where the cgroup that descriptor `fd` of the caller names
+/// sits — [`CG_OURS`], [`CG_ROOT`], [`CG_OTHER`] or [`CG_UNREADABLE`]. A
+/// global BPF function (exported, never inlined, scalar argument):
+/// verified once.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_fd_cgroup_place(fd: u64) -> u64 {
+    match unsafe { fd_cgroup_place(fd as u32) } {
+        Ok(v) => v,
+        Err(()) => CG_UNREADABLE,
+    }
+}
+
+#[inline(always)]
+unsafe fn fd_cgroup_place(fd: u32) -> Result<u64, ()> {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
+        let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
+        let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
+        let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
+        let o_priv = off_opt!(INODE_I_PRIVATE_OFFSET).ok_or(())?;
+        let o_name = off_opt!(KERNFS_NODE_NAME_OFFSET).ok_or(())?;
+        let o_parent = off_opt!(KERNFS_NODE_PARENT_OFFSET).ok_or(())?;
+        let task = bpf_get_current_task() as *const u8;
+        if task.is_null() {
+            return Err(());
+        }
+        let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
+        if files == 0 {
+            return Ok(CG_OTHER);
+        }
+        let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64).map_err(|_| ())?;
+        if fdt == 0 {
+            return Err(());
+        }
+        let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32).map_err(|_| ())?;
+        if fd >= max {
+            return Ok(CG_OTHER);
+        }
+        let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64).map_err(|_| ())?;
+        if arr == 0 {
+            return Err(());
+        }
+        let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
+        if file == 0 {
+            return Ok(CG_OTHER);
+        }
+        let inode = bpf_probe_read_kernel::<u64>((file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if inode == 0 {
+            return Err(());
+        }
+        let sb = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if sb == 0 {
+            return Err(());
+        }
+        let magic = bpf_probe_read_kernel::<u64>((sb as *const u8).add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {
+            return Ok(CG_OTHER);
+        }
+        let ino = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if ino == ROOT_CGROUP_INO {
+            return Ok(CG_ROOT);
+        }
+        // a kernfs inode's node is its `i_private`
+        let mut kn = read_ptr(inode as *const u8, o_priv).ok_or(())?;
+        const SLICE: [u64; 4] = kn_name_words(OUR_SLICE);
+        let mut depth = 0u32;
+        while depth < CG_WALK_DEPTH {
+            let Some(parent) = read_ptr(kn, o_parent) else {
+                // the root itself (a namespace's view ends elsewhere)
+                return Ok(if depth == 0 { CG_ROOT } else { CG_OTHER });
+            };
+            // `kn` is our slice when it is named so and its parent is the
+            // root (a node without a parent)
+            if kn_named(kn, o_name, &SLICE)
+                && matches!(
+                    bpf_probe_read_kernel::<*const u8>(parent.add(o_parent) as *const *const u8),
+                    Ok(p) if p.is_null()
+                )
+            {
+                return Ok(CG_OURS);
+            }
+            kn = parent;
+            depth += 1;
+        }
+        Ok(CG_OTHER)
+    }
+}
+
 /// [`nn_obj_get_own_link`]: the path names one of the agent's link pins.
 const PIN_OWN: u64 = 1;
 /// [`nn_obj_get_own_link`]: the path could not be read from the caller's
@@ -953,7 +1122,7 @@ pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
 /// `(dev, ino)` of `task`'s executable (`mm->exe_file`); `None` for a
 /// kernel thread (no `mm`).
 #[inline(always)]
-unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
+pub(crate) unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
         if task.is_null() {
@@ -1013,8 +1182,23 @@ pub(crate) fn caller_role() -> u8 {
 /// a child of PID 1, in that unit's own cgroup, with clean lot 277/281
 /// marks ([`started_for_the_role`]) — in or out of a trusted-installer
 /// window (the window changes the record, never this right).
+///
+/// Lot 2.2: a global BPF function behind an inline test (no argument): its
+/// reads and calls stay off the frames of the hooks that ask it (the `bpf`
+/// hook asks it four times, at the stack gate).
 #[inline(always)]
 fn fresh_instance_may_load() -> bool {
+    nn_fresh_instance_may_load() == 1
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_fresh_instance_may_load() -> u64 {
+    u64::from(fresh_instance_test())
+}
+
+#[inline(always)]
+fn fresh_instance_test() -> bool {
     let pid_tgid = bpf_get_current_pid_tgid();
     if (pid_tgid >> 32) as u32 != pid_tgid as u32 {
         return false;
@@ -1023,12 +1207,22 @@ fn fresh_instance_may_load() -> bool {
     if role != ROLE_AGENT && role != ROLE_WATCHDOG {
         return false;
     }
+    // lot 2.2: a process that lost its role (D10: an unmarked main image, or a
+    // mapping that was not trusted code) has no role to take
+    if crate::role_maps::nn_role_lost(pid_tgid >> 32) != 0 {
+        return false;
+    }
     let slot = (role - 1) as u32;
     let vacated = match ROLE_TGIDS.get(slot) {
         Some(t) if *t == 0 => false,
         Some(t) if *t == ROLE_VACATED => true,
         _ => return false,
     };
+    // lot 2.2 (the watchdog's slot): the agent's vacated role, once the
+    // watchdog arms it, only while the live watchdog's arm holds
+    if vacated && role == ROLE_AGENT && nn_agent_slot_armed() != 1 {
+        return false;
+    }
     let task = unsafe { bpf_get_current_task() } as *const u8;
     if task.is_null() {
         return false;
@@ -1071,7 +1265,32 @@ unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
         ptgid == 1
             && nn_in_role_unit(task as u64, u64::from(slot)) == 1
             && crate::cgroup_join::caller_marks_clean()
+            // lot 2.2: and no role lost to a mapping (D10)
+            && crate::role_maps::nn_role_lost(bpf_get_current_pid_tgid() >> 32) == 0
     }
+}
+
+/// Lot 2.2 (the watchdog's slot): whether the agent's vacated slot may be
+/// taken now (1) — `agent_slot_open` on the watchdog's arm (an arm further
+/// than `ARM_MAX_NS` ahead is no arm) and on whether a watchdog holds its
+/// role. A global BPF function: its frame off the hooks' (the `bpf` hook's
+/// stack chain is at the gate).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_agent_slot_armed() -> u64 {
+    u64::from(agent_slot_armed())
+}
+
+#[inline(always)]
+fn agent_slot_armed() -> bool {
+    let supported = matches!(WATCHDOG_ARM.get(ARM_SLOT_SUPPORTED), Some(v) if *v == 1);
+    let live = matches!(ROLE_TGIDS.get(0), Some(t) if *t != 0 && *t != ROLE_VACATED);
+    let now = unsafe { bpf_ktime_get_boot_ns() };
+    let deadline = match WATCHDOG_ARM.get(ARM_SLOT_DEADLINE) {
+        Some(d) if *d <= now.saturating_add(ARM_MAX_NS) => *d,
+        _ => 0,
+    };
+    agent_slot_open(supported, live, deadline, now)
 }
 
 /// Lot 374: whether `task`'s cgroup of the default hierarchy is role slot
@@ -1199,6 +1418,8 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
     if tgid != pid_tgid as u32 {
         return 0; // a thread, not the process
     }
+    // lot 2.2: a process that lost its role is forgotten with it
+    crate::role_maps::forget(tgid);
     let mut slot = 0u32;
     while slot < 2 {
         if let Some(t) = ROLE_TGIDS.get_ptr_mut(slot) {
@@ -1538,6 +1759,123 @@ unsafe fn try_bpf_write_user_guard(ctx: &LsmContext) -> i32 {
     // the slot of bpf_probe_write_user; the type is not known here
     emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_CALL, 0);
     -EPERM
+}
+
+/// Lot 2.2 (the kernel-read option, off by default): `locked_down(enum
+/// lockdown_reason what)` — a lockdown question of a class the signed rule
+/// policy's `kernel-read-refuse` names (physical memory: `/dev/mem`,
+/// `/dev/port`, `/proc/kcore`; tracefs; kprobes; perf's interrupt
+/// registers), asked by a caller outside the agent's family, outside a
+/// window — refused, signed (`FS_OP_KERNEL_READ`, the class and the
+/// reason). The tracefs, kprobes and perf classes honour the signed
+/// per-loader opt-out of a kprobe loader (a tracing tool needs all three);
+/// physical memory none. Attached only while the option names a lockdown
+/// class; the reasons are the running kernel's values, never constants.
+#[lsm(hook = "locked_down")]
+pub fn kernel_read_guard(ctx: LsmContext) -> i32 {
+    unsafe { try_kernel_read_guard(&ctx) }
+}
+
+/// `BPF_PROG_TYPE_KPROBE` and `BPF_PROG_TYPE_PERF_EVENT` (uapi), the
+/// opt-out's types the kernel-read option honours.
+const PROG_TYPE_KPROBE: u64 = 2;
+const PROG_TYPE_PERF_EVENT: u64 = 7;
+
+#[inline(always)]
+fn kread_conf(slot: u32) -> u32 {
+    match KERNEL_READ_CONF.get(slot) {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+#[inline(always)]
+unsafe fn try_kernel_read_guard(ctx: &LsmContext) -> i32 {
+    let mask = kread_conf(KREAD_SLOT_MASK);
+    if mask == 0 {
+        return 0;
+    }
+    let what = ctx.arg::<c_int>(0) as u32;
+    if what == 0 {
+        return 0;
+    }
+    let mut class = 0u32;
+    let mut i = 0u32;
+    while i < KERNEL_READ_LOCKDOWN.len() as u32 {
+        if kread_conf(KREAD_SLOT_REASONS + i) == what {
+            class = KERNEL_READ_LOCKDOWN[i as usize].1;
+            break;
+        }
+        i += 1;
+    }
+    if class & mask == 0
+        || caller_is_exempt()
+        || crate::inode_protect::override_active()
+        || fresh_instance_may_load()
+    {
+        return 0;
+    }
+    if class != KERNEL_READ_PHYSICAL_MEMORY && nn_loader_opted_out(PROG_TYPE_KPROBE) == LOADER_OPTED_OUT {
+        return 0;
+    }
+    emit_denial_kind(FS_OP_KERNEL_READ, class as u8, what);
+    -EPERM
+}
+
+/// Lot 2.2 (the kernel-read option's perf class): `perf_event_open(struct
+/// perf_event_attr *attr, int type)` — a uprobe PMU event (its fetches read
+/// a process's memory with no BPF) or a CPU-wide event sampling user
+/// registers or stacks (every process's, the agent's among them), asked
+/// by a caller outside the agent's family outside a window, while the
+/// option names perf — refused, signed (`FS_OP_PERF_EVENT`), unless the
+/// signed opt-out names the caller for kprobe or perf_event programs. A
+/// per-task event asks the ptrace check, which judges its target (the
+/// agent's processes, and from lot 2.3 a window's members). Attached only
+/// while the option names perf.
+#[lsm(hook = "perf_event_open")]
+pub fn perf_event_guard(ctx: LsmContext) -> i32 {
+    unsafe { try_perf_event_guard(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_perf_event_guard(ctx: &LsmContext) -> i32 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if kread_conf(KREAD_SLOT_MASK) & KERNEL_READ_PERF == 0 {
+            return 0;
+        }
+        let attr: *const u8 = ctx.arg(0);
+        if attr.is_null() {
+            return 0;
+        }
+        let security_type = ctx.arg::<c_int>(1) as u32;
+        // uapi `struct perf_event_attr`: `type` at 0, `sample_type` at 24
+        let (Ok(ty), Ok(sample)) = (
+            bpf_probe_read_kernel::<u32>(attr as *const u32),
+            bpf_probe_read_kernel::<u64>(attr.add(24) as *const u64),
+        ) else {
+            crate::fail_open::bump(fail_open_hook::BPF);
+            return 0;
+        };
+        let what = perf_refusal(ty, sample, security_type, kread_conf(KREAD_SLOT_UPROBE_PMU));
+        if what == 0
+            || caller_is_exempt()
+            || crate::inode_protect::override_active()
+            || fresh_instance_may_load()
+        {
+            return 0;
+        }
+        let opt = if what == northnarrow_common::wire::PERF_REFUSED_UPROBE_PMU {
+            PROG_TYPE_KPROBE
+        } else {
+            PROG_TYPE_PERF_EVENT
+        };
+        if nn_loader_opted_out(opt) == LOADER_OPTED_OUT {
+            return 0;
+        }
+        emit_denial_kind(FS_OP_PERF_EVENT, what, ty);
+        -EPERM
+    }
 }
 
 /// Lot 345: the stage the agent armed ([`PROG_CONTENT_CONF`] slot 0).
@@ -1997,6 +2335,33 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
                 return -EPERM;
             }
         }
+        // Lot 2.2 (the cgroup BPF guard): a cgroup program attached to the
+        // agent's unit cgroups or `northnarrow.slice`, or below them, outside
+        // a window — refused, signed, in every mode, PID 1's attach for a
+        // unit property included (none of our units declares one). One on
+        // the root cgroup of the packet or device class is let through and
+        // recorded High. A target that cannot be read is a fail-open,
+        // counted: every unit's cgroup attach would be refused otherwise.
+        let mut root_cgroup_attach = false;
+        if judges_cgroup_attach(cmd, arg)
+            && !crate::inode_protect::override_active()
+            && !fresh_instance_may_load()
+        {
+            let fd = match attach_target_offset(cmd) {
+                Some(off) if !attr.is_null() => {
+                    match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+                        Ok(fd) => u64::from(fd),
+                        Err(_) => u64::MAX,
+                    }
+                }
+                _ => u64::MAX,
+            };
+            match nn_cgroup_attach_verdict(u64::from(arg), fd) {
+                CGV_REFUSED => return -EPERM,
+                CGV_ROOT_SIGNED => root_cgroup_attach = true,
+                _ => {}
+            }
+        }
         let foreign_handle =
             own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
         // Lot 344 (the alpha's false positives): a fresh agent or watchdog —
@@ -2015,6 +2380,8 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();
         let report_cmd = if fresh_instance {
             fresh_instance_cmd()
+        } else if root_cgroup_attach {
+            BPF_CMD_ROOT_CGROUP_ATTACH
         } else if foreign_handle {
             BPF_CMD_FOREIGN_GET_FD
         } else {

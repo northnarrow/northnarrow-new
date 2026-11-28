@@ -534,7 +534,8 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
             "let foreign_handle =\n            own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
             "let fresh_instance =\n            (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
             // lot 370 (F10-4): the start's record, or a vacated role's
-            "let report_cmd = if fresh_instance {\n            fresh_instance_cmd()\n        } else if foreign_handle {\n            BPF_CMD_FOREIGN_GET_FD",
+            // lot 2.2: a root cgroup attach's record between the two
+            "let report_cmd = if fresh_instance {\n            fresh_instance_cmd()\n        } else if root_cgroup_attach {\n            BPF_CMD_ROOT_CGROUP_ATTACH\n        } else if foreign_handle {\n            BPF_CMD_FOREIGN_GET_FD",
             "if should_report(pid, dedup) {\n            emit_syscall(report_cmd, arg);",
         ],
     )
@@ -552,7 +553,7 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
     // the role vacant, the main thread, the first minute — lot 370
     // (F10-4): a role vacated this boot only to a successor started for it
     in_order(
-        body(&c, "fresh_instance_may_load"),
+        body(&c, "fresh_instance_test"),
         &[
             "if (pid_tgid >> 32) as u32 != pid_tgid as u32 {\n        return false;\n    }",
             "let role = caller_role();",
@@ -1403,4 +1404,304 @@ fn enforce_mode_tests_read_maps_read_only_and_match_whole_kinds() {
         "the_watchdog_signs_the_agent_s_vacancy_and_its_successor",
     );
     assert!(t.contains("format!(\"\\\"kind\\\":\\\"{k}\\\"\")"), "{t}");
+}
+
+/// Lot 2.2 (named): the cgroup BPF guard — every cgroup attach type of
+/// both attach commands is judged, outside a window and past a fresh
+/// instance, in every mode (no `enforce()`), PID 1 not exempt; one on our
+/// slice or below it is refused and signed before anything is recorded; a
+/// root attach of the packet or device class is recorded High; the target
+/// is read from the caller's own descriptor, and our slice is the root's
+/// child of that name.
+#[test]
+fn a_cgroup_program_on_our_cgroups_is_refused() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let h = body(&c, "try_bpf_syscall_observe");
+    in_order(
+        h,
+        &[
+            "if caller_is_exempt() {",
+            "if judges_cgroup_attach(cmd, arg)\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
+            "match nn_cgroup_attach_verdict(u64::from(arg), fd) {\n                CGV_REFUSED => return -EPERM,\n                CGV_ROOT_SIGNED => root_cgroup_attach = true,",
+            "} else if root_cgroup_attach {\n            BPF_CMD_ROOT_CGROUP_ATTACH",
+            "emit_syscall(report_cmd, arg);",
+        ],
+    )
+    .unwrap();
+    let guard =
+        &h[h.find("if judges_cgroup_attach(").unwrap()..h.find("let foreign_handle =").unwrap()];
+    assert!(
+        !guard.contains("enforce()"),
+        "the guard holds in every mode"
+    );
+    assert!(!guard.contains("== 1"), "PID 1 gets no exemption");
+    in_order(
+        body(&c, "nn_cgroup_attach_verdict"),
+        &[
+            "nn_fd_cgroup_place(fd)",
+            "if at == CG_OURS {\n        emit_denial_kind(FS_OP_BPF_CGROUP_ATTACH, class, attach_type as u32);\n        return CGV_REFUSED;\n    }",
+            "if at == CG_ROOT && root_attach_signed(class) {\n        CGV_ROOT_SIGNED",
+        ],
+    )
+    .unwrap();
+    let place = body(&c, "fd_cgroup_place");
+    in_order(
+        place,
+        &[
+            "Some(SpecialFs::Cgroup2)",
+            "if ino == ROOT_CGROUP_INO {\n            return Ok(CG_ROOT);",
+            "read_ptr(inode as *const u8, o_priv)",
+            "while depth < CG_WALK_DEPTH {",
+            "kn_named(kn, o_name, &SLICE)",
+            "Ok(p) if p.is_null()",
+            "return Ok(CG_OURS);",
+        ],
+    )
+    .unwrap();
+    let cmd = code("common/src/bpf_cmd.rs");
+    assert!(cmd.contains(
+        "pub const fn judges_cgroup_attach(cmd: u32, attach_type: u32) -> bool {\n    attach_target_offset(cmd).is_some() && cgroup_attach_class(attach_type) != 0\n}"
+    ));
+}
+
+/// Lot 2.2 (named): the kernel-read option's two guards refuse only a
+/// class in force, never the family, a window or a fresh instance; the
+/// physical-memory class honours no opt-out; the agent arms them from a
+/// signed policy only, the configuration frozen before the programs.
+#[test]
+fn the_kernel_read_option_refuses_what_it_names() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let k = body(&c, "try_kernel_read_guard");
+    in_order(
+        k,
+        &[
+            "if mask == 0 {\n        return 0;\n    }",
+            "if kread_conf(KREAD_SLOT_REASONS + i) == what {",
+            "if class & mask == 0\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
+            "if class != KERNEL_READ_PHYSICAL_MEMORY && nn_loader_opted_out(PROG_TYPE_KPROBE) == LOADER_OPTED_OUT {",
+            "emit_denial_kind(FS_OP_KERNEL_READ, class as u8, what);\n    -EPERM",
+        ],
+    )
+    .unwrap();
+    let p = body(&c, "try_perf_event_guard");
+    in_order(
+        p,
+        &[
+            "if kread_conf(KREAD_SLOT_MASK) & KERNEL_READ_PERF == 0 {",
+            "let what = perf_refusal(ty, sample, security_type, kread_conf(KREAD_SLOT_UPROBE_PMU));",
+            "|| caller_is_exempt()",
+            "emit_denial_kind(FS_OP_PERF_EVENT, what, ty);\n        -EPERM",
+        ],
+    )
+    .unwrap();
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    assert!(u.contains(
+        "if signed {\n            policy.kernel_read_refusals()\n        } else {\n            0\n        },"
+    ));
+    in_order(
+        body(&u, "arm_kernel_read"),
+        &[
+            "antitamper_bpf::attach_transient(ebpf, KERNEL_READ_PROGRAM, KERNEL_READ_HOOK, btf)",
+            "match attach_guard_hook(\n        ebpf,\n        PERF_GUARD_PROGRAM,\n        PERF_GUARD_HOOK,\n        btf,\n        pin_root,\n        enforce,\n    ) {",
+            "write_kernel_read_conf(&mut a)?;",
+        ],
+    )
+    .unwrap();
+    // the policy applied after the load (the start's, a `policy set`)
+    // reaches the kernel through the pin
+    in_order(
+        body(&u, "apply_loader_policy"),
+        &[
+            "KERNEL_READ_POLICY.store(",
+            "let pin = root.join(common::wire::KERNEL_READ_CONF_MAP_NAME);",
+            "write_kernel_read_conf_pin(&pin)",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 2.2 (named; the review of #644, decision D10): a role is held only
+/// with a marked main image and trusted code — the mapping hooks judge a
+/// role holder or a process running our binaries once the marks are armed,
+/// each mapping when it is made (an `mprotect` of a mapping already
+/// executable is not judged again): the main image must carry the role
+/// mark, any other mapped file must be marked or pass the trust test
+/// (`exec_marks::role_mapping_verdict`), anonymous memory never does. The
+/// loss is recorded in the map only the hooks write, and read where an
+/// exemption is decided and where a vacant role is taken; the agent
+/// freezes that map and writes the marks before it attaches the hooks, and
+/// clears the arm flag when the write fails.
+#[test]
+fn an_unmarked_executable_mapping_takes_the_role_away() {
+    let r = code("agent-ebpf/src/role_maps.rs");
+    in_order(
+        body(&r, "nn_role_map"),
+        &[
+            "if !armed() {\n            return 0;\n        }",
+            "if role_lost(tgid) {\n            return 0;\n        }",
+            "let holds = crate::task_kill::is_exempt_pid(tgid);",
+            "if !holds && !crate::bpf_defense::task_runs_own_binary(task) {",
+            "if flags & VM_EXEC != 0 {\n                return 0;\n            }",
+            "file = bpf_probe_read_kernel::<u64>((vma as *const u8).add(o_file) as *const u64).unwrap_or(0);",
+            "let main_marks = match crate::bpf_defense::task_exe_key(task) {\n            Some(k) => EXEC_MARKS.get(&k).copied(),",
+            "file_marks = EXEC_MARKS.get(&k).copied();",
+            "if unmarked_for_role(file_marks) {\n                        facts = code_facts(file as *const u8, inode as *const u8);",
+            "if role_mapping_verdict(main_marks, file_marks, facts) == CODE_TRUSTED {\n            return 0;\n        }",
+            "let _ = ROLE_UNMARKED.insert(&tgid, &start, 0);",
+            "crate::inode_protect::emit_attempt(FS_OP_ROLE_UNMARKED, key);",
+        ],
+    )
+    .unwrap();
+    // every field of the trust test read, the mount's idmapping included
+    in_order(
+        body(&r, "code_facts"),
+        &[
+            "off!(INODE_I_MODE_OFFSET)",
+            "off!(INODE_I_UID_OFFSET)",
+            "off_opt!(INODE_I_NLINK_OFFSET)",
+            "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
+            "crate::execq::fs_type_is_virtiofs(sb)",
+            "off_opt!(SUPER_BLOCK_S_USER_NS_OFFSET)",
+            "idmapped: mount_idmapped(file),",
+        ],
+    )
+    .unwrap();
+    // the idmapping by its layout: maps of its own (6.7 on), an owner
+    // (6.3 to 6.6), or the mount's user namespace (5.12 to 6.2)
+    in_order(
+        body(&r, "mount_idmapped"),
+        &[
+            "let o_userns = off_opt!(VFSMOUNT_MNT_USERNS_OFFSET);",
+            "let o_map = off_opt!(VFSMOUNT_MNT_IDMAP_OFFSET);",
+            "if let Some(o) = o_userns {",
+            "return userns_level(ns) != 0;",
+            "if let Some(o) = off_opt!(MNT_IDMAP_UID_NR_EXTENTS_OFFSET) {\n            return bpf_probe_read_kernel::<u32>(map.add(o) as *const u32).unwrap_or(0) != 0;\n        }",
+            "match off_opt!(MNT_IDMAP_OWNER_OFFSET) {",
+            "!= 0\n            }\n            None => {\n                crate::fail_open::bump(",
+        ],
+    )
+    .unwrap();
+    assert!(r.contains("if (raw_arg(ctx, 1) | raw_arg(ctx, 2)) & PROT_EXEC != 0 {\n            let _ = nn_role_map(file, 0);"));
+    assert!(body(&r, "role_file_mprotect").contains(
+        "if (raw_arg(&ctx, 1) | raw_arg(&ctx, 2)) & PROT_EXEC != 0 {\n            let vma = raw_arg(&ctx, 0);\n            if vma != 0 {\n                let _ = nn_role_map(0, vma);"
+    ));
+    let k = code("agent-ebpf/src/task_kill.rs");
+    assert!(k.contains(
+        "northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid)) && crate::role_maps::nn_role_lost(u64::from(tgid)) == 0"
+    ));
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&c, "fresh_instance_test"),
+        &[
+            "if crate::role_maps::nn_role_lost(pid_tgid >> 32) != 0 {\n        return false;\n    }",
+            "if vacated && role == ROLE_AGENT && nn_agent_slot_armed() != 1 {\n        return false;\n    }",
+            "!vacated || unsafe { started_for_the_role(task, slot) }",
+        ],
+    )
+    .unwrap();
+    assert!(
+        body(&c, "started_for_the_role")
+            .contains("&& crate::role_maps::nn_role_lost(bpf_get_current_pid_tgid() >> 32) == 0")
+    );
+    assert!(body(&c, "role_exit").contains("crate::role_maps::forget(tgid);"));
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "arm_role_marks"),
+        &[
+            "freeze_named(ebpf, ROLE_UNMARKED_MAP_NAME)?;",
+            "write_role_marks(&mut map, &want)",
+            "set_marks_armed(&mut a, written.is_ok())?;",
+            "let n = written?;",
+            "attach_guard_hook(ebpf, program, hook, btf, pin_root, enforce)",
+        ],
+    )
+    .unwrap();
+    // F5: a refresh that fails disarms the marks
+    in_order(
+        body(&u, "refresh_role_marks"),
+        &[
+            "match write_role_marks(&mut map, &want) {",
+            "set_marks_armed(&mut a, false)",
+        ],
+    )
+    .unwrap();
+    // D10: the marks are the main images; no library is looked for
+    let images = body(&u, "role_images");
+    for needle in ["/maps", "nsswitch", "ld.so.preload"] {
+        assert!(!images.contains(needle), "role_images reads {needle}");
+    }
+}
+
+/// Lot 2.2 (the review of #644, F3 and F4): the role watch runs at the
+/// agent's start and each round of the link self-check, and at once after
+/// a cgroup attach the kernel let through (the `bpf` ring's row wakes it);
+/// each finding is signed when it appears and its end when it goes; the
+/// census only asks the kernel (`BPF_PROG_QUERY`), it never detaches.
+#[test]
+fn the_cgroup_census_runs_after_each_attach_and_never_detaches() {
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    assert!(m.contains("                    cgroup_attach_wakes_census,\n"));
+    assert!(body(&m, "cgroup_attach_wakes_census").contains(
+        "if crate::anti_tamper::role_watch::is_cgroup_attach_row(raw.cmd, raw.arg) {\n        crate::anti_tamper::role_watch::census_soon();"
+    ));
+    let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    in_order(
+        body(&u, "spawn_link_self_check"),
+        &[
+            "if !first {\n                    super::role_watch::wait_round(",
+            "ids.extend(crate::sysctl_cgroup::own_prog_id());",
+            "super::role_watch::preload_findings(watchdog),\n                        super::role_watch::census(&own_ids),",
+            "let (fresh, gone) = signed.fresh(&now, kept);",
+            "crate::self_integrity::report_event(audit_log.as_ref(), f);",
+            "crate::self_integrity::report_cleared(audit_log.as_ref(), f);",
+        ],
+    )
+    .unwrap();
+    let w = code("crates/nn-linux/src/anti_tamper/role_watch.rs");
+    let census = body(&w, "census");
+    assert!(census.contains("crate::sysctl_cgroup::query_cgroup(fd, t)"));
+    for forbidden in [
+        "BPF_PROG_DETACH",
+        "bpf_cmd::BPF_PROG_DETACH",
+        "query_flags: 1",
+    ] {
+        assert!(
+            !w.contains(forbidden),
+            "the census detaches nothing: {forbidden}"
+        );
+    }
+    assert!(
+        body(&w, "census_with")
+            .contains("for (attach, t, _) in common::bpf_cmd::CGROUP_ATTACH_TYPES {")
+    );
+    let s = code("crates/nn-linux/src/sysctl_cgroup.rs");
+    assert!(
+        body(&s, "query_cgroup").contains("query_flags: 0,"),
+        "the cgroup's own programs, not what it inherits"
+    );
+}
+
+/// Lot 2.2 (named): a shared mapping of a write-protected file opened for
+/// writing is refused to everyone outside the family, with no window test.
+#[test]
+fn a_shared_writable_mapping_of_a_protected_file_is_refused_in_a_window_too() {
+    let r = code("agent-ebpf/src/role_maps.rs");
+    let f = body(&r, "nn_shared_map_refused");
+    in_order(
+        f,
+        &[
+            "if fmode & FMODE_WRITE == 0 {\n            return 0;\n        }",
+            "Some(f) => *f & FS_PROTECT_WRITE != 0,",
+            "if crate::task_kill::is_exempt_pid(tgid) {\n            return 0;\n        }",
+            "crate::inode_protect::emit_attempt(FS_OP_SHARED_MAP, key);\n        1",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !f.contains("override_active"),
+        "a window lifts nothing here"
+    );
+    assert!(body(&r, "try_role_mmap_file").contains(
+        "if file != 0 && matches!(flags & MAP_TYPE, MAP_SHARED | MAP_SHARED_VALIDATE) && nn_shared_map_refused(file) == 1 {\n            return -EPERM;\n        }"
+    ));
 }

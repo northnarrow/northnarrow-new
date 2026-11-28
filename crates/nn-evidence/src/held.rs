@@ -294,6 +294,18 @@ pub const ADVISORY_KINDS: &[(&str, &str)] = &[
          request is signed and restarted)",
     ),
     (
+        "role_preloaded_library",
+        "lot 2.2: a library /etc/ld.so.preload names is mapped into the agent or the watchdog — \
+         the kernel judged it trusted code when it was mapped (one that is not takes the role \
+         away, signed by the kernel); a host's own preload, shown while found",
+    ),
+    (
+        "cgroup_bpf_foreign",
+        "lot 2.2: a cgroup BPF program that is not the agent's on its cgroups, the slice or the \
+         root cgroup (attached before the start, in a window, or past the bpf hook's check) — \
+         signed High, left attached for the operator to decide; shown while found",
+    ),
+    (
         "boot_continuity_unknown",
         "lot 387: whether boots passed without the agent since its last run is not knowable at \
          this start (a volatile or rotated journal): no sensor is degraded, and no clean \

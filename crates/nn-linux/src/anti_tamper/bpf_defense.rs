@@ -457,6 +457,12 @@ pub(crate) fn attach(
             }
         }
     }
+    // Lot 2.2: the kernel-read option (off by default), after the content
+    // judge: its opt-outs follow the judge's stage.
+    if let Err(e) = arm_kernel_read(ebpf, btf, pin_root, enforce) {
+        warn!(error = %e, "kernel-read option NOT fully armed");
+        health.observe_failures.push((KERNEL_READ_PROGRAM, e));
+    }
     match crate::bpf_crossview::Parts::setup(ebpf, btf) {
         Ok(parts) => {
             *guard.0.census.lock() = Some(parts);
@@ -1443,6 +1449,16 @@ pub fn apply_loader_policy(
     signed: bool,
 ) -> Option<String> {
     let lines: Vec<(&str, u32)> = policy.bpf_loader_opt_outs().collect();
+    // lot 2.2: the kernel-read option, from a signed policy only (armed at
+    // the agent's start)
+    KERNEL_READ_POLICY.store(
+        if signed {
+            policy.kernel_read_refusals()
+        } else {
+            0
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let (resolved, unresolved) = if signed {
         resolve_loader_opt_outs(&lines, stat_executable)
     } else {
@@ -1454,6 +1470,13 @@ pub fn apply_loader_policy(
         if pin.exists() {
             if let Err(e) = write_loader_opt_outs_pin(&pin) {
                 warn!(error = %e, "BPF loader opt-out: NOT written to the kernel — its loads stay refused");
+            }
+        }
+        // lot 2.2: and the kernel-read option, at once
+        let pin = root.join(common::wire::KERNEL_READ_CONF_MAP_NAME);
+        if pin.exists() {
+            if let Err(e) = write_kernel_read_conf_pin(&pin) {
+                warn!(error = %e, "kernel-read option NOT written to the kernel");
             }
         }
     }
@@ -2051,6 +2074,561 @@ fn pin_name_key(name: &str) -> Option<u64> {
     Some(common::wire::pin_name_hash(seen))
 }
 
+// ── Lot 2.2: the role marks, the kernel-read option, the window's maps ──
+
+/// Lot 2.2: the two role programs (`agent-ebpf/src/role_maps.rs`), each
+/// with its hook (pinned as `prog_<hook>` / `link_<hook>`).
+pub const ROLE_MMAP_PROGRAM: &str = "role_mmap_file";
+pub const ROLE_MMAP_HOOK: &str = "mmap_file";
+pub const ROLE_MPROTECT_PROGRAM: &str = "role_file_mprotect";
+pub const ROLE_MPROTECT_HOOK: &str = "file_mprotect";
+/// Lot 2.2: the kernel-read option's programs. The `locked_down` one lives
+/// with the agent (the hook's pin is the content judge's before 6.9).
+pub const KERNEL_READ_PROGRAM: &str = "kernel_read_guard";
+pub const KERNEL_READ_HOOK: &str = "locked_down";
+pub const PERF_GUARD_PROGRAM: &str = "perf_event_guard";
+pub const PERF_GUARD_HOOK: &str = "perf_event_open";
+
+/// Lot 2.2: the kernel-read classes the signed rule policy names (0 when
+/// unsigned or off), set by [`apply_loader_policy`] and written to the
+/// kernel there and at the start ([`arm_kernel_read`]).
+static KERNEL_READ_POLICY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Lot 2.2: the classes the kernel refuses now.
+static KERNEL_READ_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Lot 2.2: the kernel-read classes in force in the kernel, by name
+/// (`nn-admin status`'s `kernel_read_refused`).
+pub fn kernel_read_refused_now() -> Vec<String> {
+    let armed = KERNEL_READ_ARMED.load(std::sync::atomic::Ordering::SeqCst);
+    common::wire::KERNEL_READ_CLASSES
+        .iter()
+        .filter(|(_, bit)| armed & bit != 0)
+        .map(|(n, _)| (*n).to_string())
+        .collect()
+}
+
+/// Lot 2.2: `KERNEL_READ_CONF`'s slots for the option's classes `mask`,
+/// this kernel's lockdown values (`resolved`, in
+/// `common::wire::KERNEL_READ_LOCKDOWN`'s order) and its uprobe PMU type.
+/// The block-device class has no lockdown question (lot 2.3's), so it
+/// arms nothing here; an unresolved reason stays 0 (never matched).
+pub fn kernel_read_conf(
+    mask: u32,
+    resolved: &[Option<u32>; common::wire::KERNEL_READ_LOCKDOWN.len()],
+    uprobe_pmu: Option<u32>,
+) -> [u32; common::wire::KERNEL_READ_CONF_SLOTS as usize] {
+    use common::wire::{
+        KERNEL_READ_LOCKDOWN, KREAD_SLOT_MASK, KREAD_SLOT_REASONS, KREAD_SLOT_UPROBE_PMU,
+    };
+    let mut conf = [0u32; common::wire::KERNEL_READ_CONF_SLOTS as usize];
+    let lockdown_or_perf = mask & !common::wire::KERNEL_READ_BLOCK_DEVICE;
+    conf[KREAD_SLOT_MASK as usize] = lockdown_or_perf;
+    for (i, (_, class)) in KERNEL_READ_LOCKDOWN.iter().enumerate() {
+        if mask & class != 0 {
+            conf[KREAD_SLOT_REASONS as usize + i] = resolved[i].unwrap_or(0);
+        }
+    }
+    if mask & common::wire::KERNEL_READ_PERF != 0 {
+        conf[KREAD_SLOT_UPROBE_PMU as usize] = uprobe_pmu.unwrap_or(0);
+    }
+    conf
+}
+
+/// The uprobe PMU's perf type (`/sys/bus/event_source/devices/uprobe/type`).
+fn uprobe_pmu_type() -> Option<u32> {
+    antitamper_bpf::kernel_roots::read_to_string("/sys/bus/event_source/devices/uprobe/type")
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+}
+
+/// Lot 2.2: which of the kernel-read option's guards this start attached
+/// (the `locked_down` one, the perf one).
+static KERNEL_READ_GUARDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const GUARD_LOCKDOWN: u32 = 1;
+const GUARD_PERF: u32 = 2;
+
+/// Lot 2.2: the classes the kernel refuses for `mask`, given the guards
+/// attached (`guards`) and the lockdown reasons this kernel names.
+pub fn kernel_read_armed(
+    mask: u32,
+    guards: u32,
+    resolved: &[Option<u32>; common::wire::KERNEL_READ_LOCKDOWN.len()],
+) -> u32 {
+    let mut armed = 0;
+    if guards & GUARD_LOCKDOWN != 0 {
+        for (i, (_, class)) in common::wire::KERNEL_READ_LOCKDOWN.iter().enumerate() {
+            if mask & class != 0 && resolved[i].is_some() {
+                armed |= class;
+            }
+        }
+    }
+    if guards & GUARD_PERF != 0 {
+        armed |= mask & common::wire::KERNEL_READ_PERF;
+    }
+    armed
+}
+
+/// Lot 2.2: the kernel-read option's two guards attached at the start —
+/// always, each a no-op while the option names none of its classes (one
+/// array lookup per question): the signed policy is applied after the
+/// load, and a `policy set` changes the configuration at once. `perf_event_guard`
+/// is pinned where the guard enforces; `kernel_read_guard` lives with the
+/// agent (the hook's pin is the content judge's before 6.9). The
+/// configuration the policy holds now is written. Why a guard is not
+/// attached, if one is not.
+pub(crate) fn arm_kernel_read(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+    enforce: bool,
+) -> std::result::Result<(), String> {
+    let mut guards = 0;
+    let mut missing = Vec::new();
+    match antitamper_bpf::attach_transient(ebpf, KERNEL_READ_PROGRAM, KERNEL_READ_HOOK, btf) {
+        Ok(()) => guards |= GUARD_LOCKDOWN,
+        Err(e) => {
+            dump_verifier_log(KERNEL_READ_PROGRAM, &e);
+            missing.push(format!("{KERNEL_READ_PROGRAM} not attached: {e:#}"));
+        }
+    }
+    match attach_guard_hook(
+        ebpf,
+        PERF_GUARD_PROGRAM,
+        PERF_GUARD_HOOK,
+        btf,
+        pin_root,
+        enforce,
+    ) {
+        Ok(()) => guards |= GUARD_PERF,
+        Err(e) => {
+            dump_verifier_log(PERF_GUARD_PROGRAM, &e);
+            missing.push(format!("{PERF_GUARD_PROGRAM} not attached: {e:#}"));
+        }
+    }
+    KERNEL_READ_GUARDS.store(guards, std::sync::atomic::Ordering::SeqCst);
+    let m = ebpf
+        .map_mut(common::wire::KERNEL_READ_CONF_MAP_NAME)
+        .ok_or_else(|| {
+            format!(
+                "{} missing from the eBPF object",
+                common::wire::KERNEL_READ_CONF_MAP_NAME
+            )
+        })?;
+    let mut a: Array<&mut MapData, u32> = Array::try_from(m).map_err(|e| e.to_string())?;
+    write_kernel_read_conf(&mut a)?;
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
+/// Lot 2.2: the option the signed policy holds now written over `conf`,
+/// and the classes then refused recorded for status.
+fn write_kernel_read_conf<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    conf: &mut Array<M, u32>,
+) -> std::result::Result<u32, String> {
+    use common::wire::KERNEL_READ_LOCKDOWN;
+    let mask = KERNEL_READ_POLICY.load(std::sync::atomic::Ordering::SeqCst);
+    let resolved = crate::anti_tamper::btf_revalidate::resolved()
+        .map(|r| *r.kernel_read_lockdown)
+        .unwrap_or([None; KERNEL_READ_LOCKDOWN.len()]);
+    let slots = kernel_read_conf(mask, &resolved, uprobe_pmu_type());
+    // the mask last: a guard reading it finds its reasons written
+    for (i, v) in slots.iter().enumerate().rev() {
+        conf.set(i as u32, v, 0)
+            .map_err(|e| format!("{}[{i}]: {e}", common::wire::KERNEL_READ_CONF_MAP_NAME))?;
+    }
+    let armed = kernel_read_armed(
+        mask,
+        KERNEL_READ_GUARDS.load(std::sync::atomic::Ordering::SeqCst),
+        &resolved,
+    );
+    KERNEL_READ_ARMED.store(armed, std::sync::atomic::Ordering::SeqCst);
+    if mask != 0 {
+        info!(
+            classes = armed,
+            wanted = mask,
+            "kernel-read option in force"
+        );
+    }
+    Ok(armed)
+}
+
+/// Lot 2.2: the policy's kernel-read option written through the pin (a
+/// policy applied once the object is loaded). Why not, if it is not.
+fn write_kernel_read_conf_pin(pin: &Path) -> std::result::Result<u32, String> {
+    let md = MapData::from_pin(pin).map_err(|e| e.to_string())?;
+    let mut a: Array<MapData, u32> = Array::try_from(Map::Array(md)).map_err(|e| e.to_string())?;
+    write_kernel_read_conf(&mut a)
+}
+
+/// Lot 2.2 (the review of #644, decision D10): the role images, by kernel
+/// key, each with what names it — the two binaries (`own`: the agent's and
+/// the watchdog's, as the install or the upgrade put them in place, inside
+/// a window) and the main image of the live watchdog (`watchdog_main`: an
+/// upgrade's watchdog still runs the binary it replaced until its own
+/// restart). Only the MAIN image of a role process is marked: every other
+/// executable mapping is judged by the kernel when it is made, on its own
+/// file (`common::exec_marks::code_verdict`), so a library an upgrade
+/// replaced, an NSS module opened later or a preloaded library needs no
+/// mark.
+pub fn role_images(
+    own: &crate::anti_tamper::OwnExes,
+    watchdog_main: Option<common::wire::InodeKey>,
+) -> Vec<(common::wire::InodeKey, &'static str)> {
+    let mut out: Vec<(common::wire::InodeKey, &'static str)> = Vec::new();
+    for id in own.keep() {
+        let key = common::wire::InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+            ino: id.ino,
+        };
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, "a role binary"));
+        }
+    }
+    if let Some(key) = watchdog_main {
+        if !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, "the live watchdog's main image"));
+        }
+    }
+    out
+}
+
+/// Lot 2.2: the role marks written over `map`'s entries: `want` marked
+/// (`MARK_ROLE`, the bits S12 owns kept), and an entry no longer wanted
+/// removed. The marks written.
+fn write_role_marks<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    map: &mut HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
+    want: &[(common::wire::InodeKey, &'static str)],
+) -> std::result::Result<usize, String> {
+    use crate::anti_tamper::filesystem::AyaInodeKey;
+    use common::exec_marks::MARK_ROLE;
+    let stale: Vec<AyaInodeKey> = map
+        .keys()
+        .filter_map(std::result::Result::ok)
+        .filter(|k| !want.iter().any(|(w, _)| *w == k.0))
+        .collect();
+    for k in &stale {
+        map.remove(k)
+            .map_err(|e| format!("removing a stale role mark: {e}"))?;
+    }
+    let mut n = 0;
+    for (key, what) in want {
+        let old = map.get(&AyaInodeKey(*key), 0).unwrap_or(0);
+        if old & MARK_ROLE == 0 {
+            map.insert(&AyaInodeKey(*key), &(old | MARK_ROLE), 0)
+                .map_err(|e| format!("{what} ({}:{}): {e}", key.dev, key.ino))?;
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// The main image of the live watchdog (`/proc/<pid>/exe`), by kernel key,
+/// when it is one of the role binaries this agent knows or was marked
+/// before (an upgrade's watchdog before its restart).
+fn watchdog_main(
+    watchdog_pid: Option<u32>,
+    marked: impl Fn(common::wire::InodeKey) -> bool,
+) -> Option<common::wire::InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let pid = watchdog_pid.filter(|p| *p != 0 && *p != common::wire::ROLE_VACATED)?;
+    let m = antitamper_bpf::kernel_roots::metadata(format!("/proc/{pid}/exe")).ok()?;
+    let key = common::wire::InodeKey {
+        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+        ino: m.ino(),
+    };
+    marked(key).then_some(key)
+}
+
+/// Lot 2.2 (the review of #644, F5): the arm flag set or cleared — cleared
+/// when the marks could not be written whole, so that no role is judged
+/// against marks the write left partial (fail open for the role, signed by
+/// the caller).
+fn set_marks_armed<M: std::borrow::BorrowMut<MapData> + std::borrow::Borrow<MapData>>(
+    a: &mut Array<M, u32>,
+    on: bool,
+) -> std::result::Result<(), String> {
+    a.set(0, &armed_word(on), 0)
+        .map_err(|e| format!("{}: {e}", common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+}
+
+/// The arm flag's word: [`common::exec_marks::EXEC_MARKS_ARMED_ON`] when
+/// armed, 0 (nothing judged) when not.
+fn armed_word(on: bool) -> u32 {
+    if on {
+        common::exec_marks::EXEC_MARKS_ARMED_ON
+    } else {
+        0
+    }
+}
+
+/// Lot 2.2 (the review of #644, F5): the degradation a failed refresh of
+/// the role marks reports (the marks then disarmed).
+pub const ROLE_MARKS_REFRESH_DEGRADATION: &str = "role_marks";
+
+/// Lot 2.2: the agent's own executables, for the refresh of the marks.
+static ROLE_MARK_EXES: OnceLock<crate::anti_tamper::OwnExes> = OnceLock::new();
+
+/// Lot 2.2: how many images the marks name, as last written
+/// (`nn-admin status`'s `role_marks.marked`).
+static ROLE_MARKS_WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Lot 2.2: the role marks for `nn-admin status`: the images marked, the
+/// processes alive now that lost their role (read through the pin), and
+/// what [`super::role_watch`] found (the preloaded libraries, the foreign
+/// cgroup programs).
+pub fn role_marks_status(pin_root: Option<&Path>) -> Option<nn_proto::admin_protocol::RoleMarks> {
+    let marked = ROLE_MARKS_WRITTEN.load(std::sync::atomic::Ordering::SeqCst);
+    let foreign = super::role_watch::foreign_now();
+    if marked == 0 && foreign.is_none() {
+        return None;
+    }
+    let unmarked = pin_root
+        .and_then(|r| MapData::from_pin(r.join(common::exec_marks::ROLE_UNMARKED_MAP_NAME)).ok())
+        .and_then(|md| HashMap::<MapData, u32, u64>::try_from(Map::HashMap(md)).ok())
+        .map_or(0, |m| {
+            m.keys().filter_map(std::result::Result::ok).count() as u64
+        });
+    Some(nn_proto::admin_protocol::RoleMarks {
+        marked,
+        unmarked_refused: unmarked,
+        preloaded: super::role_watch::preloaded_now(),
+        cgroup_bpf_foreign: foreign,
+    })
+}
+
+/// Lot 2.2: the role marks armed for this start — `ROLE_UNMARKED` frozen
+/// (only the hooks write it), the marks written ([`role_images`]), the
+/// mapping hooks told they are ([`common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME`]),
+/// then the two programs attached (pinned where the guard enforces: a
+/// restarted role is judged by its predecessor's hooks). Run after the
+/// agent's own executables are registered. The marks written, or why the
+/// marks are not armed (then no role is judged: a signed degradation). A
+/// write that fails clears the flag (the review of #644, F5: the flag is
+/// pinned, and an earlier start set it).
+pub(crate) fn arm_role_marks(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+    own: &crate::anti_tamper::OwnExes,
+) -> std::result::Result<usize, String> {
+    use common::exec_marks::{
+        EXEC_MARKS_ARMED_MAP_NAME, EXEC_MARKS_MAP_NAME, ROLE_UNMARKED_MAP_NAME,
+    };
+    freeze_named(ebpf, ROLE_UNMARKED_MAP_NAME)?;
+    let watchdog = pin_root.and_then(|r| antitamper_bpf::role_slot(r, 0).ok());
+    let written = {
+        let m = ebpf
+            .map_mut(EXEC_MARKS_MAP_NAME)
+            .ok_or_else(|| format!("{EXEC_MARKS_MAP_NAME} missing from the eBPF object"))?;
+        let mut map: HashMap<&mut MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
+            HashMap::try_from(m).map_err(|e| format!("{EXEC_MARKS_MAP_NAME}: {e}"))?;
+        let want = role_images(own, watchdog_main(watchdog, |k| marked_now(&map, own, k)));
+        write_role_marks(&mut map, &want)
+    };
+    {
+        let m = ebpf
+            .map_mut(EXEC_MARKS_ARMED_MAP_NAME)
+            .ok_or_else(|| format!("{EXEC_MARKS_ARMED_MAP_NAME} missing from the eBPF object"))?;
+        let mut a: Array<&mut MapData, u32> =
+            Array::try_from(m).map_err(|e| format!("{EXEC_MARKS_ARMED_MAP_NAME}: {e}"))?;
+        set_marks_armed(&mut a, written.is_ok())?;
+    }
+    let n = written?;
+    ROLE_MARKS_WRITTEN.store(n as u32, std::sync::atomic::Ordering::SeqCst);
+    let _ = ROLE_MARK_EXES.set(*own);
+    let enforce = enforce_mode();
+    let mut missing = Vec::new();
+    for (program, hook) in [
+        (ROLE_MMAP_PROGRAM, ROLE_MMAP_HOOK),
+        (ROLE_MPROTECT_PROGRAM, ROLE_MPROTECT_HOOK),
+    ] {
+        if let Err(e) = attach_guard_hook(ebpf, program, hook, btf, pin_root, enforce) {
+            dump_verifier_log(program, &e);
+            missing.push(format!("{program} not attached: {e:#}"));
+        }
+    }
+    if missing.is_empty() {
+        info!(
+            marked = n,
+            "role marks armed (a role's main image must be marked; any other executable mapping \
+             must be trusted code when it is made)"
+        );
+        Ok(n)
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
+/// Whether `key` is one of `own`'s binaries or carries the role mark in
+/// `map` now.
+fn marked_now<M: std::borrow::Borrow<MapData>>(
+    map: &HashMap<M, crate::anti_tamper::filesystem::AyaInodeKey, u32>,
+    own: &crate::anti_tamper::OwnExes,
+    key: common::wire::InodeKey,
+) -> bool {
+    role_images(own, None).iter().any(|(k, _)| *k == key)
+        || map
+            .get(&crate::anti_tamper::filesystem::AyaInodeKey(key), 0)
+            .is_ok_and(|m| m & common::exec_marks::MARK_ROLE != 0)
+}
+
+/// Lot 2.2: the role marks rewritten through the pin (the integrity
+/// round): the two binaries and the live watchdog's main image marked, any
+/// other mark dropped. A write that fails clears the arm flag (F5). The
+/// marks written.
+pub fn refresh_role_marks(
+    pin_root: &Path,
+    own: &crate::anti_tamper::OwnExes,
+) -> std::result::Result<usize, String> {
+    let watchdog = antitamper_bpf::role_slot(pin_root, 0).ok();
+    let md = MapData::from_pin(pin_root.join(common::exec_marks::EXEC_MARKS_MAP_NAME))
+        .map_err(|e| e.to_string())?;
+    let mut map: HashMap<MapData, crate::anti_tamper::filesystem::AyaInodeKey, u32> =
+        HashMap::try_from(Map::HashMap(md)).map_err(|e| e.to_string())?;
+    let want = role_images(own, watchdog_main(watchdog, |k| marked_now(&map, own, k)));
+    match write_role_marks(&mut map, &want) {
+        Ok(n) => {
+            ROLE_MARKS_WRITTEN.store(n as u32, std::sync::atomic::Ordering::SeqCst);
+            Ok(n)
+        }
+        Err(e) => {
+            let cleared =
+                MapData::from_pin(pin_root.join(common::exec_marks::EXEC_MARKS_ARMED_MAP_NAME))
+                    .map_err(|e| e.to_string())
+                    .and_then(|md| {
+                        let mut a: Array<MapData, u32> =
+                            Array::try_from(Map::Array(md)).map_err(|e| e.to_string())?;
+                        set_marks_armed(&mut a, false)
+                    });
+            ROLE_MARKS_WRITTEN.store(0, std::sync::atomic::Ordering::SeqCst);
+            Err(match cleared {
+                Ok(()) => format!("{e} — the marks are disarmed (no role is judged)"),
+                Err(c) => format!("{e} — and the arm flag NOT cleared ({c})"),
+            })
+        }
+    }
+}
+
+/// Lot 2.2 (the design's section 5, boot-zero): the window's maps emptied
+/// at the agent's start — the grant slot, the members, the leases. A
+/// window an earlier agent opened is closed by this start; its members and
+/// leases fail the session and generation test anyway. The window ring's
+/// drops an earlier run left (records the hooks could not write while no
+/// agent ran), summed.
+pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, String> {
+    use common::wire::{
+        FS_GRANT_V2_MAP_NAME, TREE_MEMBERS_MAP_NAME, WINDOW_EVENT_DROPS_MAP_NAME,
+        WINDOW_LEASES_MAP_NAME, WINDOW_LEASES_MAX,
+    };
+    {
+        let m = ebpf
+            .map_mut(FS_GRANT_V2_MAP_NAME)
+            .ok_or_else(|| format!("{FS_GRANT_V2_MAP_NAME} missing"))?;
+        let mut a: Array<&mut MapData, PodGrantV2> =
+            Array::try_from(m).map_err(|e| e.to_string())?;
+        a.set(0, &PodGrantV2(common::wire::FsGrantV2::default()), 0)
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let m = ebpf
+            .map_mut(WINDOW_LEASES_MAP_NAME)
+            .ok_or_else(|| format!("{WINDOW_LEASES_MAP_NAME} missing"))?;
+        let mut a: Array<&mut MapData, PodLease> = Array::try_from(m).map_err(|e| e.to_string())?;
+        for i in 0..WINDOW_LEASES_MAX {
+            a.set(i, &PodLease(bytemuck::Zeroable::zeroed()), 0)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    {
+        let m = ebpf
+            .map_mut(TREE_MEMBERS_MAP_NAME)
+            .ok_or_else(|| format!("{TREE_MEMBERS_MAP_NAME} missing"))?;
+        let mut h: HashMap<&mut MapData, u32, PodMember> =
+            HashMap::try_from(m).map_err(|e| e.to_string())?;
+        let keys: Vec<u32> = h.keys().filter_map(std::result::Result::ok).collect();
+        for k in keys {
+            h.remove(&k).map_err(|e| e.to_string())?;
+        }
+    }
+    let m = ebpf
+        .map(WINDOW_EVENT_DROPS_MAP_NAME)
+        .ok_or_else(|| format!("{WINDOW_EVENT_DROPS_MAP_NAME} missing"))?;
+    let a: aya::maps::PerCpuArray<&MapData, u64> =
+        aya::maps::PerCpuArray::try_from(m).map_err(|e| e.to_string())?;
+    Ok(a.get(&0, 0).map(|v| v.iter().sum()).unwrap_or(0))
+}
+
+/// Lot 2.2: the agent's heartbeat for an open window, `now_boot_ns`
+/// (`CLOCK_BOOTTIME`): the slot as it is, with the heartbeat moved — none
+/// for a slot that holds no grant (nothing to keep alive).
+pub fn heartbeat(
+    grant: common::wire::FsGrantV2,
+    now_boot_ns: u64,
+) -> Option<common::wire::FsGrantV2> {
+    (grant.generation != 0).then_some(common::wire::FsGrantV2 {
+        heartbeat_boot_ns: now_boot_ns.max(grant.heartbeat_boot_ns),
+        ..grant
+    })
+}
+
+/// Lot 2.2: the slot a new lease takes among `leases` at `now_boot_ns`
+/// for the window `generation`: one never used for this window, or used,
+/// or expired; `None` when every slot holds a live lease of this window
+/// (a small number per window: the member's request is refused).
+pub fn lease_slot(
+    leases: &[common::wire::WindowLease],
+    generation: u64,
+    now_boot_ns: u64,
+) -> Option<usize> {
+    leases
+        .iter()
+        .position(|l| l.generation != generation || l.used != 0 || now_boot_ns >= l.expires_boot_ns)
+}
+
+/// Lot 2.2: a lease for `member` on the link `name` in `dir`, for `action`,
+/// in the window `generation`, void after `WINDOW_LEASE_TTL_NS`.
+pub fn lease_for(
+    generation: u64,
+    dir: common::wire::InodeKey,
+    name: &str,
+    action: u32,
+    member: u32,
+    now_boot_ns: u64,
+) -> common::wire::WindowLease {
+    common::wire::WindowLease {
+        generation,
+        dir,
+        name_hash: common::wire::pin_name_hash(name.as_bytes()),
+        expires_boot_ns: now_boot_ns.saturating_add(common::wire::WINDOW_LEASE_TTL_NS),
+        member_tgid: member,
+        action,
+        used: 0,
+        _pad: 0,
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodGrantV2(common::wire::FsGrantV2);
+// SAFETY: `FsGrantV2` is `repr(C)`, `bytemuck::Pod` (no padding, every bit
+// pattern valid).
+unsafe impl aya::Pod for PodGrantV2 {}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodLease(common::wire::WindowLease);
+// SAFETY: as above (`WindowLease` is `bytemuck::Pod`).
+unsafe impl aya::Pod for PodLease {}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodMember(common::wire::TreeMember);
+// SAFETY: as above (`TreeMember` is `bytemuck::Pod`).
+unsafe impl aya::Pod for PodMember {}
+
 /// Lot 385: what the eBPF `obj_get_names_own_link` computes for the
 /// `OBJ_GET` path `path` that fits its buffer — the hash of the final
 /// component within the last [`PIN_NAME_LEN`] bytes (restarted at each `/`),
@@ -2114,13 +2692,34 @@ impl BpfGuard {
         );
         tokio::spawn(async move {
             let mut reported: HashSet<u32> = HashSet::new();
+            let mut signed = super::role_watch::Signed::default();
+            let mut first = true;
             loop {
-                tokio::time::sleep(crate::self_integrity::jittered(Duration::from_secs(
-                    LINK_CHECK_SECS,
-                )))
-                .await;
+                // lot 2.2 (the review of #644, F4): the first round at once
+                // (the census at the start), then each period or right after
+                // a cgroup attach the kernel let through
+                if !first {
+                    super::role_watch::wait_round(crate::self_integrity::jittered(
+                        Duration::from_secs(LINK_CHECK_SECS),
+                    ))
+                    .await;
+                }
+                first = false;
                 if guard.stopping() {
                     return;
+                }
+                // lot 2.2: the role marks follow the live watchdog's main
+                // image (an upgrade's, before its restart)
+                if let (Some(root), Some(exes)) = (own.pin_root.clone(), ROLE_MARK_EXES.get()) {
+                    if let Err(e) =
+                        crate::runtime::off_the_runtime(|| refresh_role_marks(&root, exes))
+                    {
+                        warn!(error = %e, "role marks NOT refreshed");
+                        crate::boot::degradation::report(
+                            ROLE_MARKS_REFRESH_DEGRADATION,
+                            &format!("the role marks could not be written ({e})"),
+                        );
+                    }
                 }
                 // lot 353 (re-check 1 of #563): the pins walked by path
                 // (`/sys/fs/bpf`) — off the runtime's worker
@@ -2165,6 +2764,66 @@ impl BpfGuard {
                             );
                         }
                     }
+                }
+                // lot 2.2 (the review of #644, F3 and F4): a preloaded
+                // library in a role process, a foreign cgroup program on the
+                // agent's cgroups — each signed High once while it holds,
+                // listed by the status
+                let own_ids = {
+                    let mut ids = guard.own_prog_ids();
+                    ids.extend(crate::sysctl_cgroup::own_prog_id());
+                    ids
+                };
+                let watchdog = own
+                    .pin_root
+                    .as_deref()
+                    .and_then(|r| antitamper_bpf::role_slot(r, 0).ok());
+                let (preloaded, census) = crate::runtime::off_the_runtime(|| {
+                    (
+                        super::role_watch::preload_findings(watchdog),
+                        super::role_watch::census(&own_ids),
+                    )
+                });
+                let foreign = match census {
+                    Ok(hits) => Some(
+                        hits.iter()
+                            .map(|h| crate::self_integrity::Finding {
+                                kind: super::role_watch::CGROUP_FOREIGN_KIND,
+                                detail: super::role_watch::census_detail(
+                                    h,
+                                    guard
+                                        .census_program(h.prog_id)
+                                        .ok()
+                                        .map(|p| p.name)
+                                        .as_deref(),
+                                ),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "cgroup BPF census NOT made this round");
+                        None
+                    }
+                };
+                super::role_watch::set_counts(
+                    foreign.as_ref().map(|f| f.len() as u32),
+                    preloaded.len() as u32,
+                );
+                // signed rows of advisory kinds: the status lists each
+                // until its end is signed (a census that failed ends none)
+                let kept: &[&str] = if foreign.is_some() {
+                    &[]
+                } else {
+                    &[super::role_watch::CGROUP_FOREIGN_KIND]
+                };
+                let mut now = preloaded;
+                now.extend(foreign.unwrap_or_default());
+                let (fresh, gone) = signed.fresh(&now, kept);
+                for f in fresh {
+                    crate::self_integrity::report_event(audit_log.as_ref(), f);
+                }
+                for f in &gone {
+                    crate::self_integrity::report_cleared(audit_log.as_ref(), f);
                 }
             }
         });
@@ -2212,6 +2871,187 @@ pub(crate) fn map_data(m: &Map) -> &MapData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review of #644 (D10, F1, F2): the marks name the MAIN images only
+    /// — the two binaries, each once, and the live watchdog's main image (an
+    /// upgrade's watchdog before its restart). No library is marked: the
+    /// kernel judges every other executable mapping on its own file when it
+    /// is made, so a C library upgraded under a running agent, an NSS module
+    /// opened later or a preloaded library needs no mark (the lot's first
+    /// version marked the mapped libraries and dropped a replaced one: the
+    /// role was lost at the next restart after a library upgrade).
+    #[test]
+    fn the_role_marks_name_the_main_images_only() {
+        use crate::anti_tamper::{ExeIdentity, OwnExes};
+        let agent = ExeIdentity {
+            dev: 0x801,
+            ino: 1311,
+        };
+        let watchdog = ExeIdentity {
+            dev: 0x801,
+            ino: 1312,
+        };
+        let own = OwnExes {
+            agent: Some(agent),
+            watchdog: Some(watchdog),
+        };
+        let k = |id: ExeIdentity| common::wire::InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(id.dev),
+            ino: id.ino,
+        };
+        let got: Vec<_> = role_images(&own, None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, [k(agent), k(watchdog)]);
+        let old = common::wire::InodeKey {
+            dev: k(agent).dev,
+            ino: 999,
+        };
+        let got: Vec<_> = role_images(&own, Some(old))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, [k(agent), k(watchdog), old], "the upgrade's watchdog");
+        let got: Vec<_> = role_images(&own, Some(k(watchdog)))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, [k(agent), k(watchdog)], "each once");
+        let one = OwnExes {
+            agent: Some(agent),
+            watchdog: Some(agent),
+        };
+        assert_eq!(role_images(&one, None).len(), 1);
+        assert!(role_images(&OwnExes::default(), None).is_empty());
+    }
+
+    /// The review of #644 (F5): the arm flag's word is the hooks' "armed"
+    /// only when the marks were written whole; the live watchdog's main
+    /// image is kept only when it is a role image already (its own
+    /// `/proc/<pid>/exe`, by kernel key).
+    #[test]
+    fn the_marks_are_armed_only_when_written_and_keep_a_marked_watchdog() {
+        assert_eq!(armed_word(true), common::exec_marks::EXEC_MARKS_ARMED_ON);
+        assert_eq!(armed_word(false), 0);
+        assert_ne!(common::exec_marks::EXEC_MARKS_ARMED_ON, 0);
+        let me = Some(std::process::id());
+        assert_eq!(watchdog_main(me, |_| false), None, "not a role image");
+        let k = watchdog_main(me, |_| true).expect("this test's own executable");
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!(k.ino, m.ino());
+        assert_eq!(
+            k.dev,
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev())
+        );
+        assert_eq!(
+            watchdog_main(Some(common::wire::ROLE_VACATED), |_| true),
+            None
+        );
+        assert_eq!(watchdog_main(Some(0), |_| true), None);
+        assert_eq!(watchdog_main(None, |_| true), None);
+    }
+
+    /// Lot 2.2 (named): the kernel-read configuration — the classes, each
+    /// named lockdown reason's running value, the uprobe PMU for perf;
+    /// nothing for a class not named, an unresolved reason 0, the block
+    /// device none here.
+    #[test]
+    fn the_kernel_read_configuration_follows_the_classes() {
+        use common::wire::*;
+        let resolved = [Some(2), Some(22), Some(27), Some(23), None];
+        let off = kernel_read_conf(0, &resolved, Some(9));
+        assert_eq!(off, [0; KERNEL_READ_CONF_SLOTS as usize]);
+        let all = kernel_read_conf(KERNEL_READ_ALL, &resolved, Some(9));
+        assert_eq!(
+            all[KREAD_SLOT_MASK as usize],
+            KERNEL_READ_ALL & !KERNEL_READ_BLOCK_DEVICE
+        );
+        assert_eq!(&all[1..6], &[2, 22, 27, 23, 0], "PERF unresolved: 0");
+        assert_eq!(all[KREAD_SLOT_UPROBE_PMU as usize], 9);
+        let mem = kernel_read_conf(KERNEL_READ_PHYSICAL_MEMORY, &resolved, Some(9));
+        assert_eq!(&mem[1..6], &[2, 22, 0, 0, 0]);
+        assert_eq!(mem[KREAD_SLOT_UPROBE_PMU as usize], 0, "no perf: no PMU");
+        let bdev = kernel_read_conf(KERNEL_READ_BLOCK_DEVICE, &resolved, Some(9));
+        assert_eq!(
+            bdev, [0; KERNEL_READ_CONF_SLOTS as usize],
+            "lot 2.3's class"
+        );
+    }
+
+    /// Lot 2.2 (named): the classes the kernel refuses — a lockdown class
+    /// only with its guard and a reason this kernel names, perf only with
+    /// its guard, the block device never here.
+    #[test]
+    fn the_kernel_read_classes_refused_follow_the_guards() {
+        use common::wire::*;
+        let resolved = [Some(2), Some(22), Some(27), Some(23), None];
+        let both = GUARD_LOCKDOWN | GUARD_PERF;
+        assert_eq!(kernel_read_armed(0, both, &resolved), 0);
+        assert_eq!(
+            kernel_read_armed(KERNEL_READ_ALL, both, &resolved),
+            KERNEL_READ_PHYSICAL_MEMORY
+                | KERNEL_READ_TRACEFS
+                | KERNEL_READ_KPROBES
+                | KERNEL_READ_PERF
+        );
+        assert_eq!(
+            kernel_read_armed(KERNEL_READ_ALL, GUARD_PERF, &resolved),
+            KERNEL_READ_PERF
+        );
+        assert_eq!(
+            kernel_read_armed(KERNEL_READ_ALL, GUARD_LOCKDOWN, &[None; 5]),
+            0,
+            "no reason named: nothing refused"
+        );
+        assert_eq!(
+            kernel_read_armed(KERNEL_READ_BLOCK_DEVICE, both, &resolved),
+            0
+        );
+    }
+
+    /// Lot 2.2 (named): the heartbeat moves only a slot that holds a
+    /// grant, and never backwards.
+    #[test]
+    fn the_heartbeat_keeps_only_a_granted_window_alive() {
+        use common::wire::FsGrantV2;
+        assert_eq!(heartbeat(FsGrantV2::default(), 100), None);
+        let g = FsGrantV2 {
+            generation: 3,
+            heartbeat_boot_ns: 50,
+            ..FsGrantV2::default()
+        };
+        assert_eq!(heartbeat(g, 100).map(|g| g.heartbeat_boot_ns), Some(100));
+        assert_eq!(heartbeat(g, 10).map(|g| g.heartbeat_boot_ns), Some(50));
+        assert_eq!(heartbeat(g, 100).map(|g| g.generation), Some(3));
+    }
+
+    /// Lot 2.2 (named): a lease takes a slot of another window, a used or
+    /// an expired one; never a live lease of this window; its deadline is
+    /// the TTL and its name the hook's hash.
+    #[test]
+    fn a_lease_takes_a_free_slot_only() {
+        use common::wire::*;
+        let dir = InodeKey { dev: 1, ino: 2 };
+        let live = lease_for(5, dir, "northnarrow-agent.service", LEASE_REMOVE, 42, 1_000);
+        assert_eq!(live.expires_boot_ns, 1_000 + WINDOW_LEASE_TTL_NS);
+        assert_eq!(live.name_hash, pin_name_hash(b"northnarrow-agent.service"));
+        assert_eq!(lease_slot(&[live, live], 5, 1_001), None, "all live");
+        let used = WindowLease { used: 1, ..live };
+        assert_eq!(lease_slot(&[live, used], 5, 1_001), Some(1));
+        assert_eq!(
+            lease_slot(&[live, live], 6, 1_001),
+            Some(0),
+            "another window's"
+        );
+        assert_eq!(
+            lease_slot(&[live], 5, live.expires_boot_ns),
+            Some(0),
+            "expired"
+        );
+        assert_eq!(lease_slot(&[], 5, 0), None);
+    }
 
     /// The review of #578 (N2, named): the agent's start records the role it
     /// takes from the kernel's facts — a role its holder left this boot

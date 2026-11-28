@@ -807,7 +807,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     bpf_syscall_rb,
                     &tx,
                     &rt,
-                    no_carry::<BpfSyscallRaw>,
+                    cgroup_attach_wakes_census,
                 )?),
             ),
             // Lab PR 267 (R12a): the bus's drops, WARNed, signed, raised.
@@ -1472,6 +1472,16 @@ fn take_ringbuf(ebpf: &mut Ebpf, name: &str) -> Result<RingBuf<MapData>> {
 
 /// A record that carries no other event.
 fn no_carry<T>(_: &T, e: Event) -> (Event, [Option<Event>; 2]) {
+    (e, [None, None])
+}
+
+/// Lot 2.2 (the review of #644, F4 a): a cgroup attach the kernel let
+/// through (its `bpf` row) wakes the census of the agent's cgroups at once
+/// — the hook judged the descriptor before the kernel resolved it again.
+fn cgroup_attach_wakes_census(raw: &BpfSyscallRaw, e: Event) -> (Event, [Option<Event>; 2]) {
+    if crate::anti_tamper::role_watch::is_cgroup_attach_row(raw.cmd, raw.arg) {
+        crate::anti_tamper::role_watch::census_soon();
+    }
     (e, [None, None])
 }
 

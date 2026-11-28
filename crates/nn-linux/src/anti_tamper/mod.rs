@@ -54,6 +54,9 @@ pub mod mount_guard;
 pub mod network_isolate;
 /// Lot 359 (the re-check 3 of #567, N4): the lock of the pin directory.
 pub mod pin_lock;
+/// Lot 2.2 (the review of #644): the preloaded libraries in the role
+/// processes, the census of the cgroup BPF programs on the agent's cgroups.
+pub mod role_watch;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
 /// stub the recon flagged).
@@ -720,6 +723,29 @@ fn attach_reporting(
     if let Some(why) = mount_guard::guard_own_namespace(ebpf) {
         warn!(reason = %why, "anti-tamper mount guard: the agent's namespace not guarded");
         report.degraded.push(why);
+    }
+    // Lot 2.2: the role marks, once the agent's own executables are
+    // registered — the marks written, then the mapping hooks attached
+    // (pinned before the pin root is protected below). A failure leaves no
+    // role judged by its mappings (the arm flag cleared: the review of
+    // #644, F5): signed degraded.
+    if let Err(why) = bpf_defense::arm_role_marks(ebpf, &btf, pin_root, own) {
+        warn!(reason = %why, "role marks NOT armed — a role is not judged by its executable mappings");
+        report.degraded.push(format!("role marks: {why}"));
+    }
+    // Lot 2.2 (the design's boot-zero): the per-tree window's maps emptied;
+    // a drop count an earlier run left in the window ring is signed.
+    match bpf_defense::zero_window_maps(ebpf) {
+        Ok(0) => {}
+        Ok(n) => report.degraded.push(format!(
+            "window ring: {n} record(s) the kernel could not write while no agent drained it"
+        )),
+        Err(e) => {
+            warn!(error = %e, "window maps NOT emptied at the start");
+            report
+                .degraded
+                .push(format!("window maps not emptied at the start: {e}"));
+        }
     }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.

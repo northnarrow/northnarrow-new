@@ -557,6 +557,11 @@ fn benign_states_are_advisories_not_degradations() {
         "boot_continuity_unknown",
         // lot 2.0: the host's keyboard SysRq mask (a host setting)
         "sysrq_keyboard_signals",
+        // lot 2.2 (the review of #644): a host's preload in a role process
+        // that the kernel judged trusted code, a cgroup program the host's
+        // operator attached (each signed High, no sensor degraded)
+        "role_preloaded_library",
+        "cgroup_bpf_foreign",
     ];
     for k in advisories {
         assert_eq!(hold_of(k, "detected"), Hold::Advisory, "{k}");

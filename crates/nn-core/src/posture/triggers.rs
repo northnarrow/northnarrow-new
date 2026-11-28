@@ -938,7 +938,15 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     // process becomes a "transaction" with an `apt-get -o
                     // APT::Update::Pre-Invoke::=…` hook.
                     TriggerType::PackageTamperRefusal
-                } else if *operation == nn_model::FsProtectOperation::Read {
+                } else if matches!(
+                    operation,
+                    nn_model::FsProtectOperation::Read
+                        // lot 2.2: a read of physical memory, tracefs,
+                        // kprobes or perf the kernel-read option refuses —
+                        // a reach for the agent's keys in memory, which a
+                        // profiling tool meets too
+                        | nn_model::FsProtectOperation::KernelRead
+                ) {
                     // External audit EVD-001: a refused read of the agent's
                     // signing key is a credential reach (ALERTED), not a
                     // decisive tamper — a backup of /etc meets it too.
@@ -970,6 +978,12 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         // attach of a program held at a window's load,
                         // refused like the load would be
                         | nn_model::FsProtectOperation::BpfHeldUse
+                        // lot 2.2: a foreign cgroup BPF attach on our
+                        // cgroups, a uprobe PMU or user-stack sampling under
+                        // the kernel-read option — refused; a tracing tool
+                        // or a unit property meets them too
+                        | nn_model::FsProtectOperation::BpfCgroupAttach
+                        | nn_model::FsProtectOperation::PerfEvent
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a
@@ -5233,8 +5247,10 @@ mod tests {
         // refused mount is decisive); the review of #567: an unmount let
         // through and recorded, one more; its re-check (b): a read-mode
         // ptrace access refused, one more; lot 2.0: the SysRq trigger
-        // refused, and a window's write of it, two more
-        assert_eq!((minor, sole), (22, 7));
+        // refused, and a window's write of it, two more; lot 2.2: a cgroup
+        // BPF attach on our cgroups, the kernel-read option's lockdown and
+        // perf refusals, three more
+        assert_eq!((minor, sole), (25, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -5258,6 +5274,10 @@ mod tests {
             w::FS_OP_CGROUP_MOVE,
             // lot 357: a mount refused over the agent's paths
             w::FS_OP_MOUNT,
+            // lot 2.2: a role process mapping an unmarked image; a shared
+            // writable mapping of a protected file
+            w::FS_OP_ROLE_UNMARKED,
+            w::FS_OP_SHARED_MAP,
         ] {
             assert!(!w::is_minor_denial(decisive), "{decisive}");
         }
@@ -5275,6 +5295,10 @@ mod tests {
             w::FS_OP_PTRACE_READ,
             w::FS_OP_SYSRQ,
             w::FS_OP_SYSRQ_WINDOW,
+            // lot 2.2
+            w::FS_OP_BPF_CGROUP_ATTACH,
+            w::FS_OP_KERNEL_READ,
+            w::FS_OP_PERF_EVENT,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }
@@ -5443,10 +5467,32 @@ mod tests {
             nn_model::FsProtectOperation::SysctlRootAttach,
             // lot 2.0: the SysRq trigger refused
             nn_model::FsProtectOperation::Sysrq,
+            // lot 2.2: a cgroup BPF attach on our cgroups, a perf event
+            // under the kernel-read option
+            nn_model::FsProtectOperation::BpfCgroupAttach,
+            nn_model::FsProtectOperation::PerfEvent,
         ] {
             assert_eq!(
                 det.detect(&ev(op), &[]),
                 vec![TriggerType::DefenseImpairment],
+                "{op}"
+            );
+        }
+        // lot 2.2: a physical-memory or tracing read refused is a reach for
+        // the agent's keys (ALERTED), as a refused read of the key file
+        assert_eq!(
+            det.detect(&ev(nn_model::FsProtectOperation::KernelRead), &[]),
+            vec![TriggerType::SensitiveFileAccess]
+        );
+        // and a role lost to an unmarked image, a shared writable mapping
+        // refused, are decisive
+        for op in [
+            nn_model::FsProtectOperation::RoleUnmarked,
+            nn_model::FsProtectOperation::SharedMap,
+        ] {
+            assert_eq!(
+                det.detect(&ev(op), &[]),
+                vec![TriggerType::AntiTamperDenial],
                 "{op}"
             );
         }

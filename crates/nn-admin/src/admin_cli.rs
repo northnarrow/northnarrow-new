@@ -279,6 +279,13 @@ pub struct StatusOutcome {
     /// that degrade no sensor (`StatusResponse::advisories`; `None` from an
     /// older agent or the unsigned reply).
     pub advisories: Option<Vec<String>>,
+    /// Lot 2.2 (the review of #644, F8): the role marks and what the agent
+    /// watches around its roles (`StatusResponse::role_marks`), and the
+    /// classes of the kernel-read option in force
+    /// (`StatusResponse::kernel_read_refused`); `None` from an older agent
+    /// or the unsigned reply.
+    pub role_marks: Option<nn_proto::admin_protocol::RoleMarks>,
+    pub kernel_read_refused: Option<Vec<String>>,
     pub execq_script_refused_total: Option<u64>,
     /// Lab PR 267 (R12a): the priority event bus and the loss counters by
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
@@ -567,6 +574,8 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         kernel_state_held_back: resp.kernel_state_held_back,
         runtime_clones: resp.runtime_clones,
         advisories: resp.advisories,
+        role_marks: resp.role_marks,
+        kernel_read_refused: resp.kernel_read_refused,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,

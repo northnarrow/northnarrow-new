@@ -28,7 +28,7 @@ use common::bpf_cmd::{
 };
 use common::wire::{
     BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_CMD_LISTING_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD, bpf_cmd_name,
+    BPF_CMD_LISTING_GET_FD, BPF_CMD_ROOT_CGROUP_ATTACH, BPF_CMD_VACATED_ROLE_GET_FD, bpf_cmd_name,
 };
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
@@ -263,6 +263,27 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
                 event,
                 ResponseAction::Log,
                 Severity::Low,
+                &reasoning,
+            ));
+        }
+        // Lot 2.2 (the cgroup BPF guard): a foreign packet or device program
+        // on the ROOT cgroup — let through by the kernel (it governs the
+        // whole host; firewalls and container runtimes attach there), High:
+        // a drop-all egress program there cuts the agent's heartbeat and
+        // export as one on its own cgroups would.
+        if *cmd == BPF_CMD_ROOT_CGROUP_ATTACH {
+            let reasoning = format!(
+                "`{comm}` (pid {pid}) attached a packet or device BPF program (attach type \
+                 {arg}) to the root cgroup: it governs every process of the host, the agent's \
+                 heartbeat and export among them. Let through (a firewall or a container \
+                 runtime attaches there); the same attach on the agent's own cgroups is \
+                 refused. Check that the program is the host's own."
+            );
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::High,
                 &reasoning,
             ));
         }
@@ -645,6 +666,27 @@ mod tests {
         assert_eq!(f.severity, Severity::High);
         assert!(
             r1.evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
+                .is_none()
+        );
+    }
+
+    /// Lot 2.2 (named): a packet or device program attached to the root
+    /// cgroup — let through by the kernel — is recorded High by NN-L-BPF-002
+    /// with its attach type; NN-L-BPF-001 does not take it.
+    #[test]
+    fn a_root_cgroup_packet_attach_is_high() {
+        let (r1, r2) = rules();
+        let v = r2
+            .evaluate(&ev("iptables", BPF_CMD_ROOT_CGROUP_ATTACH, 1))
+            .expect("recorded");
+        assert_eq!(v.rule_id, BPF002_ID);
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::Log)
+        );
+        assert!(v.reasoning.contains("attach type 1"), "{}", v.reasoning);
+        assert!(
+            r1.evaluate(&ev("iptables", BPF_CMD_ROOT_CGROUP_ATTACH, 1))
                 .is_none()
         );
     }

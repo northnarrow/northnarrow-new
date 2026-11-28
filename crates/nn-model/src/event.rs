@@ -1269,6 +1269,28 @@ pub enum FsProtectOperation {
     /// Lot 2.0: NOT a refusal — a write-open of `/proc/sysrq-trigger` let
     /// through by the signed trusted-installer window; the target its inode.
     SysrqWindow,
+    /// Lot 2.2: a process running the agent's or the watchdog's binary,
+    /// or holding a role, mapped an executable image without the role mark
+    /// (or anonymous memory): it has no role from then on. `target_dev`
+    /// the image's device (0: anonymous), `target_ino` its inode.
+    RoleUnmarked,
+    /// Lot 2.2: a foreign cgroup BPF attach on the agent's unit cgroups or
+    /// `northnarrow.slice`, refused outside a window (PID 1's included).
+    /// `target_dev` the attach type's class, `target_ino` the attach type.
+    BpfCgroupAttach,
+    /// Lot 2.2: a lockdown question of a class the kernel-read option
+    /// refuses (physical memory, tracefs, kprobes, perf), refused.
+    /// `target_dev` the class bit, `target_ino` the lockdown reason.
+    KernelRead,
+    /// Lot 2.2: a foreign `perf_event_open` of a uprobe PMU, or CPU-wide
+    /// sampling of user registers or stacks, refused under the
+    /// kernel-read option. `target_dev` what (1 uprobe PMU, 2 user-stack
+    /// sampling), `target_ino` the event's type.
+    PerfEvent,
+    /// Lot 2.2: a shared writable mapping of a WRITE-protected inode,
+    /// refused at the mapping (`mmap`, or `mprotect` adding the write),
+    /// inside a window too. The target the inode.
+    SharedMap,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1331,6 +1353,11 @@ impl FsProtectOperation {
             crate::wire::FS_OP_PTRACE_READ => Self::PtraceRead,
             crate::wire::FS_OP_SYSRQ => Self::Sysrq,
             crate::wire::FS_OP_SYSRQ_WINDOW => Self::SysrqWindow,
+            crate::wire::FS_OP_ROLE_UNMARKED => Self::RoleUnmarked,
+            crate::wire::FS_OP_BPF_CGROUP_ATTACH => Self::BpfCgroupAttach,
+            crate::wire::FS_OP_KERNEL_READ => Self::KernelRead,
+            crate::wire::FS_OP_PERF_EVENT => Self::PerfEvent,
+            crate::wire::FS_OP_SHARED_MAP => Self::SharedMap,
             other => Self::Unknown(other),
         }
     }
@@ -1391,6 +1418,11 @@ impl FsProtectOperation {
             Self::PtraceRead => "ptrace_read",
             Self::Sysrq => "sysrq",
             Self::SysrqWindow => "sysrq_window",
+            Self::RoleUnmarked => "role_unmarked",
+            Self::BpfCgroupAttach => "bpf_cgroup_attach",
+            Self::KernelRead => "kernel_read",
+            Self::PerfEvent => "perf_event",
+            Self::SharedMap => "shared_map",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2310,6 +2342,33 @@ mod tests {
                 crate::wire::FS_OP_SYSRQ_WINDOW,
                 FsProtectOperation::SysrqWindow,
                 "sysrq_window",
+            ),
+            // lot 2.2: the role marks, the BPF guard, the kernel-read
+            // option, the shared mappings
+            (
+                crate::wire::FS_OP_ROLE_UNMARKED,
+                FsProtectOperation::RoleUnmarked,
+                "role_unmarked",
+            ),
+            (
+                crate::wire::FS_OP_BPF_CGROUP_ATTACH,
+                FsProtectOperation::BpfCgroupAttach,
+                "bpf_cgroup_attach",
+            ),
+            (
+                crate::wire::FS_OP_KERNEL_READ,
+                FsProtectOperation::KernelRead,
+                "kernel_read",
+            ),
+            (
+                crate::wire::FS_OP_PERF_EVENT,
+                FsProtectOperation::PerfEvent,
+                "perf_event",
+            ),
+            (
+                crate::wire::FS_OP_SHARED_MAP,
+                FsProtectOperation::SharedMap,
+                "shared_map",
             ),
         ];
         for (byte, op, name) in cases {

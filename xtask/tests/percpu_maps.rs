@@ -210,6 +210,11 @@ enum Why {
 /// posture-floor kills (FIM-010..017) and are per-task entries now.
 const KNOWN: &[(&str, Why)] = &[
     ("RING_DROPS", Why::Counter),
+    // lot 2.2: the window ring's drops, and its per-CPU sequence (an
+    // increment an interleaved run loses repeats a number; the drop is
+    // still counted)
+    ("WINDOW_EVENT_DROPS", Why::Counter),
+    ("WINDOW_EVENT_SEQ", Why::Counter),
     ("DENY_FAIL_OPEN", Why::Counter),
     ("EPG_COUNTERS", Why::Counter),
     ("EXECPOL_COUNTERS", Why::Counter),

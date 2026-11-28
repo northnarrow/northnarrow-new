@@ -147,6 +147,12 @@ static LINK: OnceLock<OwnedFd> = OnceLock::new();
 /// other programs from it).
 static OWN_PROG: OnceLock<u32> = OnceLock::new();
 
+/// Lot 2.2 (the review of #644, F4): this boot's `cgroup/sysctl` program,
+/// the agent's own on the root cgroup (the census leaves it out).
+pub fn own_prog_id() -> Option<u32> {
+    OWN_PROG.get().copied()
+}
+
 /// The boot's judge, once [`attach`]ed.
 pub fn judge() -> Option<&'static Judge> {
     JUDGE.get()
@@ -232,10 +238,18 @@ fn link_create(prog_fd: i32, cgroup_fd: i32) -> std::io::Result<OwnedFd> {
 
 /// The root cgroup's `cgroup/sysctl` programs and mode.
 fn query_root(cgroup_fd: i32) -> std::io::Result<RootQuery> {
+    query_cgroup(cgroup_fd, BPF_CGROUP_SYSCTL)
+}
+
+/// Lot 2.2 (the review of #644, F4): the programs of `attach_type` attached
+/// to the cgroup `cgroup_fd` names itself (not those it inherits:
+/// `query_flags` 0), and its mode — the census of `anti_tamper::role_watch`
+/// asks every cgroup attach type of the agent's cgroups this way.
+pub(crate) fn query_cgroup(cgroup_fd: i32, attach_type: u32) -> std::io::Result<RootQuery> {
     let mut ids = [0u32; 64];
     let mut attr = ProgQueryAttr {
         target_fd: cgroup_fd as u32,
-        attach_type: BPF_CGROUP_SYSCTL,
+        attach_type,
         query_flags: 0,
         attach_flags: 0,
         prog_ids: ids.as_mut_ptr() as u64,
