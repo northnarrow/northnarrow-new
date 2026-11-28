@@ -134,7 +134,7 @@ pub const MG_LOCK: u8 = 32;
 /// or a recursive `MS_PRIVATE` in PID 1's namespace (the review of #569),
 /// reaches the lock ([`lock_touched`]).
 pub const MG_LOCK_ABOVE: u8 = 64;
-/// Lot 2.3a (the review of #647, K4): the key files (`admin.pub`, the
+/// Lot 2.3a (the review of #647, the key files): the key files (`admin.pub`, the
 /// agent's signing key) and their directory: a mount on, over or below
 /// one is refused inside a window too — no window lifts it (the window
 /// lifts what it lifts of [`MG_OWN`] and [`MG_ON`] elsewhere). Propagated
@@ -1603,7 +1603,7 @@ pub fn decide_as(op: u8, q: &Query) -> Verdict {
     }
 }
 
-/// Lot 2.3a (K4): the point is a key file, their directory or below it
+/// Lot 2.3a (the key files): the point is a key file, their directory or below it
 /// ([`MG_KEPT`]): no window lifts a mount there.
 #[inline(always)]
 pub const fn point_kept(p: &Point) -> bool {
@@ -4112,7 +4112,7 @@ mod tests {
         assert!(!vacates(0, host));
     }
 
-    /// Lot 2.3a (K4): a mount on the key files' directory or below it is
+    /// Lot 2.3a (the key files): a mount on the key files' directory or below it is
     /// refused inside a window too; the window lifts it elsewhere.
     #[test]
     fn a_mount_on_or_below_the_key_directory_is_refused_inside_a_window() {

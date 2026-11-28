@@ -10,7 +10,7 @@
 //! boot's pin goes. [`manifest_missing`] names what this kernel or this
 //! start lacks for a tree window — a program not attached, a field of the
 //! per-lift test the kernel does not have, a key file `INODE_EXT` does not
-//! keep (lot 2.3a, K4) — and a tree grant is refused
+//! keep (lot 2.3a, the key files) — and a tree grant is refused
 //! while it names anything: the window never falls back to host-wide.
 //!
 //! Not a deny hook of the start's count: without them no tree window opens
@@ -216,7 +216,7 @@ pub fn missing_from(attached: Option<&Result<(), String>>, absent: &[&str]) -> V
     out
 }
 
-/// [`missing_from`] for this start, and (lot 2.3a, K4, the review of
+/// [`missing_from`] for this start, and (lot 2.3a, the key files, the review of
 /// #647: fail-closed) the key files the pinned `INODE_EXT` under
 /// `pin_root` does not keep now (`filesystem::key_files_not_kept`: a key
 /// rotated or bootstrapped since the start is registered first). No pin

@@ -241,7 +241,7 @@ pub fn protected_points(
     for d in &own {
         add(d, MG_OWN | MG_HOLD, &mut out);
     }
-    // Lot 2.3a (K4, the review of #647): the key files' directory — a mount
+    // Lot 2.3a (the key files, the review of #647): the key files' directory — a mount
     // on, over or below it is refused inside a window too
     add(CONFIG_DIR, MG_KEPT, &mut out);
     for p in BINARY_AND_UNIT_PATHS.iter().filter(|p| exists(p)) {
@@ -2490,7 +2490,7 @@ mod tests {
         }
     }
 
-    /// Lot 2.3a (K4, the review of #647): the key files' directory is kept
+    /// Lot 2.3a (the key files, the review of #647): the key files' directory is kept
     /// by any window (`MG_KEPT`), on top of being the agent's own; no other
     /// point is.
     #[test]

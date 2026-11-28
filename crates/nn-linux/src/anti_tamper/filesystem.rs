@@ -2061,7 +2061,7 @@ pub fn enablement_dirs(unit_dir: &Path, list: &dyn Fn(&Path) -> Vec<String>) -> 
     out
 }
 
-/// Lot 2.3a (K4, the review of #647: fail-closed): the key files
+/// Lot 2.3a (the key files, the review of #647: fail-closed): the key files
 /// ([`WINDOW_KEPT_FILES`] in `etc_dir`) as `INODE_EXT` must keep them for a
 /// tree window — each one's inode now (`key_of`: `None` when it cannot be
 /// `stat`ed) carrying `INODE_EXT_WINDOW_KEPT` (`get`). A key whose inode
@@ -2080,7 +2080,7 @@ pub fn key_files_not_kept_with(
         let path = etc_dir.join(f);
         let Some(key) = key_of(&path) else {
             missing.push(format!(
-                "key file {} not found: not kept (K4)",
+                "key file {} not found: not kept by any window",
                 path.display()
             ));
             continue;
@@ -2091,7 +2091,7 @@ pub fn key_files_not_kept_with(
         }
         if let Err(e) = insert(&key, have | common::wire::INODE_EXT_WINDOW_KEPT) {
             missing.push(format!(
-                "key file {} not registered in INODE_EXT: {e:#} (K4)",
+                "key file {} not registered in INODE_EXT: {e:#}: not kept by any window",
                 path.display()
             ));
         }
@@ -2113,7 +2113,7 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
         Ok(m) => m,
         Err(e) => {
             return vec![format!(
-                "INODE_EXT not opened at {}: {e:#}: the key files are not kept (K4)",
+                "INODE_EXT not opened at {}: {e:#}: the key files are not kept by any window",
                 pin.display()
             )];
         }
@@ -2157,7 +2157,7 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
 /// tree window is then refused, signed).
 pub const DEBUG_KEY_KEPT_FAIL: &str = "/run/nn-debug-key-kept-fail";
 
-/// Lot 2.3a (K4, the review of #647): after a rotation's rewrite of a key
+/// Lot 2.3a (the key files, the review of #647): after a rotation's rewrite of a key
 /// file (a new inode), the new inode kept by any window in the pinned
 /// `INODE_EXT` (`INODE_EXT_WINDOW_KEPT`), the stale one's entry dropped.
 /// No pin root: nothing to do (no window opens either).
@@ -4759,7 +4759,7 @@ mod tests {
         assert!(passthrough_nodes((253, 0), &read, &list).is_empty());
     }
 
-    /// Lot 2.3a (K4, the review of #647: fail-closed): a key file kept
+    /// Lot 2.3a (the key files, the review of #647: fail-closed): a key file kept
     /// passes; one whose inode is new is registered; one missing, or whose
     /// registration fails, is named (a tree window refused).
     #[test]
@@ -4809,7 +4809,7 @@ mod tests {
         assert_eq!(m.len(), 2, "{m:?}");
         assert!(
             m.iter()
-                .all(|l| l.contains("not registered") && l.contains("K4")),
+                .all(|l| l.contains("not registered") && l.contains("not kept by any window")),
             "{m:?}"
         );
         let none = |_: &Path| None;

@@ -506,7 +506,7 @@ print(res["a"], res["b"])
 /// write-protects the fixed directory's files (`ETC_WRITE_DENY_FILES`),
 /// not the tempdir's `--admin-pub` (a first version wrote there, and its
 /// "refused" write went through: nothing protected it). Lot 2.3a: not a key
-/// file — a window keeps `admin.pub` and the signing key refused (K4), so
+/// file — a window keeps `admin.pub` and the signing key refused, so
 /// their write-open fails inside the window too, as asserted below.
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
@@ -548,7 +548,7 @@ except OSError as e:
 "#;
     fx.grant_window(5);
     fx.wait_for_log("trusted-installer override ARMED");
-    // K4: inside the window the key file's write-open is still refused.
+    // the key files: inside the window the key file's write-open is still refused.
     if Path::new(key_file).exists() {
         let (_, out) = py(open, &[key_file]);
         assert_eq!(out.trim(), "errno=EPERM", "{}", fx.log_tail());

@@ -47,7 +47,7 @@ fn reregister_admin_pub_after_rotate(
              FAILED — admin.pub is UNPROTECTED against tamper until the next agent restart"
         );
     }
-    // Lot 2.3a (K4, the review of #647): and kept by any window (INODE_EXT);
+    // Lot 2.3a (the key files, the review of #647): and kept by any window (INODE_EXT);
     // a failure here refuses every tree window until it is registered (the
     // arming's manifest re-checks the key files, fail-closed).
     if let Err(e) =
