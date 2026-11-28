@@ -1982,8 +1982,13 @@ mod tests {
             self.closed = [0; 2];
             Ok(())
         }
-        fn put_cgroup_file(&mut self, key: InodeKey, value: [u64; 2]) -> std::result::Result<(), String> {
-            self.ops.push(format!("cgroup file {} op {}", key.ino, value[1]));
+        fn put_cgroup_file(
+            &mut self,
+            key: InodeKey,
+            value: [u64; 2],
+        ) -> std::result::Result<(), String> {
+            self.ops
+                .push(format!("cgroup file {} op {}", key.ino, value[1]));
             self.cgroup_files.push((key, value));
             Ok(())
         }
@@ -2494,26 +2499,60 @@ mod tests {
         let mut maps = FakeMaps::default();
         let reader = CgroupReader(host(), Ok(vec![(k(30), kill), (k(31), freeze)]));
         let g = ov
-            .arm_tree_with(Some(&mut maps), &reader, &[], NOW, 120, (501, 9_000), &line())
+            .arm_tree_with(
+                Some(&mut maps),
+                &reader,
+                &[],
+                NOW,
+                120,
+                (501, 9_000),
+                &line(),
+            )
             .expect("armed");
         assert_eq!(
             maps.cgroup_files,
-            vec![(k(30), [g, u64::from(kill)]), (k(31), [g, u64::from(freeze)])]
+            vec![
+                (k(30), [g, u64::from(kill)]),
+                (k(31), [g, u64::from(freeze)])
+            ]
         );
-        let files = maps.ops.iter().position(|o| o.starts_with("cgroup file")).unwrap();
-        let grant = maps.ops.iter().position(|o| o.starts_with("grant")).unwrap();
-        let last_member = maps.ops.iter().rposition(|o| o.starts_with("member")).unwrap();
+        let files = maps
+            .ops
+            .iter()
+            .position(|o| o.starts_with("cgroup file"))
+            .unwrap();
+        let grant = maps
+            .ops
+            .iter()
+            .position(|o| o.starts_with("grant"))
+            .unwrap();
+        let last_member = maps
+            .ops
+            .iter()
+            .rposition(|o| o.starts_with("member"))
+            .unwrap();
         assert!(last_member < files && files < grant, "{:?}", maps.ops);
 
         let ov = tree_override();
         let mut maps = FakeMaps::default();
         let reader = CgroupReader(host(), Err("/proc/501/cgroup: EACCES".to_string()));
         let e = ov
-            .arm_tree_with(Some(&mut maps), &reader, &[], NOW, 120, (501, 9_000), &line())
+            .arm_tree_with(
+                Some(&mut maps),
+                &reader,
+                &[],
+                NOW,
+                120,
+                (501, 9_000),
+                &line(),
+            )
             .unwrap_err();
         assert!(e.contains("the root's cgroup files"), "{e}");
         assert!(maps.members.is_empty(), "the members withdrawn");
-        assert!(!maps.ops.iter().any(|o| o.starts_with("grant")), "{:?}", maps.ops);
+        assert!(
+            !maps.ops.iter().any(|o| o.starts_with("grant")),
+            "{:?}",
+            maps.ops
+        );
     }
-
 }

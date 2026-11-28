@@ -4798,7 +4798,10 @@ mod tests {
             Ok(())
         };
         assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
-        assert_eq!(written, vec![(k(11), INODE_EXT_NO_RENAME | INODE_EXT_WINDOW_KEPT)]);
+        assert_eq!(
+            written,
+            vec![(k(11), INODE_EXT_NO_RENAME | INODE_EXT_WINDOW_KEPT)]
+        );
         // a registration that fails, and a key file missing: named
         let get = |_: &InodeKey| None;
         let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Err(anyhow!("map full")) };
