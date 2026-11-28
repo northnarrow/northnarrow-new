@@ -43,8 +43,10 @@ pub(crate) struct Budget {
     /// only this much is left and the stop has not ended.
     pub(crate) note: Duration,
     /// Before the note's part, kept for the stop's own signed rows (the
-    /// `agent_stop`, the heads anchored at stop): the stages that drain
-    /// end before it ([`StopDeadline::drain_bound`]).
+    /// `agent_stop`, the heads anchored at stop; lot M7: the exec
+    /// quarantine sweep's `stopping` entry, signed
+    /// `execq::release::SIGN_MARGIN` before the note at the latest): the
+    /// stages that drain end before it ([`StopDeadline::drain_bound`]).
     pub(crate) evidence: Duration,
 }
 

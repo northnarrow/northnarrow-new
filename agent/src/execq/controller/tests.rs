@@ -2122,6 +2122,7 @@ fn a_stop_while_the_controller_is_in_a_pass_releases_every_held_process() {
         thread,
         &sweeper,
         Duration::from_millis(150),
+        None,
     );
     let took = t0.elapsed();
     let states: Vec<_> = kids.iter().map(|h| (h.pid, state(h.pid))).collect();
@@ -2360,7 +2361,7 @@ fn the_sweep_kills_a_held_process_whose_verdict_asks_for_it() {
         )],
         "the scan's kill verdict is not owed in the map"
     );
-    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time", None);
     assert!(
         wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
         "the sweep resumed a held process whose block-list verdict the controller had: {:?} \
@@ -2438,7 +2439,7 @@ fn the_sweep_resumes_a_held_process_whose_scan_asks_no_kill() {
         1,
         "a kill owed for a clean scan"
     );
-    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time", None);
     assert_eq!(swept.resumed, [h.pid], "{swept:?}");
     assert!(swept.killed.is_empty(), "{swept:?}");
     assert!(
@@ -2481,7 +2482,7 @@ fn the_sweep_kills_a_suspicious_scan_the_policy_kills() {
         on_suspicious: Action::Kill,
         ..Policy::default()
     });
-    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time", None);
     assert_eq!(swept.killed, [h.pid], "{swept:?}");
     assert!(
         wait_state(h.pid, |s| s.is_none() || s == Some('Z')),
@@ -2496,7 +2497,7 @@ fn the_sweep_kills_a_suspicious_scan_the_policy_kills() {
 fn the_sweep_resumes_a_suspicious_scan_the_policy_resumes() {
     let (w, h) = held_with_a_suspicious_scan(Policy::default());
     assert_eq!(w.k.0.lock().left[0].1.stop_ns, 1);
-    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time");
+    let swept = sweeper_of(&w).sweep("sweep: the controller did not stop in time", None);
     assert_eq!(swept.resumed, [h.pid], "{swept:?}");
     assert!(
         wait_state(h.pid, |s| s == Some('S') || s == Some('R')),

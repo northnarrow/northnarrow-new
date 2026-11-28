@@ -9,6 +9,31 @@ date is the day of its tag, written in the last commit before the tag
 tag that is not `v` and the workspace version, or whose section is not the
 first one here, dated (CONTRIBUTING.md, "Releases").
 
+### Unreleased: on `main` since `v0.1.1-alpha`
+
+Merged after the `v0.1.1-alpha` tag, in no tag yet. It is a level-3
+heading on purpose: until the next tag the first `## ` section stays the
+tagged `[0.1.1-alpha]`, which `verify-release-tag.sh version` and
+`xtask/tests/release_version.rs` require; the last commit before the next
+tag makes this block that version's dated section. What changes for an
+operator is in `UPGRADE_NOTES_0.2.md`.
+
+#### Fixed
+- Lot M7: the exec quarantine's release at the stop signs what it has
+  done before the stop's deadline. The nightly lab run of 27/11 on ubuntu
+  26.04 (7.0) failed `a_stop_while_the_controller_is_stuck_releases_every_held_process`:
+  the burst was held, but the stop's earlier stages took 750 ms and the
+  sweep of more than 1 000 held processes did not end before the deadline's
+  note — its exit resumed the last ones and no signed `stopping` entry
+  named any process the stop had resumed. Now a sweep still running 200 ms
+  before the note signs its first part (`"part": "first"`, the processes
+  left to release in `unfinished`), goes on, and signs the rest at its end
+  (`"part": "rest"`); one that ends in time signs once (`"part":
+  "whole"`). `xtask/tests/execq_stop.rs` holds the stop's signing time on
+  its path; the lab's `execq_stop_privileged_e2e` gains a case whose sweep
+  the deadline cuts every time (a `debug-trigger` build's slow sweep,
+  `NN_DEBUG_EXECQ_SLOW_SWEEP_US`).
+
 ## [0.1.1-alpha] - 2026-11-27
 
 Tag `v0.1.1-alpha`: the second alpha, everything merged since

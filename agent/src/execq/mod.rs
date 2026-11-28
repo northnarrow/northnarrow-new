@@ -31,7 +31,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::wire::execq::{class, mode};
 use nn_model::Event;
@@ -453,8 +453,14 @@ impl Drop for Handle {
     /// start that may not come.
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
-            let _ =
-                release::stop_then_sweep(&STOPPING, wake_controller, t, &self.sweeper, DROP_WAIT);
+            let _ = release::stop_then_sweep(
+                &STOPPING,
+                wake_controller,
+                t,
+                &self.sweeper,
+                DROP_WAIT,
+                None,
+            );
             ACTIVE.store(false, Ordering::Relaxed);
         }
     }
@@ -575,11 +581,25 @@ pub fn start(
 /// controller is still in a pass (an rpm host's package lookups), the
 /// processes it could not capture otherwise. The process never ends its
 /// stop with processes held for a decision that will not come.
-pub fn shutdown(handle: Option<Handle>, wait: Duration) {
+///
+/// Lot M7: `to_note`, what the stop's deadline leaves before its note (its
+/// exit follows): the sweep signs what it has released
+/// [`release::SIGN_MARGIN`] before it at the latest, and goes on with the
+/// rest — a sweep the deadline cuts leaves its signed part in the audit
+/// chain.
+pub fn shutdown(handle: Option<Handle>, wait: Duration, to_note: Duration) {
+    let sign_by = release::signing_time(Instant::now(), to_note);
     match handle.and_then(|mut h| Some((h.thread.take()?, Arc::clone(&h.sweeper)))) {
         Some((thread, sweeper)) => {
             // a controller still in its pass is let go: the exit ends it
-            let _ = release::stop_then_sweep(&STOPPING, wake_controller, thread, &sweeper, wait);
+            let _ = release::stop_then_sweep(
+                &STOPPING,
+                wake_controller,
+                thread,
+                &sweeper,
+                wait,
+                Some(sign_by),
+            );
         }
         None => {
             STOPPING.store(true, Ordering::Relaxed);
