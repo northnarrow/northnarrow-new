@@ -217,6 +217,20 @@ pub struct ExecqStopped {
     pub stop_ns: u64,
 }
 
+/// Lot 2.3b (scaffold+; an external audit's P1): whether a `sig` to a
+/// process the exec quarantine holds stopped (`held`: its `EXECQ_STOPPED`
+/// entry; `target_start_ns`: the target's own start, `task_struct.start_time`)
+/// is refused: `SIGCONT` — what resumes it, its session's `fg`, its parent,
+/// root — from anyone but the agent's family (`family`), so that only the
+/// agent's verdict resumes it. An entry of another process (a pid reused) is
+/// none.
+pub const fn execq_resume_refused(sig: i32, held: Option<&ExecqStopped>, target_start_ns: u64, family: bool) -> bool {
+    match held {
+        Some(h) => sig == 18 && h.start_ns == target_start_ns && !family,
+        None => false,
+    }
+}
+
 /// `EXECQ_CAND` value: the candidate of an exec in progress, keyed by the
 /// exec'ing `task_struct`, from `bprm_check_security` to
 /// `sched_process_exec`.
@@ -750,3 +764,25 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    /// Lot 2.3b (scaffold+): a held process's SIGCONT is the agent's own;
+    /// its session's, its parent's or root's is refused; another signal, or
+    /// a pid reused (another start), is not this rule's.
+    #[test]
+    fn a_held_process_is_resumed_by_the_agent_only() {
+        let h = ExecqStopped {
+            start_ns: 777,
+            stop_ns: 800,
+        };
+        assert!(execq_resume_refused(18, Some(&h), 777, false));
+        assert!(!execq_resume_refused(18, Some(&h), 777, true), "the agent's verdict");
+        assert!(!execq_resume_refused(18, Some(&h), 778, false), "a reused pid");
+        assert!(!execq_resume_refused(15, Some(&h), 777, false), "not a resume");
+        assert!(!execq_resume_refused(18, None, 777, false), "not held");
+    }
+}
+

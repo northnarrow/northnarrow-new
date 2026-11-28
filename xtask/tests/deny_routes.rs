@@ -569,6 +569,15 @@ const SITES: &[(&str, &str, usize, Route)] = &[
             "while a tree window is open, an io_uring ring's or a protected inode's descriptor received outside the agent's family: no descriptor crosses the tree's boundary (lot 2.3a, D7)",
         ),
     ),
+    // lot 2.3b (scaffold+): a process the exec quarantine holds, resumed
+    (
+        "task_kill.rs",
+        "try_task_kill",
+        1,
+        Enforced(
+            "a SIGCONT to a process the exec quarantine holds stopped (EXECQ_STOPPED, its start), from anyone but the agent's family: its session's fg, its parent or root would run it before its verdict (lot 2.3b, scaffold+)",
+        ),
+    ),
     // lot 2.3b (D5): the freeze of the system code, one site per hook
     (
         "inode_protect.rs",

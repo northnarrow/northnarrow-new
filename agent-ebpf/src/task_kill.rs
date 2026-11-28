@@ -46,7 +46,9 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-use crate::btf_offsets::{TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
+use crate::btf_offsets::{
+    TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+};
 
 /// Lot 2.3a (a new instance): `task` (thread group `tgid`; `raw` the same
 /// pointer as a scalar, for the global functions) runs the agent's or the
@@ -329,6 +331,13 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
                 return -EPERM;
             }
             // Lab PR 225: a stop or kill of another security tool, reported.
+            // Lot 2.3b (scaffold+): a process the exec quarantine holds is
+            // resumed by the agent's verdict only (a SIGCONT from anyone else
+            // refused, signed)
+            if execq_held_resume(target as *const u8, target_tgid, sig, caller_tgid) {
+                crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);
+                return -EPERM;
+            }
             observe_defender(target_tgid, sig);
             return 0;
         }
@@ -370,6 +379,30 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         // by caller and signal: lot 2.3a).
         crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);
         -EPERM
+    }
+}
+
+/// Lot 2.3b (scaffold+; `northnarrow_common::wire::execq::execq_resume_refused`):
+/// whether `sig` from `caller` to `target` (thread group `tgid`), a process
+/// `EXECQ_STOPPED` names for its own start, would resume it before the
+/// agent's verdict.
+#[inline(always)]
+unsafe fn execq_held_resume(target: *const u8, tgid: u32, sig: c_int, caller: u32) -> bool {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if sig != 18 {
+            return false;
+        }
+        let held = crate::execq::EXECQ_STOPPED.get(&tgid);
+        if held.is_none() {
+            return false;
+        }
+        // the group leader's start (a SIGCONT to any thread resumes the group;
+        // `de_thread` gave the exec'ing thread the leader's start)
+        let leader = bpf_probe_read_kernel::<*const u8>(target.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET)) as *const *const u8)
+            .unwrap_or(target);
+        let start = bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64).unwrap_or(0);
+        northnarrow_common::wire::execq::execq_resume_refused(sig, held, start, is_exempt_pid(caller))
     }
 }
 

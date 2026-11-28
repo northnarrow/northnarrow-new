@@ -2850,6 +2850,32 @@ pub(crate) fn register_runtime_inodes(pin_root: &Path, regs: &[((u64, u64), u8)]
     Ok(())
 }
 
+/// Lot 2.3b (scaffold+; an external audit's P2): the admin socket at `path`,
+/// once bound, joins the protected set under `pin_root` — its unlink, rename
+/// and attribute change refused outside a window (signed by the deny hooks),
+/// as the agent's other files — and its directory is never renamed
+/// (`INODE_EXT_NO_RENAME`). A mount on or below the directory is the mount
+/// guard's (`mount_guard::own_dirs`). The rebind of a socket found gone
+/// stays the fallback (and registers the new one).
+pub fn protect_admin_socket(pin_root: &Path, path: &Path) -> Result<()> {
+    let key_of = |p: &Path| -> Result<InodeKey> {
+        let m = antitamper_bpf::kernel_roots::symlink_metadata(p)
+            .with_context(|| format!("stat {}", p.display()))?;
+        Ok(InodeKey { dev: stat_dev_to_kernel_dev(m.dev()), ino: m.ino() })
+    };
+    let sock = key_of(path)?;
+    register_runtime_inodes(pin_root, &[((sock.dev, sock.ino), FS_PROTECT_MUTATE)])?;
+    let Some(dir) = path.parent() else { return Ok(()) };
+    let dir = AyaInodeKey(key_of(dir)?);
+    let name = common::wire::INODE_EXT_MAP_NAME;
+    let md = MapData::from_pin(pin_root.join(name)).with_context(|| format!("opening pinned {name}"))?;
+    let mut ext: AyaHashMap<MapData, AyaInodeKey, u8> = AyaHashMap::try_from(AyaMap::HashMap(md))?;
+    let have = ext.get(&dir, 0).unwrap_or(0);
+    ext.insert(&dir, &(have | common::wire::INODE_EXT_NO_RENAME), 0)
+        .with_context(|| format!("registering {} in {name}", path.display()))?;
+    Ok(())
+}
+
 /// Lot 302: the deny self-test's targets of an earlier round, made again
 /// (an attempt on them went through): their keys out of `PROTECTED_INODES`
 /// and of the start's set, so a hook let through round after round does not

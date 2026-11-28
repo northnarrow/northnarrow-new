@@ -1502,3 +1502,33 @@ fn window_run_sanitises_and_the_member_requests_are_authenticated_first() {
     in_order(body(&ti, "walk_line"), &["pins.push((pid, reader.pin(pid)?))", "reader.hop(pid)?"]).unwrap();
     assert!(body(&ti, "admit_line").contains("check_pins(&line, &pins)?"));
 }
+
+/// Lot 2.3b (scaffold+; an external audit's P1): `task_kill` refuses an
+/// outsider's SIGCONT to a process the exec quarantine holds — looked up in
+/// `EXECQ_STOPPED` by its tgid, compared on its group leader's start, the
+/// agent's family let through — before the defender's observation; the
+/// admin socket joins the protected set at its bind and at each rebind.
+#[test]
+fn a_held_process_is_resumed_by_the_agent_only_and_the_socket_is_protected() {
+    let k = code("agent-ebpf/src/task_kill.rs");
+    in_order(
+        body(&k, "try_task_kill"),
+        &["execq_held_resume(target as *const u8, target_tgid, sig, caller_tgid)", "return -EPERM;", "observe_defender(target_tgid, sig);"],
+    )
+    .unwrap();
+    in_order(
+        body(&k, "execq_held_resume"),
+        &["EXECQ_STOPPED.get(&tgid)", "TASK_STRUCT_GROUP_LEADER_OFFSET", "execq_resume_refused(sig, held, start, is_exempt_pid(caller))"],
+    )
+    .unwrap();
+    let t = code("agent/src/admin/transport.rs");
+    assert_eq!(t.matches("protect(&socket_path);").count(), 2, "at the bind and at each rebind");
+    let f = code("crates/nn-linux/src/anti_tamper/filesystem.rs");
+    in_order(
+        body(&f, "protect_admin_socket"),
+        &["FS_PROTECT_MUTATE", "INODE_EXT_NO_RENAME"],
+    )
+    .unwrap();
+    assert!(code("crates/nn-linux/src/anti_tamper/mount_guard.rs").contains("\"/run/northnarrow\".to_string(),"));
+}
+

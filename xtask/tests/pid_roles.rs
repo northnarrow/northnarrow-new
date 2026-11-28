@@ -57,7 +57,8 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
     // (`(file, is_protected_pid( calls, is_exempt_pid( calls)`, the
     // definitions in task_kill.rs counted)
     for (file, protected, exempt) in [
-        ("task_kill.rs", 2, 3),
+        // lot 2.3b (scaffold+): the caller of a SIGCONT to an execq-held process
+        ("task_kill.rs", 2, 4),
         ("ptrace_check.rs", 1, 1),
         // lot 2.3a: the renamer of an ancestor, the opener of a block
         // device, the remover of our units' links by name — callers

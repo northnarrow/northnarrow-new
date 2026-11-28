@@ -19,8 +19,9 @@
 #   5. the exec time of new binaries, first sight and cached, with the guard
 #      on, and with it off;
 #   6. the scanner stopped (SIGSTOP) during a decision: the budget runs out,
-#      the default policy resumes, signed; the scanner killed (SIGKILL)
-#      during a scan: a signed degradation and a decision.
+#      the default policy resumes, signed; while it is held, its session's
+#      and root's SIGCONT are refused (lot 2.3b); the scanner killed
+#      (SIGKILL) during a scan: a signed degradation and a decision.
 # Then it puts the guest back (drop-in and list removed, agent restarted).
 # Verdicts come from the signed detection chain, the signed audit log and
 # the signed status (`nn-admin status --key`), never from journal text.
@@ -273,6 +274,30 @@ if [[ -n $spid ]]; then
     sudo kill -CONT "$spid" 2>/dev/null
 else
     bad "6  no running scanner to stop"
+fi
+
+# ── 6c. lot 2.3b: a held process is resumed by the agent's verdict only — a
+# SIGCONT from its own session (this shell, its parent) and from root refused
+spid=$(scanner_pid)
+C=$WORK/nn-cont
+{ cat /usr/bin/true; head -c 32 /dev/urandom; } > "$C" && chmod 0755 "$C"
+if [[ -n $spid ]]; then
+    sudo kill -STOP "$spid"
+    "$C" </dev/null >/dev/null 2>&1 & cp=$!
+    st0=""; for _ in $(seq 1 25); do st0=$(awk '{print $3}' "/proc/$cp/stat" 2>/dev/null); [[ $st0 == T ]] && break; sleep 0.2; done
+    kill -CONT "$cp" 2>/dev/null; own=$?
+    sudo kill -CONT "$cp" 2>/dev/null; root=$?
+    sleep 0.5; st1=$(awk '{print $3}' "/proc/$cp/stat" 2>/dev/null)
+    wait "$cp"; rc=$?
+    sudo kill -CONT "$spid" 2>/dev/null
+    if [[ $st0 == T && $own -ne 0 && $root -ne 0 && $st1 == T && $rc -eq 0 ]]; then
+        pass "6c held: its session's and root's SIGCONT refused (still stopped), the budget's verdict resumed it"
+    else
+        bad "6c held: state $st0 -> $st1, SIGCONT from its session rc $own, from root rc $root, exit $rc"
+    fi
+    sleep 6
+else
+    bad "6c no running scanner to stop"
 fi
 
 # ── 6b. the scanner killed during a scan

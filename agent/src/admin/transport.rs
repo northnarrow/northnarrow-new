@@ -236,6 +236,17 @@ pub async fn serve_with_marker_path(
         path = %socket_path.display(),
         "admin socket listening (mode 0600)"
     );
+    // Lot 2.3b (scaffold+): the socket in the protected set, its directory
+    // never renamed; the watch's rebind below stays the fallback
+    let protect = |p: &std::path::Path| {
+        let root = installer_override.as_ref().and_then(|o| o.bpffs_root().map(std::path::Path::to_path_buf));
+        if let Some(root) = root {
+            if let Err(e) = nn_linux::anti_tamper::filesystem::protect_admin_socket(&root, p) {
+                warn!(error = format!("{e:#}"), "admin socket not added to the protected set");
+            }
+        }
+    };
+    protect(&socket_path);
     // External audit WDG-007 (NN-AUD-358): the path is outside the deny
     // hooks; a socket removed or replaced while the agent runs is a signed
     // finding and is bound again at the next check.
@@ -278,6 +289,7 @@ pub async fn serve_with_marker_path(
                 if let Ok(looked) = looked {
                     if let Some(rebound) = watch.finish(looked, audit_log.as_ref()) {
                         listener = rebound;
+                        protect(&socket_path);
                     }
                 }
                 continue;
