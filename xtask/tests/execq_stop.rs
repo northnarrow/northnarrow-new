@@ -140,10 +140,36 @@ fn release_rule(
     if !body_of(module, "release_at_exit").is_some_and(|b| b.contains(".sweep_at_exit()")) {
         bad.push("agent/src/execq/mod.rs: `release_at_exit` does not sweep".into());
     }
+    // lot M7: the stop's sweep signs by the time the stop gives it — what
+    // its deadline leaves before the note, less SIGN_MARGIN
+    // (`release::signing_time`; a `shutdown` without the sweep is the rule
+    // above's)
+    if body_of(module, "shutdown").is_some_and(|b| {
+        b.contains("release::stop_then_sweep(")
+            && !(b.contains("release::signing_time(") && b.contains("Some(sign_by)"))
+    }) {
+        bad.push(
+            "agent/src/execq/mod.rs: `shutdown` gives the sweep no signing time before the \
+             deadline's note (release::signing_time, Some(sign_by))"
+                .into(),
+        );
+    }
     match body_of(release, "stop_then_sweep") {
         Some(b) => {
             let wait = b.find("while !thread.is_finished()");
             let sweep = b.rfind("sweeper.sweep(");
+            let signs = sweep.is_some_and(|s| {
+                b[s..]
+                    .find(");")
+                    .is_some_and(|e| b[s..s + e].contains("sign_by"))
+            });
+            if !signs {
+                bad.push(
+                    "agent/src/execq/release.rs: `stop_then_sweep` does not hand its signing \
+                     time to the sweep"
+                        .into(),
+                );
+            }
             let guarded = sweep.is_some_and(|s| {
                 let before = &b[..s];
                 let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -170,6 +196,16 @@ fn release_rule(
     }) {
         bad.push(
             "agent/src/shutdown.rs: execq::shutdown is not bounded by the stop's deadline".into(),
+        );
+    }
+    // lot M7: and told what the deadline leaves before its note
+    if !call.is_some_and(|c| {
+        shutdown[c..c + shutdown[c..].find(';').unwrap_or(0)].contains("deadline.left()")
+    }) {
+        bad.push(
+            "agent/src/shutdown.rs: execq::shutdown is not told what the deadline leaves before \
+             its note (deadline.left())"
+                .into(),
         );
     }
     match body_of(deadline, "start") {
@@ -214,9 +250,9 @@ fn the_stop_releases_what_the_kernel_holds_whatever_the_controller_does() {
 #[test]
 fn planted_breaks_of_the_stops_release_fail_the_rule() {
     let kernel = "impl super::release::HeldMaps for KernelMaps {\n    fn set_beat(&mut self, ns: u64) {\n        let _ = self.alive.set(0, &ns, 0);\n    }\n}\n";
-    let module = "impl Drop for Handle {\n    fn drop(&mut self) {\n        let _ = release::stop_then_sweep(&STOPPING, w, t, &self.sweeper, DROP_WAIT);\n    }\n}\npub fn start() -> R {\n    let _ = EXIT_SWEEPER.set(Arc::clone(&sweeper));\n}\npub fn shutdown(h: Option<Handle>, wait: Duration) {\n    let _ = release::stop_then_sweep(&STOPPING, wake, h.thread, &h.sweeper, wait);\n}\npub fn release_at_exit() {\n    match s.sweep_at_exit() {}\n}\n";
-    let release = "pub fn stop_then_sweep() -> Option<J> {\n    while !thread.is_finished() && Instant::now() < deadline {\n        sleep();\n    }\n    sweeper.sweep(by);\n    running\n}\n";
-    let shutdown = "fn stop() {\n    northnarrow_agent::execq::shutdown(\n        execq_handle,\n        deadline.drain_bound(STOP_WAIT),\n    );\n}\n";
+    let module = "impl Drop for Handle {\n    fn drop(&mut self) {\n        let _ = release::stop_then_sweep(&STOPPING, w, t, &self.sweeper, DROP_WAIT);\n    }\n}\npub fn start() -> R {\n    let _ = EXIT_SWEEPER.set(Arc::clone(&sweeper));\n}\npub fn shutdown(h: Option<Handle>, wait: Duration, to_note: Duration) {\n    let sign_by = release::signing_time(Instant::now(), to_note);\n    let _ = release::stop_then_sweep(&STOPPING, wake, h.thread, &h.sweeper, wait, Some(sign_by));\n}\npub fn release_at_exit() {\n    match s.sweep_at_exit() {}\n}\n";
+    let release = "pub fn stop_then_sweep() -> Option<J> {\n    while !thread.is_finished() && Instant::now() < deadline {\n        sleep();\n    }\n    sweeper.sweep(by, sign_by);\n    running\n}\n";
+    let shutdown = "fn stop() {\n    northnarrow_agent::execq::shutdown(\n        execq_handle,\n        deadline.drain_bound(STOP_WAIT),\n        deadline.left(),\n    );\n}\n";
     let deadline = "pub(crate) fn start() -> Self {\n    Self::start_with(BUDGET, Arc::new(|s| {\n        northnarrow_agent::execq::release_at_exit();\n        exit_now(s)\n    }))\n}\n";
     assert!(release_rule(kernel, module, release, shutdown, deadline).is_empty());
     // a second writer of the heartbeat, past the latch
@@ -229,7 +265,7 @@ fn planted_breaks_of_the_stops_release_fail_the_rule() {
     );
     // the old stop: a fixed wait and a join of its own
     let m2 = module.replace(
-        "    let _ = release::stop_then_sweep(&STOPPING, wake, h.thread, &h.sweeper, wait);",
+        "    let _ = release::stop_then_sweep(&STOPPING, wake, h.thread, &h.sweeper, wait, Some(sign_by));",
         "    while !h.thread.is_finished() { sleep(); }\n    let _ = h.thread.join();",
     );
     assert_eq!(
@@ -258,16 +294,36 @@ fn planted_breaks_of_the_stops_release_fail_the_rule() {
     );
     // a sweep only when the controller finished
     let r2 = release.replace(
-        "    sweeper.sweep(by);",
-        "    if running.is_none() { sweeper.sweep(by); }",
+        "    sweeper.sweep(by, sign_by);",
+        "    if running.is_none() { sweeper.sweep(by, sign_by); }",
     );
     assert_eq!(
         release_rule(kernel, module, &r2, shutdown, deadline).len(),
         1
     );
     // an unbounded wait
-    let s2 = "fn stop() {\n    northnarrow_agent::execq::shutdown(execq_handle, STOP_WAIT);\n}\n";
+    let s2 = "fn stop() {\n    northnarrow_agent::execq::shutdown(execq_handle, STOP_WAIT, deadline.left());\n}\n";
     assert_eq!(release_rule(kernel, module, release, s2, deadline).len(), 1);
+    // lot M7: a sweep given no signing time — by the agent's stop, by the
+    // module, or not handed on to the sweep
+    let s3 = shutdown.replace("        deadline.left(),\n", "        STOP_WAIT,\n");
+    assert_eq!(
+        release_rule(kernel, module, release, &s3, deadline).len(),
+        1
+    );
+    let m6 = module.replace(
+        "&h.sweeper, wait, Some(sign_by));",
+        "&h.sweeper, wait, None);",
+    );
+    assert_eq!(
+        release_rule(kernel, &m6, release, shutdown, deadline).len(),
+        1
+    );
+    let r3 = release.replace("sweeper.sweep(by, sign_by);", "sweeper.sweep(by, None);");
+    assert_eq!(
+        release_rule(kernel, module, &r3, shutdown, deadline).len(),
+        1
+    );
     // the deadline's exit without the release
     let d2 =
         "pub(crate) fn start() -> Self {\n    Self::start_with(BUDGET, Arc::new(exit_now))\n}\n";

@@ -202,6 +202,20 @@ experimental, off by default).
 - A new WARN, `exec quarantine controller did not stop in time — the
   stop's sweep releases what the kernel holds`, replaces `… did not stop
   within 2 s — the processes it holds stay stopped …`.
+- **The release signs what it has done before the stop's deadline** (lot
+  M7, builds of `main` after `v0.1.1-alpha`). A release still running
+  200 ms before the deadline's note signs a first `stopping` entry
+  (`"part": "first"`: what it has resumed or killed, and in `unfinished`
+  what it has still to release), goes on, and signs the rest at its end
+  (`"part": "rest"`). A release that ends in time signs one entry, as
+  before (`"part": "whole"`). Count `resumed` across every `stopping`
+  entry of the stop, as before: there can now be three (the controller's,
+  then the release's two parts). Before, a release the deadline cut (seen on
+  ubuntu 26.04, a burst of more than 1 000 held processes on a slow guest)
+  left no signed entry: every process was released, but the audit chain
+  named none. A WARN says when a release signs early: `exec quarantine:
+  the stop's sweep signs what it has released at the stop's signing time,
+  and goes on with the rest`.
 - **Not covered yet:** after the agent was killed (SIGKILL, the OOM
   killer), the next start releases what it held only when the exec
   quarantine runs again; `uninstall.sh` after such a crash removes the
