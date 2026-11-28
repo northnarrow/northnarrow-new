@@ -2268,9 +2268,32 @@ DROPINS_RC=0
 DROPINS_FOUND=""
 DROPINS_MOVED=""
 WINDOW_OPENED=0
+# Pre-v0.2.0 cleanup: the settings of the LLM advisor (removed in Wave 4)
+# are no longer accepted by the agent, which refuses to start with one. A
+# drop-in of the agent's unit that still sets one is listed and the run
+# refused before anything is changed; the operator's file is never edited.
+removed_advisor_preflight() {
+    local d="$DROPIN_ROOT/northnarrow-agent.service.d" f hits=""
+    for f in "$d"/*.conf; do
+        [[ -f $f ]] || continue
+        if grep -Eq -- '(^|[[:space:]=])(--no-ade|--ade-(model|timeout|prompt|threads))([[:space:]=]|$)|NN_ADE_' "$f" 2>/dev/null; then
+            hits+="$f"$'\n'
+        fi
+    done
+    [[ -z $hits ]] && return 0
+    echo "install.sh: these drop-ins still set the LLM advisor's flags or NN_ADE_* variables, removed in Wave 4;" >&2
+    echo "install.sh: the agent refuses to start with one:" >&2
+    while IFS= read -r f; do
+        [[ -n $f ]] && echo "install.sh:   $f" >&2
+    done <<< "$hits"
+    echo "install.sh: REFUSED — remove those settings from the files above and run again" >&2
+    echo "install.sh: (docs/operator/UPGRADE_NOTES_WAVE4.md). Nothing was changed." >&2
+    return 1
+}
 own_dropins_preflight() {
     (( ${DROPINS_CHECKED:-0} )) && return 0
     DROPINS_CHECKED=1
+    removed_advisor_preflight || return 1
     # the coordinator's decision on #497's NN_ drop-ins: the agent's own
     # settings are kept configuration — listed, never a refusal
     own_dropins_kept "$DROPINS_FOUND"

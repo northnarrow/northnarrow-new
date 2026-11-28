@@ -811,6 +811,14 @@ not cause as an incident.
   `/etc/ld.so.preload` outside a window is not refused yet (a later lot of
   stage S2). *Evidence:* `a_preloaded_library_is_found_among_the_role_s_mappings`;
   `an_untrusted_mapping_takes_the_role_away_by_its_first_reason`.
+- **COMBAT's network isolation covers the host's network namespace only.**
+  It is a set of iptables jumps in the host namespace's own chains. Traffic
+  that does not cross them is not isolated: a container or any other
+  network namespace with its own stack, a macvlan or ipvlan child, a NIC
+  moved into another namespace, and a raw `AF_PACKET` sender. *For you:*
+  on a host that runs containers or hands out NICs, treat COMBAT's
+  isolation as covering the host's own traffic, and cut the other paths
+  yourself. *Evidence:* `jump_bases_follow_the_ruleset`.
 
 ## Detection coverage
 
@@ -976,6 +984,13 @@ not cause as an incident.
   leave them stopped. *For you:* after a crash of an agent with the
   quarantine on, start it again before you uninstall it. *Evidence:*
   `the_next_start_releases_what_a_killed_agent_held`.
+- **A held process can be resumed by its own session before the verdict.**
+  The exec quarantine stops a process with `SIGSTOP` and resumes it with
+  `SIGCONT` itself; nothing refuses a `SIGCONT` from the held process's own
+  session (`kill -CONT`, `fg`) while it waits for its verdict, so "before
+  its first instruction" holds against code in the image, not against the
+  caller. *Evidence:* `the_kernel_stops_only_a_process_its_map_names`;
+  `a_clean_new_binary_is_resumed_cached_and_recorded_once`.
 
 ## False positives you may see
 

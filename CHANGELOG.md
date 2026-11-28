@@ -18,6 +18,25 @@ tagged `[0.1.1-alpha]`, which `verify-release-tag.sh version` and
 tag makes this block that version's dated section. What changes for an
 operator is in `UPGRADE_NOTES_0.2.md`.
 
+#### Changed
+- Lot M10 (external-audit quick wins): `NN_ALLOW_UNVERIFIED_BINARY=1`, the
+  development override of the boot manifest check, is honoured only by a
+  build with the cargo feature `dev-allow-unverified` (off by default, named
+  by `northnarrow-agent --build-features`, which the release check refuses).
+  A release build has no code that reads it: a mismatch refuses the boot
+  whatever the environment says, and a host where the variable is set still
+  shows a signed `weakening_env` row. `xtask/tests/dev_overrides.rs` fails
+  when the variable is read outside that feature. On a release build the
+  recovery from a refused boot is a reboot and `install.sh`
+  (INSTALL_UPGRADE_UNINSTALL.md). The removed LLM advisor's flags
+  (`--no-ade`, `--ade-*`) and `NN_ADE_*` variables are no longer accepted
+  with a WARN: the agent refuses to start with one and names the removal,
+  and `install.sh --upgrade` lists a drop-in that still sets one before
+  changing anything (UPGRADE_NOTES_WAVE4.md). Two honest limits in
+  KNOWN_LIMITATIONS.md: COMBAT's network isolation covers the host's
+  network namespace only, and a process held by the exec quarantine can be
+  resumed by its own session before the verdict.
+
 #### Fixed
 - Lot M7: the exec quarantine's release at the stop signs what it has
   done before the stop's deadline. The nightly lab run of 27/11 on ubuntu

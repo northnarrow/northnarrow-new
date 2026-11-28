@@ -14,7 +14,7 @@
 //! binary that runs a month later is not the one that was verified —
 //! this is the "binding runtime" half of the supply chain (ROADMAP,
 //! Tappa 10.8). A mismatch is fatal in enforcement mode unless
-//! [`ALLOW_UNVERIFIED_ENV`] is set. `install.sh` writes the manifest on
+//! [`ALLOW_UNVERIFIED_ENV`] is set in a `dev-allow-unverified` build. `install.sh` writes the manifest on
 //! every install, source trees included, so a missing one is fatal too
 //! once the signed audit chain holds a boot that verified against it
 //! (external audit DEP-009, [`BootHistory`]); before that (a developer run,
@@ -30,7 +30,9 @@ use sha2::{Digest, Sha256};
 /// Where `install.sh` writes the manifest.
 pub const DEFAULT_INSTALL_MANIFEST_PATH: &str = "/etc/northnarrow/install-manifest.json";
 /// Set to `1` to turn a binary mismatch from fatal into a WARN (a
-/// deliberate dev override, never a default).
+/// deliberate dev override, never a default). Honoured only by a build with
+/// the `dev-allow-unverified` feature; a release build has no code that
+/// reads it, and `self_integrity` reports it when set (`weakening_env`).
 pub const ALLOW_UNVERIFIED_ENV: &str = "NN_ALLOW_UNVERIFIED_BINARY";
 /// Manifest key of the eBPF object hash (`files` map).
 pub const EBPF_OBJECT_KEY: &str = "ebpf_object";

@@ -4862,6 +4862,7 @@ const TEST_ONLY_FEATURES: &[&str] = &[
     "test-privileged",
     "debug-trigger",
     "demo-tappa5",
+    "dev-allow-unverified",
     "posture-demo",
     "schema-check",
 ];
@@ -5068,7 +5069,7 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
          <FEATURE>: bool = cfg!(feature = …)`, {}",
         unnamed.join(", ")
     );
-    assert!(named >= 9, "the linked crates' test-only features: {named}");
+    assert!(named >= 10, "the linked crates' test-only features: {named}");
     assert!(
         info.contains(".chain(DEPENDENCY_TEST_FEATURES)"),
         "build_features() names the dependencies' test features"

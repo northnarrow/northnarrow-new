@@ -52,6 +52,10 @@ debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/de
 # (lab PR 254): the attach permit's test constructor is nn-linux's, which
 # takes the feature.
 test-privileged = ["nn-linux/test-privileged"]
+# Development hosts only: the boot manifest check honours
+# `NN_ALLOW_UNVERIFIED_BINARY=1` (nn-linux's feature of the same name).
+# Never enabled in production builds.
+dev-allow-unverified = ["nn-linux/dev-allow-unverified"]
 # Builds `examples/posture_demo.rs` (`required-features`). External audit
 # POS-013 made it compile `PostureMachine::admin_release_combat`, the
 # Sub-tappa 6.5 bool stub that leaves COMBAT without a signed token, for

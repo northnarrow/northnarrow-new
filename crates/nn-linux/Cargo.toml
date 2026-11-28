@@ -111,6 +111,14 @@ test-privileged = []
 # agent enables it as a dev-dependency only, as nn-core's `test-util`). No
 # build of the binaries has it.
 test-util = []
+# External audit quick win (lot M10): the development override of the boot
+# manifest check (`NN_ALLOW_UNVERIFIED_BINARY=1`). Without this feature the
+# code that reads the variable does not exist in the binary: a release
+# build refuses a mismatch whatever the environment says, and
+# `self_integrity` still reports the variable as `weakening_env` (someone
+# tried). Off by default; production builds never see it
+# (xtask/tests/dev_overrides.rs, `TEST_ONLY_FEATURES`).
+dev-allow-unverified = []
 
 [build-dependencies]
 # R09b (lab PR 254): the staleness guard of the eBPF object `build.rs`

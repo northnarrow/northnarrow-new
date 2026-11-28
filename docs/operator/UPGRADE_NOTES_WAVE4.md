@@ -127,9 +127,10 @@ ran on its rules alone; and since lab PR 134 a model verdict that named a
 response was only recorded as a recommendation, unless `NN_ADE_ENFORCE=1`
 let it act (`UPGRADE_NOTES_AUDIT_16f7563.md` §7, which no longer applies).
 
-**Removed settings.** The agent still accepts them, so that a unit or a
-drop-in written for an older agent starts, ignores them, and writes one
-WARN per setting it finds at start:
+**Removed settings.** Until the pre-v0.2.0 cleanup (lot M10) the agent
+accepted them, ignored them and wrote one WARN per setting. It no longer
+does: a unit, a drop-in or a wrapper that still sets one makes the agent
+refuse to start (exit 2), naming each setting and its removal:
 
 | Setting | Was |
 |---|---|
@@ -143,18 +144,22 @@ WARN per setting it finds at start:
 | `NN_ADE_RAG_ENABLED`, `NN_ADE_RAG_INDEX_DIR`, `NN_ADE_RAG_JSONL_DIR` | the knowledge base |
 | `NN_ADE_TOKENIZER` | the tokenizer of the golden test |
 
-The WARN reads, for `--no-ade`:
+The refusal reads, for `--no-ade`:
 
 ```text
-command-line flag --no-ade removed in Wave 4 (lab PR 214) with the on-host LLM advisor: ignored, detection is deterministic (rules, correlation, posture, COMBAT); drop it from the unit, its drop-ins and wrappers flag=--no-ade
+northnarrow-agent: refusing to start:
+  command-line flag --no-ade was removed in Wave 4 (lab PR 214) with the on-host LLM advisor and is no longer accepted: detection is deterministic (rules, correlation, posture, COMBAT); drop it from the unit, its drop-ins and wrappers
 ```
 
-and `environment variable NN_ADE_ENFORCE removed in Wave 4 …
-variable=NN_ADE_ENFORCE` for a variable. A removed flag's value is not
-read: `--ade-timeout abc` starts too. The flags are no longer in
-`northnarrow-agent --help`. `NN_ADE_ENFORCE=1` and `NN_ADE_ALLOW_MOCK=1` are
-no longer reported as weakening variables by the self-integrity check
-(`integrity_drift`, `weakening_env`): nothing reads them.
+and the same line with `environment variable NN_ADE_ENFORCE` for a
+variable. **The units `install.sh` ships never set them.** Only a drop-in or
+a wrapper of your own can: `install.sh --upgrade` lists the drop-ins of the
+agent's unit that still hold one and refuses before it changes anything
+(your files are never edited); remove those settings and run it again. The
+flags are not in `northnarrow-agent --help`. `NN_ADE_ENFORCE=1` and
+`NN_ADE_ALLOW_MOCK=1` are not reported as weakening variables by the
+self-integrity check: nothing reads them, and the agent does not start with
+them.
 
 Other journal lines that are gone: `ADE engine ready`, `ADE engine
 unavailable, fallback to rule-only mode`, `insufficient free memory to load

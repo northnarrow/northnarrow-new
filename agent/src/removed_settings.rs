@@ -8,15 +8,17 @@
 //! cost gigabytes of RAM on a server. Detection is deterministic (rules,
 //! correlation, posture, COMBAT).
 //!
-//! A unit, a drop-in or a wrapper written for an older agent can still set
-//! those settings. They are accepted and ignored, and the agent names each
-//! one it finds in a WARN at start: an upgrade never fails on them
-//! (`docs/operator/UPGRADE_NOTES_WAVE4.md`).
+//! They are no longer accepted (pre-v0.2.0 cleanup; before it they were
+//! accepted, ignored and named in a WARN). A unit, a drop-in or a wrapper
+//! that still sets one makes the agent refuse to start, with a message that
+//! names the setting and its removal (exit 2); `install.sh` refuses an
+//! upgrade while a drop-in of the agent's unit holds one, before it changes
+//! anything (`docs/operator/UPGRADE_NOTES_WAVE4.md`).
 
-use tracing::warn;
+use std::ffi::OsStr;
 
 /// The command-line flags of the advisor. `--no-ade` takes no value, the
-/// others take one (`main.rs` accepts them hidden).
+/// others take one .
 pub const REMOVED_FLAGS: &[&str] = &[
     "--no-ade",
     "--ade-model",
@@ -36,10 +38,10 @@ pub const REMOVED_ENV: &[&str] = &[
     "NN_ADE_TOKENIZER",
 ];
 
-/// What the WARN says about each setting.
-pub const REMOVED_REASON: &str = "removed in Wave 4 (lab PR 214) with the on-host LLM advisor: \
-     ignored, detection is deterministic (rules, correlation, posture, COMBAT); \
-     drop it from the unit, its drop-ins and wrappers";
+/// What the refusal says about each setting.
+pub const REMOVED_REASON: &str = "was removed in Wave 4 (lab PR 214) with the on-host LLM advisor \
+     and is no longer accepted: detection is deterministic (rules, correlation, posture, \
+     COMBAT); drop it from the unit, its drop-ins and wrappers";
 
 /// The variables of [`REMOVED_ENV`] that `is_set` reports set, in that
 /// order.
@@ -52,18 +54,44 @@ pub fn removed_env_in_process() -> Vec<&'static str> {
     removed_env_set(|k| std::env::var_os(k).is_some())
 }
 
-/// One WARN per removed setting found: `flags` from the command line,
-/// `env` from the environment.
-pub fn warn_removed(flags: &[&'static str], env: &[&'static str]) {
+/// The removed flags among `args` (the command line without the program's
+/// name), also in their `--flag=value` form, in the order of
+/// [`REMOVED_FLAGS`].
+pub fn removed_flags_in<I, S>(args: I) -> Vec<&'static str>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    REMOVED_FLAGS
+        .iter()
+        .copied()
+        .filter(|flag| {
+            args.iter().any(|a| {
+                let a = a.as_ref().to_string_lossy();
+                a == *flag || a.strip_prefix(*flag).is_some_and(|r| r.starts_with('='))
+            })
+        })
+        .collect()
+}
+
+/// The refusal for a command line and an environment that still set a
+/// removed setting: one line naming each and its removal, `None` when none
+/// is set.
+pub fn refusal(flags: &[&'static str], env: &[&'static str]) -> Option<String> {
+    if flags.is_empty() && env.is_empty() {
+        return None;
+    }
+    let mut out = String::from("northnarrow-agent: refusing to start:");
     for flag in flags {
-        warn!(flag = *flag, "command-line flag {flag} {REMOVED_REASON}");
+        out.push_str(&format!("\n  command-line flag {flag} {REMOVED_REASON}"));
     }
     for var in env {
-        warn!(
-            variable = *var,
-            "environment variable {var} {REMOVED_REASON}"
-        );
+        out.push_str(&format!(
+            "\n  environment variable {var} {REMOVED_REASON}"
+        ));
     }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -79,6 +107,19 @@ mod tests {
         );
         assert!(removed_env_set(|_| false).is_empty());
         assert_eq!(removed_env_set(|_| true), REMOVED_ENV);
+    }
+
+    #[test]
+    fn a_removed_flag_in_any_spelling_is_refused_with_its_removal_named() {
+        let args = ["--detect-only", "--ade-model=/m.gguf", "--no-ade", "--ade-threads", "3"];
+        let flags = removed_flags_in(args);
+        assert_eq!(flags, ["--no-ade", "--ade-model", "--ade-threads"]);
+        let msg = refusal(&flags, &["NN_ADE_ENFORCE"]).expect("a refusal");
+        for named in ["--ade-model", "--no-ade", "NN_ADE_ENFORCE", "removed in Wave 4"] {
+            assert!(msg.contains(named), "{named} in {msg}");
+        }
+        assert!(removed_flags_in(["--detect-only", "--ade"]).is_empty());
+        assert!(refusal(&[], &[]).is_none());
     }
 
     #[test]

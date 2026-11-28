@@ -239,11 +239,22 @@ pub(crate) fn check(
             }
         }
         if fatal {
-            error!(
-                "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
-                 override on a dev host; re-run install.sh to restore a verified install)",
-                outcome.label()
-            );
+            // A release build has no override: the hint names only what
+            // works there (the override exists in a dev-allow-unverified
+            // build only; the variable is still reported if set).
+            if cfg!(feature = "dev-allow-unverified") {
+                error!(
+                    "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
+                     override on a dev host; re-run install.sh to restore a verified install)",
+                    outcome.label()
+                );
+            } else {
+                error!(
+                    "refusing to start: install-manifest check = {} (re-run install.sh to restore a \
+                     verified install; this build has no override)",
+                    outcome.label()
+                );
+            }
             // Leave the refusal in the signed audit chain before exiting.
             let detail = match &outcome {
                 IntegrityOutcome::Mismatch { mismatches, .. } => mismatches

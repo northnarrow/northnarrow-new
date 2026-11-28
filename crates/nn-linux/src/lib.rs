@@ -70,6 +70,13 @@ pub const TEST_UTIL: bool = cfg!(feature = "test-util");
 /// without the agent's own feature — is refused by the release's check.
 pub const TEST_PRIVILEGED: bool = cfg!(feature = "test-privileged");
 
+/// Whether this build has its `dev-allow-unverified` feature: the boot
+/// manifest check honours `NN_ALLOW_UNVERIFIED_BINARY=1` only then
+/// ([`install_manifest::ALLOW_UNVERIFIED_ENV`]). The agent's
+/// `--build-features` names it, so the release's check (`none`) refuses a
+/// binary built with it.
+pub const DEV_ALLOW_UNVERIFIED: bool = cfg!(feature = "dev-allow-unverified");
+
 /// Lot 379 (the review of #586, P3-5): whether this build has its
 /// `debug-trigger` feature (test-only, `xtask/tests/supply_chain.rs`'s
 /// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it

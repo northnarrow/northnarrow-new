@@ -474,8 +474,23 @@ pub fn install_manifest(
 ) -> Result<ManifestCheck, BootOrderError> {
     let own_exe = antitamper_bpf::kernel_roots::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
-    let allow = std::env::var(install_manifest::ALLOW_UNVERIFIED_ENV).ok();
+    let allow = allow_unverified_from_env();
     install_manifest_for(boot, manifest, &own_exe, audit_log, allow.as_deref())
+}
+
+/// The development override of the manifest check, read from the process's
+/// environment: only in a `dev-allow-unverified` build. Any other build
+/// has no code that reads it (xtask/tests/dev_overrides.rs), so a release
+/// refuses a mismatch whatever the environment says; `self_integrity`
+/// still reports the variable (`weakening_env`) as a signed row.
+#[cfg(feature = "dev-allow-unverified")]
+fn allow_unverified_from_env() -> Option<String> {
+    std::env::var(install_manifest::ALLOW_UNVERIFIED_ENV).ok()
+}
+
+#[cfg(not(feature = "dev-allow-unverified"))]
+fn allow_unverified_from_env() -> Option<String> {
+    None
 }
 
 /// [`install_manifest`] for the binary `own_exe` (this crate's tests).
@@ -783,6 +798,19 @@ fn vmlinux_btf_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build without `dev-allow-unverified` never reads the override: the
+    /// variable set to `1` changes nothing (the process's environment is
+    /// not touched by another test of this crate).
+    #[cfg(not(feature = "dev-allow-unverified"))]
+    #[test]
+    fn a_release_build_ignores_the_unverified_binary_variable() {
+        // SAFETY: no other test of this crate reads this variable.
+        unsafe { std::env::set_var(install_manifest::ALLOW_UNVERIFIED_ENV, "1") };
+        let got = allow_unverified_from_env();
+        unsafe { std::env::remove_var(install_manifest::ALLOW_UNVERIFIED_ENV) };
+        assert_eq!(got, None);
+    }
     use crate::boot::BootPhase;
 
     fn has(boot: &BootSequence, step: BootStep) -> bool {

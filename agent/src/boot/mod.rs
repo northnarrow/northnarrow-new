@@ -125,6 +125,16 @@ pub fn main() -> Result<()> {
     // unit, is ignored before anything reads it — the command line's
     // `env =` arguments included (one thread here).
     let _ = nn_linux::self_integrity::ignore_manager_weakening("northnarrow-agent.service");
+    // Pre-v0.2.0 cleanup: the settings of the removed LLM advisor are not
+    // accepted; the refusal names the removal (clap alone would only say
+    // "unexpected argument").
+    if let Some(msg) = northnarrow_agent::removed_settings::refusal(
+        &northnarrow_agent::removed_settings::removed_flags_in(std::env::args_os().skip(1)),
+        &northnarrow_agent::removed_settings::removed_env_in_process(),
+    ) {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
     let cli = Cli::parse();
     if cli.build_features {
         let features = northnarrow_agent::build_info::build_features();

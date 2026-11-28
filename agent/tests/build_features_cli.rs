@@ -22,6 +22,9 @@ fn expected() -> String {
     if cfg!(feature = "demo-tappa5") {
         features.push("demo-tappa5");
     }
+    if cfg!(feature = "dev-allow-unverified") {
+        features.push("dev-allow-unverified");
+    }
     if cfg!(feature = "posture-demo") {
         features.push("posture-demo");
     }
@@ -38,6 +41,7 @@ fn expected() -> String {
         ("nn-core/test-util", nn_core::TEST_UTIL),
         ("nn-export/schema-check", nn_export::SCHEMA_CHECK),
         ("nn-linux/debug-trigger", nn_linux::DEBUG_TRIGGER),
+        ("nn-linux/dev-allow-unverified", nn_linux::DEV_ALLOW_UNVERIFIED),
         ("nn-linux/test-privileged", nn_linux::TEST_PRIVILEGED),
         ("nn-linux/test-util", nn_linux::TEST_UTIL),
         ("nn-proto/debug-trigger", nn_proto::DEBUG_TRIGGER),

@@ -200,21 +200,6 @@ pub(crate) struct Cli {
     #[arg(long = "exploit-guard-tasks", env = "NN_EXPLOIT_GUARD_TASKS")]
     pub(crate) exploit_guard_tasks: Option<u32>,
 
-    /// Removed in Wave 4 (lab PR 214) with the on-host LLM advisor, as
-    /// the four below: accepted so that a unit written for an older agent
-    /// still starts, ignored, and named in a WARN at start
-    /// ([`northnarrow_agent::removed_settings`]).
-    #[arg(long = "no-ade", hide = true)]
-    pub(crate) removed_no_ade: bool,
-    #[arg(long = "ade-model", hide = true, value_name = "PATH")]
-    pub(crate) removed_ade_model: Option<std::ffi::OsString>,
-    #[arg(long = "ade-timeout", hide = true, value_name = "SECS")]
-    pub(crate) removed_ade_timeout: Option<std::ffi::OsString>,
-    #[arg(long = "ade-prompt", hide = true, value_name = "PATH")]
-    pub(crate) removed_ade_prompt: Option<std::ffi::OsString>,
-    #[arg(long = "ade-threads", hide = true, value_name = "N")]
-    pub(crate) removed_ade_threads: Option<std::ffi::OsString>,
-
     // NetworkIsolator's IPv4 ruleset. Repo dev path:
     // configs/combat-rules.v4.
     /// The IPv4 firewall ruleset (`iptables-restore` format) applied when
@@ -1157,25 +1142,6 @@ impl ExploitGuardResponse {
     }
 }
 
-impl Cli {
-    /// The flags of the removed LLM advisor this command line sets, in
-    /// the order of [`northnarrow_agent::removed_settings::REMOVED_FLAGS`].
-    pub(crate) fn removed_flags(&self) -> Vec<&'static str> {
-        let set = [
-            self.removed_no_ade,
-            self.removed_ade_model.is_some(),
-            self.removed_ade_timeout.is_some(),
-            self.removed_ade_prompt.is_some(),
-            self.removed_ade_threads.is_some(),
-        ];
-        northnarrow_agent::removed_settings::REMOVED_FLAGS
-            .iter()
-            .zip(set)
-            .filter_map(|(flag, on)| on.then_some(*flag))
-            .collect()
-    }
-}
-
 /// Held by the tests that parse a command line (R11a, lab PR 261): its
 /// flags read the process environment, which `env_switches_read_1_and_0`
 /// sets, and in the library's test binary they run beside its other
@@ -1358,37 +1324,19 @@ mod tests {
         assert!(cli.refuse_one_binary_in_both_roles(&cli.own_exes()).is_ok());
     }
 
-    /// Wave 4 (lab PR 214): a unit written for an agent with the LLM
-    /// advisor still parses — its flags are accepted, ignored and named.
+    /// A unit written for an agent with the LLM advisor no longer parses
+    /// (pre-v0.2.0 cleanup): clap refuses each removed flag, and the
+    /// agent's own check before the parse names the removal.
     #[test]
-    fn the_removed_advisor_flags_still_parse_and_are_named() {
+    fn the_removed_advisor_flags_no_longer_parse() {
         let _env = TEST_ENV.lock();
-        let cli = Cli::try_parse_from([
-            "northnarrow-agent",
-            "--no-ade",
-            "--ade-model",
-            "/var/lib/northnarrow/models/m.gguf",
-            "--ade-timeout",
-            "15",
-            "--ade-prompt",
-            "dataset/system_prompt_v1.md",
-            "--ade-threads",
-            "3",
-            "--detect-only",
-        ])
-        .expect("an old unit's command line parses");
-        assert_eq!(
-            cli.removed_flags(),
-            northnarrow_agent::removed_settings::REMOVED_FLAGS
-        );
-        assert!(cli.detect_only, "the other flags keep their meaning");
-
-        let cli = Cli::try_parse_from(["northnarrow-agent", "--ade-timeout", "not-a-number"])
-            .expect("a removed flag's value is not parsed");
-        assert_eq!(cli.removed_flags(), ["--ade-timeout"]);
-
-        let cli = Cli::try_parse_from(["northnarrow-agent"]).unwrap();
-        assert!(cli.removed_flags().is_empty());
+        for flag in northnarrow_agent::removed_settings::REMOVED_FLAGS {
+            assert!(
+                Cli::try_parse_from(["northnarrow-agent", flag, "1"]).is_err(),
+                "{flag} parses"
+            );
+        }
+        assert!(Cli::try_parse_from(["northnarrow-agent", "--detect-only"]).is_ok());
     }
 
     /// Lab (21/10, debian12): an agent unit with `NN_NET_CONNECT_DENY=1`,

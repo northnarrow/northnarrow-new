@@ -16,8 +16,8 @@
 //!
 //! Detection is deterministic. The on-host LLM advisor of Tappa 6 (the
 //! ADE, which judged the execs no rule matched) was removed in Wave 4
-//! (lab PR 214); its flags are accepted and ignored with a WARN
-//! ([`northnarrow_agent::removed_settings`]).
+//! (lab PR 214); its flags and variables are refused at start,
+//! naming the removal ([`northnarrow_agent::removed_settings`]).
 //!
 //! Wave 4 restructure, R11a (lab PR 261): the start's code is the
 //! library's, in typed phases (`northnarrow_agent::boot`), the event

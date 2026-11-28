@@ -133,6 +133,9 @@ pub fn is_known_dropin(path: &Path, content: &[u8]) -> bool {
 pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     ("NN_ANTI_TAMPER_ALLOW_DEGRADED", any_value),
     ("NN_BPF_DEFENSE_OBSERVE", is_one),
+    // Only a `dev-allow-unverified` build honours it; a release build does
+    // not read it at all, and this entry is what records that someone set
+    // it (a signed `weakening_env`): keep it in every build.
     ("NN_ALLOW_UNVERIFIED_BINARY", is_one),
     ("NN_AUDIT_ALLOW_UNWRITABLE", any_value),
     (
@@ -144,7 +147,7 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     ("NN_OVERLAY_ALLOW_UNSIGNED", is_one),
     // NN_ADE_ALLOW_MOCK and NN_ADE_ENFORCE (the LLM advisor's mock backend
     // and its licence to act) left with the advisor in Wave 4, lab PR 214:
-    // nothing reads them, the agent names them in a WARN at start (the
+    // nothing reads them, and the agent refuses to start with one (the
     // agent's `removed_settings`).
     // External audit MAIN-004: the evidence logs' rotation caps; any
     // override changes how much evidence survives.

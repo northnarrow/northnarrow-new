@@ -31,12 +31,6 @@ pub(crate) fn init(cli: &Cli, undumpable: std::io::Result<()>) {
         .init();
 
     info!("NorthNarrow agent starting...");
-    // Wave 4 (lab PR 214): the settings of the removed LLM advisor that an
-    // older unit or drop-in still passes, each named, none fatal.
-    northnarrow_agent::removed_settings::warn_removed(
-        &cli.removed_flags(),
-        &northnarrow_agent::removed_settings::removed_env_in_process(),
-    );
     // Lab PR 216: a failure is an ERROR, not a refusal to protect.
     if let Err(e) = undumpable {
         error!(

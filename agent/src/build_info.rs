@@ -40,6 +40,7 @@ pub const DEPENDENCY_TEST_FEATURES: &[(&str, bool)] = &[
     ("nn-core/test-util", nn_core::TEST_UTIL),
     ("nn-export/schema-check", nn_export::SCHEMA_CHECK),
     ("nn-linux/debug-trigger", nn_linux::DEBUG_TRIGGER),
+    ("nn-linux/dev-allow-unverified", nn_linux::DEV_ALLOW_UNVERIFIED),
     ("nn-linux/test-privileged", nn_linux::TEST_PRIVILEGED),
     ("nn-linux/test-util", nn_linux::TEST_UTIL),
     ("nn-proto/debug-trigger", nn_proto::DEBUG_TRIGGER),
@@ -53,6 +54,7 @@ pub const DEPENDENCY_TEST_FEATURES: &[(&str, bool)] = &[
 pub const LAB_FEATURES: &[(&str, bool)] = &[
     ("debug-trigger", cfg!(feature = "debug-trigger")),
     ("demo-tappa5", cfg!(feature = "demo-tappa5")),
+    ("dev-allow-unverified", cfg!(feature = "dev-allow-unverified")),
     // POS-013, WDG-R02: builds `examples/posture_demo.rs` only.
     ("posture-demo", cfg!(feature = "posture-demo")),
     ("test-privileged", cfg!(feature = "test-privileged")),

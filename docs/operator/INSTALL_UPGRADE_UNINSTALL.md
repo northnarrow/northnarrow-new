@@ -1748,9 +1748,12 @@ the watchdog and `nn-admin` under the recorded `bin_dir` and compares the
 embedded eBPF object hash with the manifest. The result is written in the
 signed `agent_boot` audit entry (`binary_integrity`, `install_provenance`).
 A mismatch — the running file is not the one the installer verified — or
-an unreadable manifest refuses the boot (exit 78); `NN_ALLOW_UNVERIFIED_BINARY=1`
-turns that into a WARN on a development host (a weakening variable: the
-agent records it in the audit chain). A binary started from
+an unreadable manifest refuses the boot (exit 78). A release build has no
+override: the code that reads `NN_ALLOW_UNVERIFIED_BINARY=1` is compiled only
+into a development build (cargo feature `dev-allow-unverified`, which
+`--build-features` names and the release check refuses), and if the variable
+is set on a release build the agent ignores it and records it in the signed
+audit chain as a weakening variable. A binary started from
 outside `bin_dir` (a test fixture) is not compared.
 
 **A removed manifest refuses the boot too (external audit DEP-009).**
@@ -1760,8 +1763,8 @@ with `binary_integrity` `verified`, a missing manifest means it was removed
 (in a trusted-installer window, from an offline disk) — it no longer
 switches the check off. The agent refuses to start (exit 78) and records
 `agent_boot` with result `refused`, `binary_integrity` `no-manifest`;
-re-run `install.sh` to write it again, or set
-`NN_ALLOW_UNVERIFIED_BINARY=1` on a development host. A chain that cannot
+re-run `install.sh` to write it again (on a development build,
+`NN_ALLOW_UNVERIFIED_BINARY=1` is the override). A chain that cannot
 be read counts the same way. A host whose chain has no verified boot (a
 developer run, an install older than the manifest) still starts, with an
 INFO. A host restored from a backup without the manifest is refused until
@@ -1785,10 +1788,13 @@ manifest). The refused agent loaded and pinned nothing (lab PR 262; its
 refusal is the signed `agent_boot` row, `refused_by: install_manifest`), but
 the hooks of the agent that ran before it are still pinned, so
 `/etc/northnarrow` stays protected, and a trusted-installer window needs a
-running agent. Start it once with the override taken from the service
-manager's environment (the agent records it as a weakening variable),
-drop the override, then reinstall — `install.sh` restarts the agent
-without it:
+running agent. On a **release** build there is no override to start it with: stop the
+agent, reboot (the pins of the earlier run do not survive a boot), then run
+`install.sh` as below. On a **development build** (feature
+`dev-allow-unverified`) start it once with the override taken from the
+service manager's environment (the agent records it as a weakening
+variable), drop the override, then reinstall — `install.sh` restarts the
+agent without it:
 
 ```sh
 sudo systemctl set-environment NN_ALLOW_UNVERIFIED_BINARY=1

@@ -80,7 +80,8 @@ to that build. What changes then is in `UPGRADE_NOTES_WAVE4.md`.
 - **A removed install manifest refuses the boot** (NN-AUD-200 DEP-009, lab
   PR 148). Once the signed audit chain holds a verified boot of this
   install, a missing manifest stops the agent (exit 78, `agent_boot`
-  refused); `NN_ALLOW_UNVERIFIED_BINARY=1` is for development hosts.
+  refused); `NN_ALLOW_UNVERIFIED_BINARY=1` is honoured only by a development
+  build (cargo feature `dev-allow-unverified`), never by a release.
   **Regression:** a host restored without its install manifest does not
   start until `install.sh` runs again (recovery: §5.1 of the install
   guide).
