@@ -108,8 +108,8 @@ use super::{
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
 use common::wire::{
-    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME, TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME,
-    TreeMember, WINDOW_MAX_NS,
+    FS_GRANT_V2_MAP_NAME, FsGrant, FsGrantV2, InodeKey, KillGrant, TREE_CGROUP_FILES_MAP_NAME,
+    TREE_MEMBER_ROOT, TREE_MEMBERS_MAP_NAME, TreeMember, WINDOW_MAX_NS,
 };
 
 // R08b (lab PR 251): the agent's own units and a window's grant are the
@@ -888,7 +888,10 @@ impl TrustedInstallerOverride {
             if let Err(e) = maps.put_cgroup_file(key, [generation, u64::from(op)]) {
                 return Err(withdrawn(
                     maps,
-                    format!("cgroup file {}:{} not written to {TREE_CGROUP_FILES_MAP_NAME}: {e}", key.dev, key.ino),
+                    format!(
+                        "cgroup file {}:{} not written to {TREE_CGROUP_FILES_MAP_NAME}: {e}",
+                        key.dev, key.ino
+                    ),
                 ));
             }
         }
@@ -1206,7 +1209,9 @@ impl LineReader for ProcFs<'_> {
                 let m = antitamper_bpf::kernel_roots::metadata(&p).ok()?;
                 Some((
                     InodeKey {
-                        dev: super::filesystem::stat_dev_to_kernel_dev(std::os::unix::fs::MetadataExt::dev(&m)),
+                        dev: super::filesystem::stat_dev_to_kernel_dev(
+                            std::os::unix::fs::MetadataExt::dev(&m),
+                        ),
                         ino: std::os::unix::fs::MetadataExt::ino(&m),
                     },
                     op,
@@ -1392,7 +1397,11 @@ trait TreeMaps {
     fn zero_closed(&mut self) -> std::result::Result<(), String>;
     /// Lot 2.3a (D7): `TREE_CGROUP_FILES[key] = value` (`[generation,
     /// operation]`). Emptied with the members ([`Self::clear_members`]).
-    fn put_cgroup_file(&mut self, _key: InodeKey, _value: [u64; 2]) -> std::result::Result<(), String> {
+    fn put_cgroup_file(
+        &mut self,
+        _key: InodeKey,
+        _value: [u64; 2],
+    ) -> std::result::Result<(), String> {
         Ok(())
     }
 }
@@ -1433,14 +1442,19 @@ impl TreeMaps for PinnedTreeMaps<'_> {
         let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
             aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
                 .map_err(|e| e.to_string())?;
-        let files: Vec<super::filesystem::AyaInodeKey> = c.keys().filter_map(std::result::Result::ok).collect();
+        let files: Vec<super::filesystem::AyaInodeKey> =
+            c.keys().filter_map(std::result::Result::ok).collect();
         for k in &files {
             c.remove(k).map_err(|e| e.to_string())?;
         }
         Ok(keys.len())
     }
 
-    fn put_cgroup_file(&mut self, key: InodeKey, value: [u64; 2]) -> std::result::Result<(), String> {
+    fn put_cgroup_file(
+        &mut self,
+        key: InodeKey,
+        value: [u64; 2],
+    ) -> std::result::Result<(), String> {
         let mut c: aya::maps::HashMap<MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
             aya::maps::HashMap::try_from(AyaMap::HashMap(self.open(TREE_CGROUP_FILES_MAP_NAME)?))
                 .map_err(|e| e.to_string())?;
@@ -2420,20 +2434,28 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                (p("user.slice/user-0.slice/session-3.scope/cgroup.kill"), kill),
-                (p("user.slice/user-0.slice/session-3.scope/cgroup.freeze"), freeze),
+                (
+                    p("user.slice/user-0.slice/session-3.scope/cgroup.kill"),
+                    kill
+                ),
+                (
+                    p("user.slice/user-0.slice/session-3.scope/cgroup.freeze"),
+                    freeze
+                ),
                 (p("user.slice/user-0.slice/cgroup.kill"), kill),
                 (p("user.slice/user-0.slice/cgroup.freeze"), freeze),
                 (p("user.slice/cgroup.kill"), kill),
                 (p("user.slice/cgroup.freeze"), freeze),
             ]
         );
-        assert!(cgroup_file_plan(root, "/").is_empty(), "the root has neither file");
+        assert!(
+            cgroup_file_plan(root, "/").is_empty(),
+            "the root has neither file"
+        );
         assert_eq!(
             unified_cgroup("12:pids:/x\n0::/system.slice/apt.service\n"),
             Some("/system.slice/apt.service")
         );
         assert_eq!(unified_cgroup("1:name=systemd:/x\n"), None);
     }
-
 }

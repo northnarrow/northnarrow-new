@@ -43,9 +43,10 @@ use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
     BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, CONF_PROPAGATED, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG,
-    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_KEPT, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB,
-    MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE, SYSFS_MAGIC,
-    TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root, held_under,
+    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_KEPT, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN,
+    MG_SB, MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE,
+    SYSFS_MAGIC, TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root,
+    held_under,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -2504,5 +2505,4 @@ mod tests {
         let f = pts.iter().find(|(p, _)| p == CONFIG_DIR).unwrap().1;
         assert_eq!(f & (MG_OWN | MG_HOLD | MG_KEPT), MG_OWN | MG_HOLD | MG_KEPT);
     }
-
 }

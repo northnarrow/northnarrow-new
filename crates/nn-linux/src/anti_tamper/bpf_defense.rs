@@ -2577,7 +2577,8 @@ pub(crate) fn zero_window_maps(ebpf: &mut Ebpf) -> std::result::Result<u64, Stri
             .ok_or_else(|| format!("{TREE_CGROUP_FILES_MAP_NAME} missing"))?;
         let mut h: HashMap<&mut MapData, super::filesystem::AyaInodeKey, [u64; 2]> =
             HashMap::try_from(m).map_err(|e| e.to_string())?;
-        let keys: Vec<super::filesystem::AyaInodeKey> = h.keys().filter_map(std::result::Result::ok).collect();
+        let keys: Vec<super::filesystem::AyaInodeKey> =
+            h.keys().filter_map(std::result::Result::ok).collect();
         for k in keys {
             h.remove(&k).map_err(|e| e.to_string())?;
         }

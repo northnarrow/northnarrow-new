@@ -973,7 +973,10 @@ fn the_ancestors_and_the_block_devices_are_judged() {
     // our units' links, by name, in their directories: removed or renamed
     in_order(
         body(&i, "try_inode_unlink"),
-        &["nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))", "return -EPERM;"],
+        &[
+            "nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))",
+            "return -EPERM;",
+        ],
     )
     .unwrap();
     in_order(
@@ -1080,7 +1083,11 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
     .unwrap();
     in_order(
         body(&w, "holds_entry"),
-        &["TREE_MEMBERS.get(&tgid)", "m.generation == generation", "entry_is_process(m, st)"],
+        &[
+            "TREE_MEMBERS.get(&tgid)",
+            "m.generation == generation",
+            "entry_is_process(m, st)",
+        ],
     )
     .unwrap();
 }
@@ -1205,7 +1212,10 @@ fn the_fork_span_and_a_traced_caller_are_guarded_and_let_throughs_take_no_class(
     let w = code("agent-ebpf/src/window_tree.rs");
     in_order(
         body(&w, "tree_task_alloc"),
-        &["TREE_MEMBERS.get(&ptgid).is_none()", "nn_tree_pending(raw_arg(&ctx, 0), raw_arg(&ctx, 1))"],
+        &[
+            "TREE_MEMBERS.get(&ptgid).is_none()",
+            "nn_tree_pending(raw_arg(&ctx, 0), raw_arg(&ctx, 1))",
+        ],
     )
     .unwrap();
     in_order(
@@ -1228,7 +1238,10 @@ fn the_fork_span_and_a_traced_caller_are_guarded_and_let_throughs_take_no_class(
     .unwrap();
     in_order(
         body(&w, "tree_task_free"),
-        &["let _ = TREE_PENDING.remove(&(task as u64));", "read_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)))"],
+        &[
+            "let _ = TREE_PENDING.remove(&(task as u64));",
+            "read_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)))",
+        ],
     )
     .unwrap();
     in_order(
@@ -1252,11 +1265,19 @@ fn the_fork_span_and_a_traced_caller_are_guarded_and_let_throughs_take_no_class(
         ],
     )
     .unwrap();
-    assert!(!g.contains("caller_is_member"), "the caller is judged by the lift test");
-    assert!(body(&w, "nn_tree_member_target").contains("target_in_span(target, g.generation, false)"));
+    assert!(
+        !g.contains("caller_is_member"),
+        "the caller is judged by the lift test"
+    );
+    assert!(
+        body(&w, "nn_tree_member_target").contains("target_in_span(target, g.generation, false)")
+    );
     in_order(
         body(&w, "tree_shmat"),
-        &["raw_arg(&ctx, 2) & SHM_EXEC != 0", "nn_tree_judge_file(0, EVICT_MAP)"],
+        &[
+            "raw_arg(&ctx, 2) & SHM_EXEC != 0",
+            "nn_tree_judge_file(0, EVICT_MAP)",
+        ],
     )
     .unwrap();
     in_order(

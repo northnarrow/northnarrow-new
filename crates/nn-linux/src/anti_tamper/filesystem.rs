@@ -2013,7 +2013,12 @@ pub(crate) fn register_enablement_links(ebpf: &mut Ebpf) -> Result<usize> {
     let dirs = enablement_dirs(Path::new("/etc/systemd/system"), &list);
     let map = ebpf
         .map_mut(common::wire::INODE_EXT_MAP_NAME)
-        .ok_or_else(|| anyhow!("{} missing from the eBPF object", common::wire::INODE_EXT_MAP_NAME))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "{} missing from the eBPF object",
+                common::wire::INODE_EXT_MAP_NAME
+            )
+        })?;
     let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)?;
     for dir in dirs {
         let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&dir) else {
@@ -2046,7 +2051,11 @@ pub fn enablement_dirs(unit_dir: &Path, list: &dyn Fn(&Path) -> Vec<String>) -> 
         }
     }
     let default = unit_dir.join("multi-user.target.wants");
-    if list(unit_dir).iter().any(|d| d == "multi-user.target.wants") && !out.contains(&default) {
+    if list(unit_dir)
+        .iter()
+        .any(|d| d == "multi-user.target.wants")
+        && !out.contains(&default)
+    {
         out.push(default);
     }
     out
@@ -2070,7 +2079,10 @@ pub fn key_files_not_kept_with(
     for f in WINDOW_KEPT_FILES {
         let path = etc_dir.join(f);
         let Some(key) = key_of(&path) else {
-            missing.push(format!("key file {} not found: not kept (K4)", path.display()));
+            missing.push(format!(
+                "key file {} not found: not kept (K4)",
+                path.display()
+            ));
             continue;
         };
         let have = get(&key).unwrap_or(0);
@@ -2091,9 +2103,12 @@ pub fn key_files_not_kept_with(
 /// `pin_root`; a map that cannot be opened keeps nothing.
 pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
     let pin = pin_root.join(common::wire::INODE_EXT_MAP_NAME);
-    let map = MapData::from_pin(&pin).map_err(anyhow::Error::from).and_then(|d| {
-        AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(d)).map_err(anyhow::Error::from)
-    });
+    let map = MapData::from_pin(&pin)
+        .map_err(anyhow::Error::from)
+        .and_then(|d| {
+            AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(d))
+                .map_err(anyhow::Error::from)
+        });
     let mut map = match map {
         Ok(m) => m,
         Err(e) => {
@@ -2104,10 +2119,12 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
         }
     };
     let key_of = |p: &Path| {
-        antitamper_bpf::kernel_roots::metadata(p).ok().map(|m| InodeKey {
-            dev: stat_dev_to_kernel_dev(m.dev()),
-            ino: m.ino(),
-        })
+        antitamper_bpf::kernel_roots::metadata(p)
+            .ok()
+            .map(|m| InodeKey {
+                dev: stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            })
     };
     let snapshot: Vec<(InodeKey, u8)> = map
         .iter()
@@ -2116,7 +2133,8 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
         .collect();
     let get = |k: &InodeKey| snapshot.iter().find(|(q, _)| q == k).map(|(_, v)| *v);
     let mut insert = |k: &InodeKey, v: u8| {
-        map.insert(&AyaInodeKey(*k), &v, 0).map_err(anyhow::Error::from)
+        map.insert(&AyaInodeKey(*k), &v, 0)
+            .map_err(anyhow::Error::from)
     };
     key_files_not_kept_with(Path::new(CONFIG_DIR), &key_of, &get, &mut insert)
 }
@@ -2125,19 +2143,28 @@ pub fn key_files_not_kept(pin_root: &Path) -> Vec<String> {
 /// file (a new inode), the new inode kept by any window in the pinned
 /// `INODE_EXT` (`INODE_EXT_WINDOW_KEPT`), the stale one's entry dropped.
 /// No pin root: nothing to do (no window opens either).
-pub fn reregister_kept_file(bpffs_root: Option<&Path>, path: &Path, old_key: Option<InodeKey>) -> Result<()> {
+pub fn reregister_kept_file(
+    bpffs_root: Option<&Path>,
+    path: &Path,
+    old_key: Option<InodeKey>,
+) -> Result<()> {
     let Some(root) = bpffs_root else {
         return Ok(());
     };
     let new_key = crate::fim::attach::key_for_path(path)
         .with_context(|| format!("stat {} for re-registration", path.display()))?;
     let pin = root.join(common::wire::INODE_EXT_MAP_NAME);
-    let data = MapData::from_pin(&pin).with_context(|| format!("opening pinned INODE_EXT at {}", pin.display()))?;
+    let data = MapData::from_pin(&pin)
+        .with_context(|| format!("opening pinned INODE_EXT at {}", pin.display()))?;
     let mut map = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(data))
         .context("INODE_EXT is not a HashMap<InodeKey, u8>")?;
     let have = map.get(&AyaInodeKey(new_key), 0).unwrap_or(0);
-    map.insert(&AyaInodeKey(new_key), &(have | common::wire::INODE_EXT_WINDOW_KEPT), 0)
-        .context("registering the rotated key file in INODE_EXT")?;
+    map.insert(
+        &AyaInodeKey(new_key),
+        &(have | common::wire::INODE_EXT_WINDOW_KEPT),
+        0,
+    )
+    .context("registering the rotated key file in INODE_EXT")?;
     if let Some(old) = old_key {
         if old != new_key {
             let _ = map.remove(&AyaInodeKey(old));
@@ -4692,12 +4719,20 @@ mod tests {
             match p {
                 "/sys/dev/block/8:0/device/scsi_generic" => vec!["sg0".into()],
                 "/sys/dev/block/8:0/device/bsg" => vec!["0:0:0:0".into()],
-                "/sys/dev/block/259:0/device" => vec!["ng0n1".into(), "nvme0n1".into(), "power".into()],
+                "/sys/dev/block/259:0/device" => {
+                    vec!["ng0n1".into(), "nvme0n1".into(), "power".into()]
+                }
                 _ => Vec::new(),
             }
         };
-        assert_eq!(passthrough_nodes((8, 0), &read, &list), vec![(21, 0), (244, 0)]);
-        assert_eq!(passthrough_nodes((259, 0), &read, &list), vec![(240, 0), (242, 0)]);
+        assert_eq!(
+            passthrough_nodes((8, 0), &read, &list),
+            vec![(21, 0), (244, 0)]
+        );
+        assert_eq!(
+            passthrough_nodes((259, 0), &read, &list),
+            vec![(240, 0), (242, 0)]
+        );
         assert!(passthrough_nodes((8, 1), &read, &list).is_empty());
         assert!(passthrough_nodes((253, 0), &read, &list).is_empty());
     }
@@ -4720,7 +4755,8 @@ mod tests {
         let mut ins = |_: &InodeKey, _: u8| -> Result<()> { panic!("nothing to register") };
         assert!(key_files_not_kept_with(etc, &key_of, &get, &mut ins).is_empty());
         // the key bootstrapped after the start (or rotated): registered here
-        let get = |q: &InodeKey| (q.ino == 10).then_some(INODE_EXT_WINDOW_KEPT | INODE_EXT_NO_RENAME);
+        let get =
+            |q: &InodeKey| (q.ino == 10).then_some(INODE_EXT_WINDOW_KEPT | INODE_EXT_NO_RENAME);
         let mut written = Vec::new();
         let mut ins = |q: &InodeKey, v: u8| -> Result<()> {
             written.push((*q, v));
@@ -4733,12 +4769,18 @@ mod tests {
         let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Err(anyhow!("map full")) };
         let m = key_files_not_kept_with(etc, &key_of, &get, &mut ins);
         assert_eq!(m.len(), 2, "{m:?}");
-        assert!(m.iter().all(|l| l.contains("not registered") && l.contains("K4")), "{m:?}");
+        assert!(
+            m.iter()
+                .all(|l| l.contains("not registered") && l.contains("K4")),
+            "{m:?}"
+        );
         let none = |_: &Path| None;
         let mut ins = |_: &InodeKey, _: u8| -> Result<()> { Ok(()) };
         let m = key_files_not_kept_with(etc, &none, &get, &mut ins);
         assert_eq!(m.len(), 2, "{m:?}");
-        assert!(m[0].contains("admin.pub") && m[0].contains("not found"), "{m:?}");
+        assert!(
+            m[0].contains("admin.pub") && m[0].contains("not found"),
+            "{m:?}"
+        );
     }
-
 }
