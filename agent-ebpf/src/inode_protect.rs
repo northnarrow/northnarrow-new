@@ -1453,6 +1453,11 @@ pub extern "C" fn nn_bdev_raw(inode: u64, access: u64, cmd: u64) -> u64 {
             Ok(m) if m & S_IFMT == S_IFCHR => false,
             _ => return 0,
         };
+        // a character node's read-open is never judged: no map lookup for
+        // the host's `/dev/null`, ttys and the like
+        if !block && access == u64::from(northnarrow_common::window_tree::BDEV_ACCESS_READ) {
+            return 0;
+        }
         let Some(o) = off_opt!(INODE_I_RDEV_OFFSET) else {
             return 0;
         };

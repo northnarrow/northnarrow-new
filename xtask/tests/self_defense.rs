@@ -947,6 +947,7 @@ fn the_ancestors_and_the_block_devices_are_judged() {
         &[
             "Ok(m) if m & S_IFMT == S_IFBLK => true,",
             "Ok(m) if m & S_IFMT == S_IFCHR => false,",
+            "if !block && access == u64::from(northnarrow_common::window_tree::BDEV_ACCESS_READ) {\n            return 0;\n        }",
             "off_opt!(INODE_I_RDEV_OFFSET)",
             "PROTECTED_BDEVS.get(&rdev)",
             "is_exempt_pid(",
