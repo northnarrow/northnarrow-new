@@ -305,6 +305,40 @@ fn a_stop_while_the_controller_is_stuck_releases_every_held_process() {
     );
 }
 
+/// Lot M7 (the nightly of 27/11, ubuntu 26.04): the stop of a stuck
+/// controller whose sweep outlasts what the stop's deadline leaves it. On
+/// that guest the stop's earlier stages took 750 ms and the sweep of more
+/// than 1 000 held processes did not end before the deadline's note: its
+/// exit resumed the rest, unsigned, and the sweep, which signed only at its
+/// end, left no `stopping` entry. A `debug-trigger` build's sweep waits
+/// 1 ms before each release here (`NN_DEBUG_EXECQ_SLOW_SWEEP_US`): the
+/// deadline cuts it every time, and the sweep has signed what it had
+/// released by then — its `first` part, the rest named `unfinished`.
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
+fn a_sweep_the_stops_deadline_cuts_has_signed_what_it_released() {
+    let ended = burst_and_stop(
+        "cut",
+        &[
+            ("NN_DEBUG_EXECQ_STALL", STALL),
+            ("NN_DEBUG_EXECQ_SLOW_SWEEP_US", "1000"),
+        ],
+        StopBy::Signed,
+    );
+    assert!(
+        ended.cut,
+        "the stop's deadline did not cut the stop: the slow sweep did not take effect"
+    );
+    assert!(
+        ended.parts.iter().any(|p| p == "first") && ended.unfinished > 0,
+        "no first part of the sweep signed before the deadline, with what it had still to \
+         release: {:?}, {} unfinished",
+        ended.parts,
+        ended.unfinished
+    );
+}
+
 /// Lot M4 (#633): the agent killed in the middle of the burst, as the OOM
 /// killer kills it (SIGKILL: no stop of its own, no sweep). The processes
 /// it held stay stopped in the pinned map; the next start of the agent
@@ -397,6 +431,13 @@ struct Ended {
     overran: bool,
     /// Who signed each `stopping` entry (its `by`).
     by: Vec<String>,
+    /// Lot M7: the part of the sweep each entry is (`-`: the controller's).
+    parts: Vec<String>,
+    /// Lot M7: the processes the first parts named still to release.
+    unfinished: usize,
+    /// Lot M7: the stop's deadline cut the stop (its exit released the
+    /// rest).
+    cut: bool,
 }
 
 /// A burst, a stop in its middle (`by`), the checks; `env`: the agent's
@@ -670,6 +711,11 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> Ended {
     };
     let (resumed, unreported, left_in_map) = (count("resumed"), count("unreported"), count("left"));
     let recaptured = count("recaptured");
+    // lot M7: the part of the sweep each entry is (`-`: the controller's)
+    let parts: Vec<&str> = stopping
+        .iter()
+        .map(|s| s.get("part").and_then(|p| p.as_str()).unwrap_or("-"))
+        .collect();
     // lot M4: what the start after a kill resumed (and could not capture)
     let recovery = audit_objects(&state.audit_log(), "recovered_at_boot");
     let in_recovery = |field: &str| -> usize {
@@ -683,6 +729,10 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> Ended {
     // it (the stop's sweep then releases what the kernel holds)
     let overran = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default())
         .contains("exec quarantine controller did not stop in time");
+    // lot M7: the stop cut at its deadline
+    let cut = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default())
+        .contains("the stop did not end within its deadline");
+    let unfinished = count("unfinished");
     // a process left stopped: what the agent's log says of its pid
     let named: Vec<String> = {
         let text = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
@@ -707,12 +757,13 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> Ended {
         let _ = writeln!(
             std::io::stderr().lock(),
             "execq stop e2e [{case}]: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
-             stopping entries: {} — resumed {resumed}, of which {unreported} without an entry \
+             stopping entries: {} {parts:?} — resumed {resumed}, of which {unreported} without an entry \
              and {recaptured} captured again, {left_in_map} left in the map; {left_by_kill} left \
              stopped by a kill, of which the next start resumed {recovered} ({deferred} deferred); \
              after the stop {} of \
              the burst still running, {} not exit 0, {} new process(es) in state T, cgroup frozen \
-             {frozen:?}; the controller's stop overran its wait: {overran}; the agent's log on them: \
+             {frozen:?}; the controller's stop overran its wait: {overran}; cut at the deadline: {cut} \
+             ({unfinished} unfinished at the first part's signing); the agent's log on them: \
              {named:?}",
             stopping.len(),
             left.len(),
@@ -770,5 +821,8 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> Ended {
         },
         overran,
         by: signers,
+        parts: parts.iter().map(|p| p.to_string()).collect(),
+        unfinished,
+        cut,
     }
 }

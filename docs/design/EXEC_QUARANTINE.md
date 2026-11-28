@@ -308,6 +308,16 @@ Now:
   with `"by": "sweep: the controller did not stop in time"` (or `"sweep
   after the controller's stop"`), the controller's own being `"by":
   "controller"`;
+- the sweep signs what it has released by the stop's signing time (lot
+  M7): 200 ms before the deadline's note, a sweep still releasing signs
+  its `"part": "first"` — what it has done, and in `unfinished` the
+  processes it has still to release — then goes on, and signs the rest at
+  its end (`"part": "rest"`, with `gone` for those that ended meanwhile).
+  A sweep that ends in time signs once (`"part": "whole"`). On ubuntu
+  26.04 a stop whose earlier stages had taken 750 ms left the sweep half
+  a second for more than 1 000 held processes, the burst still running:
+  the deadline cut it and no signed entry named a process the stop had
+  resumed. Count `resumed` across the entries;
 - the stop's deadline sweeps the map too before it ends the process,
   whichever stage blocks: there it resumes and kills nothing (a kill owed
   stays in the pinned map for the next start), and signs nothing (the
@@ -497,7 +507,8 @@ heartbeat (a dead controller) leaves nothing to report it but the counter;
 `exec_quarantine` for `recovered_at_boot` (with `deferred`: the processes
 not captured yet, and `killed`: the kills a previous agent owed, lot 317),
 `stopping` (with `unreported`, `recaptured`, `killed` and `left`, lot 317;
-`by`, and for the stop's sweep `kills_left` and `gone`, lot M4)
+`by`, and for the stop's sweep `kills_left` and `gone`, lot M4; `part`
+and `unfinished` for the sweep's, lot M7)
 and `deferred` (a decision carried out once its process was captured, lot
 317).
 

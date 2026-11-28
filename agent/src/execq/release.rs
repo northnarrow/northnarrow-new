@@ -21,6 +21,14 @@
 //! The deadline's own exit runs it too ([`Sweeper::sweep_at_exit`]):
 //! whichever stage of the stop blocks, the process does not end holding
 //! processes stopped.
+//!
+//! Lot M7: the sweep signs what it has released by the stop's signing
+//! time — [`SIGN_MARGIN`] before the deadline's note — and goes on with
+//! the rest, signed at its end. On ubuntu 26.04 (the nightly of 27/11) a
+//! stop whose earlier stages took 750 ms left the sweep 0.5 s for more
+//! than 1 000 held processes, the burst still running: the deadline cut
+//! it, its exit resumed the last 146, and no signed `stopping` entry named
+//! any process the stop had resumed.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -182,6 +190,52 @@ impl Swept {
             && self.left.is_empty()
             && self.kills_left.is_empty()
     }
+
+    /// What was done after `mark` (a copy of `self` taken earlier: each
+    /// list only grows).
+    fn since(&self, mark: &Swept) -> Swept {
+        Swept {
+            resumed: self.resumed[mark.resumed.len()..].to_vec(),
+            killed: self.killed[mark.killed.len()..].to_vec(),
+            gone: self.gone - mark.gone,
+            left: self.left[mark.left.len()..].to_vec(),
+            kills_left: self.kills_left[mark.kills_left.len()..].to_vec(),
+        }
+    }
+}
+
+/// Lot M7: which part of a sweep a signed `stopping` entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// The sweep ended before its signing time: everything, signed once.
+    Whole,
+    /// Signed at the sweep's signing time, the sweep not ended: what was
+    /// done so far, and the processes still to release (`unfinished`).
+    First,
+    /// What the sweep did after its first part, signed at its end.
+    Rest,
+}
+
+impl Part {
+    fn as_str(self) -> &'static str {
+        match self {
+            Part::Whole => "whole",
+            Part::First => "first",
+            Part::Rest => "rest",
+        }
+    }
+}
+
+/// Lot M7: what the stop keeps, before its deadline's note, for the
+/// sweep's signed `stopping` entry — the sweep signs what it has done at
+/// the latest this long before the note's point ([`signing_time`]).
+pub const SIGN_MARGIN: Duration = Duration::from_millis(200);
+
+/// Lot M7: the sweep's signing time, from `now` and what the stop's
+/// deadline leaves before its note (`to_note`): [`SIGN_MARGIN`] before it,
+/// or `now` when less is left.
+pub fn signing_time(now: Instant, to_note: Duration) -> Instant {
+    now + to_note.saturating_sub(SIGN_MARGIN)
 }
 
 /// How many times a sweep reads the map: a read after the last that finds
@@ -200,6 +254,12 @@ pub struct Sweeper<M> {
     /// intent — the journal is not optional.
     journal: ActionJournal,
     recorder: Option<SharedRecorder>,
+    /// Lot M7: a `debug-trigger` build's `NN_DEBUG_EXECQ_SLOW_SWEEP_US=<µs>`
+    /// (the lab's privileged e2e, never a release): the stop's sweep waits
+    /// that long before each release — a slow host's sweep, which the
+    /// stop's deadline cuts (the deadline's own exit sweep is not slowed).
+    #[cfg(feature = "debug-trigger")]
+    slow: Option<Duration>,
 }
 
 /// The controller's recorder, shared with the stop's sweep (each call
@@ -239,17 +299,32 @@ impl<M: HeldMaps> Sweeper<M> {
             enforce,
             journal,
             recorder,
+            #[cfg(feature = "debug-trigger")]
+            slow: std::env::var("NN_DEBUG_EXECQ_SLOW_SWEEP_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|us| Duration::from_micros(us.min(10_000))),
         }
     }
 
     /// Clear the heartbeat, wait for the programs that read it, release
     /// every process the map names, and sign what was done (`by`: who
     /// asked) when there was anything to do.
-    pub fn sweep(&self, by: &str) -> Swept {
+    ///
+    /// Lot M7: `sign_by`, the stop's signing time. A sweep still releasing
+    /// then signs what it has done so far (the `first` part, the processes
+    /// it has still to release named `unfinished`) and goes on; what it
+    /// does after is signed at its end (the `rest`). On ubuntu 26.04 a
+    /// sweep of more than 1 000 held processes outlasted what the stop's
+    /// deadline left it: the deadline's exit resumed the last ones, and the
+    /// audit chain named none of the processes the stop had resumed.
+    pub fn sweep(&self, by: &str, sign_by: Option<Instant>) -> Swept {
         self.held.clear();
         self.held.quiesce();
         let mut tried: HashSet<(u32, u64)> = HashSet::new();
         let mut out = Swept::default();
+        // what the first part signed, once signed
+        let mut first: Option<Swept> = None;
         for _ in 0..PASSES {
             let fresh: Vec<_> = self
                 .held
@@ -260,12 +335,31 @@ impl<M: HeldMaps> Sweeper<M> {
             if fresh.is_empty() {
                 break;
             }
-            for (pid, st) in fresh {
+            for (i, &(pid, st)) in fresh.iter().enumerate() {
+                #[cfg(feature = "debug-trigger")]
+                if let Some(d) = self.slow {
+                    std::thread::sleep(d);
+                }
                 self.release(pid, st, true, &mut out);
+                let more = i + 1 < fresh.len();
+                if first.is_none() && more && sign_by.is_some_and(|t| Instant::now() >= t) {
+                    let unfinished: Vec<u32> = fresh[i + 1..].iter().map(|(p, _)| *p).collect();
+                    warn!(
+                        done = out.resumed.len() + out.killed.len(),
+                        unfinished = unfinished.len(),
+                        "exec quarantine: the stop's sweep signs what it has released at the \
+                         stop's signing time, and goes on with the rest"
+                    );
+                    self.sign(by, &out, Part::First, &unfinished);
+                    first = Some(out.clone());
+                }
             }
         }
-        if !out.is_empty() {
-            self.sign(by, &out);
+        match &first {
+            // what became of each process the first part left unfinished
+            Some(mark) => self.sign(by, &out.since(mark), Part::Rest, &[]),
+            None if !out.is_empty() => self.sign(by, &out, Part::Whole, &[]),
+            None => {}
         }
         out
     }
@@ -316,7 +410,7 @@ impl<M: HeldMaps> Sweeper<M> {
         self.held.unstop(pid, st.start_ns);
     }
 
-    fn sign(&self, by: &str, s: &Swept) {
+    fn sign(&self, by: &str, s: &Swept, part: Part, unfinished: &[u32]) {
         if !s.left.is_empty() || !s.kills_left.is_empty() {
             warn!(
                 left = ?s.left,
@@ -343,6 +437,13 @@ impl<M: HeldMaps> Sweeper<M> {
                 "gone": s.gone,
                 // held without an entry the controller resolved: all of them
                 "unreported": s.resumed,
+                // lot M7: the part of the sweep this entry is, and for its
+                // first part the processes it had still to release — the
+                // rest of the sweep (its `rest` entry) or, when the stop's
+                // deadline cuts it, the deadline's exit (unsigned) releases
+                // them
+                "part": part.as_str(),
+                "unfinished": unfinished,
                 "op": AUDIT_OP,
             }),
             "success",
@@ -354,7 +455,9 @@ impl<M: HeldMaps> Sweeper<M> {
 /// its own stop waited for `wait` at most, then the sweep — whatever the
 /// thread is doing (a pass that does not end: an rpm host's package
 /// lookups, a lookup that hangs). The controller's stop that ends in time
-/// leaves the sweep what it could not capture, if anything.
+/// leaves the sweep what it could not capture, if anything. Lot M7: the
+/// sweep signs what it has done by `sign_by` at the latest
+/// ([`Sweeper::sweep`]).
 /// The thread's handle comes back when it was still running (production
 /// lets it go: the process's exit ends it).
 pub fn stop_then_sweep<M: HeldMaps>(
@@ -363,6 +466,7 @@ pub fn stop_then_sweep<M: HeldMaps>(
     thread: std::thread::JoinHandle<()>,
     sweeper: &Sweeper<M>,
     wait: Duration,
+    sign_by: Option<Instant>,
 ) -> Option<std::thread::JoinHandle<()>> {
     stop.store(true, Ordering::Relaxed);
     wake();
@@ -381,11 +485,14 @@ pub fn stop_then_sweep<M: HeldMaps>(
         );
         Some(thread)
     };
-    sweeper.sweep(if running.is_none() {
-        "sweep after the controller's stop"
-    } else {
-        "sweep: the controller did not stop in time"
-    });
+    sweeper.sweep(
+        if running.is_none() {
+            "sweep after the controller's stop"
+        } else {
+            "sweep: the controller did not stop in time"
+        },
+        sign_by,
+    );
     running
 }
 

@@ -53,11 +53,13 @@ pub(crate) fn stop(
     workers.stop();
     // Lab PR 223: nothing stays held by an agent that stops. Lot M4 (#633):
     // the controller's own stop waited for within what the deadline leaves,
-    // then the stop's sweep releases what the kernel still holds.
+    // then the stop's sweep releases what the kernel still holds. Lot M7:
+    // the sweep signs what it has released before the deadline's note.
     deadline.stage("guards");
     northnarrow_agent::execq::shutdown(
         execq_handle,
         deadline.drain_bound(northnarrow_agent::execq::STOP_WAIT),
+        deadline.left(),
     );
     // Lab PR 226: the kernel keeps the policy until its programs detach.
     northnarrow_agent::execpol::shutdown(execpol_handle);
