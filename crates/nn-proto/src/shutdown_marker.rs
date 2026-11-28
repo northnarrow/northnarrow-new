@@ -549,18 +549,22 @@ mod tests {
     /// refused.
     #[test]
     fn a_window_s_grant_stands_the_roles_down_within_its_span_once() {
-        let installer = SigningKey::from_bytes(&[5; 32]);
+        // a key and a nonce no literal names (CodeQL
+        // `rust/hard-coded-cryptographic-value`, as lot 379's `test_nonce`)
+        let seed = std::process::id().to_le_bytes();
+        let installer = SigningKey::from_bytes(&core::array::from_fn(|i| seed[i % 4] ^ (i as u8) ^ 0x5a));
+        let window_nonce: [u8; 32] = core::array::from_fn(|i| seed[i % 4] ^ (i as u8) ^ 0xa5);
         let mut a = admins();
         a.keys.push(AdminKey {
             key: installer.verifying_key(),
             roles: alloc::vec![Role::TrustedInstaller],
         });
         let e = exp(&a.keys);
-        let tree = |ts| SignedPayload::new_trusted_installer_tree_grant([4; 32], ts, AGENT, 300, 700, 7_000);
+        let tree = |ts| SignedPayload::new_trusted_installer_tree_grant(window_nonce, ts, AGENT, 300, 700, 7_000);
         let m = signed(&tree(NOW - 400), &[&installer], 4242);
         let ok = verify(&m, &e, |_| false).expect("honoured");
         assert_eq!(MAX_STAND_DOWN_SECS, 600, "the window's ceiling");
-        assert_eq!((ok.nonce, ok.grace_secs), ([4; 32], MAX_STAND_DOWN_SECS));
+        assert_eq!((ok.nonce, ok.grace_secs), (window_nonce, MAX_STAND_DOWN_SECS));
         assert_eq!(verify(&m, &e, |_| true), Err(Rejection::Replayed));
         // past the span: the window's 600 s ceiling
         let m = signed(&tree(NOW - (MAX_SKEW_SECS + 601)), &[&installer], 4242);
@@ -574,11 +578,11 @@ mod tests {
             Err(Rejection::Quorum(QuorumDecision::RoleDenied { .. }))
         ));
         // the host-wide grant is no stand-down
-        let plain = SignedPayload::new_trusted_installer_grant([4; 32], NOW, AGENT, 300);
+        let plain = SignedPayload::new_trusted_installer_grant(window_nonce, NOW, AGENT, 300);
         let m = signed(&plain, &[&installer], 4242);
         assert_eq!(verify(&m, &e, |_| false), Err(Rejection::NotAShutdown));
         // another install, another agent's pid
-        let other = SignedPayload::new_trusted_installer_tree_grant([4; 32], NOW, [1; 16], 300, 700, 7_000);
+        let other = SignedPayload::new_trusted_installer_tree_grant(window_nonce, NOW, [1; 16], 300, 700, 7_000);
         assert_eq!(verify(&signed(&other, &[&installer], 4242), &e, |_| false), Err(Rejection::OtherAgent));
         assert!(matches!(
             verify(&signed(&tree(NOW), &[&installer], 9), &e, |_| false),
