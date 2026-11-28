@@ -1664,7 +1664,20 @@ pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
 /// backup's or a deduplicator's link into a COMBAT trigger.
 #[lsm(hook = "inode_link")]
 pub fn protected_link_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_frozen(&ctx, FS_OP_LINK, ctx.arg(1), 2, hook::INODE_LINK) }
+    // SAFETY: the context is the hook's; the dentries are read through the helper only.
+    unsafe {
+        let r = deny_new_frozen(&ctx, FS_OP_LINK, ctx.arg(1), 2, hook::INODE_LINK);
+        if r != 0 {
+            return r;
+        }
+        // Lot 2.3b (D5, the mini-hunt): nor a new name, outside the frozen
+        // paths, for a frozen object (written through it, it would change
+        // the frozen file)
+        if frozen(crate::window_tree::raw_arg(&ctx, 0), FS_OP_LINK) {
+            return -EPERM;
+        }
+        0
+    }
 }
 
 /// `security.selinux` with its terminator, as the three words a

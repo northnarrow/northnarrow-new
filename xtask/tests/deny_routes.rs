@@ -608,6 +608,12 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ),
     (
         "inode_protect.rs",
+        "protected_link_deny",
+        1,
+        Enforced(FROZEN_SYSTEM_CODE),
+    ),
+    (
+        "inode_protect.rs",
         "deny_xattr",
         1,
         Enforced(FROZEN_SYSTEM_CODE),

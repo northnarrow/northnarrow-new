@@ -1370,6 +1370,10 @@ fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
         assert!(body(&ip, p).contains("deny_new_frozen(&ctx,"), "{p}");
     }
     assert!(body(&ip, "protected_link_deny").contains(", 2, hook::INODE_LINK"), "the new name");
+    assert!(
+        body(&ip, "protected_link_deny").contains("frozen(crate::window_tree::raw_arg(&ctx, 0), FS_OP_LINK)"),
+        "the linked object: no new name for a frozen file"
+    );
     assert!(body(&ip, "frozen").contains("nn_tree_frozen(dentry, u64::from(operation))"));
     let w = code("agent-ebpf/src/window_tree.rs");
     in_order(

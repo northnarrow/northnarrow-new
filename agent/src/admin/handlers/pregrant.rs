@@ -32,7 +32,15 @@ pub(in crate::admin) const CHECKED_DIRS: &[&str] = &[
 ];
 
 /// The single files checked when they exist.
-pub(in crate::admin) const CHECKED_FILES: &[&str] = &["etc/ld.so.preload", "etc/ld.so.conf"];
+pub(in crate::admin) const CHECKED_FILES: &[&str] = &[
+    "etc/ld.so.preload",
+    "etc/ld.so.conf",
+    // the package managers' main configuration (a hook or a plugin path)
+    "etc/apt/apt.conf",
+    "etc/dpkg/dpkg.cfg",
+    "etc/dnf/dnf.conf",
+    "etc/yum.conf",
+];
 
 /// The most files the check reads (a directory flooded with entries is
 /// itself foreign: the excess is named, not read).

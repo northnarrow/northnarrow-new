@@ -160,15 +160,23 @@ pub fn window_run_env<I>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    let locale = |k: &str| {
+        k == "LANG"
+            || k == "LANGUAGE"
+            || (k.len() > 3
+                && k.starts_with("LC_")
+                && k[3..].bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+    };
     let mut out: std::collections::BTreeMap<String, String> = vars
         .into_iter()
         .filter(|(k, v)| {
-            (WINDOW_RUN_ENV_KEPT.contains(&k.as_str())
-                || (k.len() > 3
-                    && k.starts_with("LC_")
-                    && k[3..].bytes().all(|b| b.is_ascii_uppercase() || b == b'_')))
+            (WINDOW_RUN_ENV_KEPT.contains(&k.as_str()) || locale(k))
                 && v.len() <= WINDOW_RUN_ENV_VALUE_MAX
                 && !v.contains('\0')
+                // a locale named by a path, a time zone read from a file of
+                // the caller's choosing: the C library would load them
+                && !(locale(k) && v.contains('/'))
+                && !(k == "TZ" && (v.starts_with('/') || v.starts_with(':')))
         })
         .collect();
     out.insert("PATH".to_string(), WINDOW_RUN_PATH.to_string());
@@ -300,10 +308,14 @@ pub const FROZEN: &[(&str, Freeze)] = &[
     ("/etc/ld.so.cache", Freeze::Subtree),
     ("/etc/ld.so.conf", Freeze::Subtree),
     ("/etc/ld.so.conf.d", Freeze::Subtree),
+    ("/etc/apt/apt.conf", Freeze::Subtree),
     ("/etc/apt/apt.conf.d", Freeze::Subtree),
+    ("/etc/dpkg/dpkg.cfg", Freeze::Subtree),
     ("/etc/dpkg/dpkg.cfg.d", Freeze::Subtree),
     ("/var/lib/dpkg/info", Freeze::Subtree),
+    ("/etc/dnf/dnf.conf", Freeze::Subtree),
     ("/etc/dnf/plugins", Freeze::Subtree),
+    ("/etc/yum.conf", Freeze::Subtree),
     ("/etc/yum/pluginconf.d", Freeze::Subtree),
     ("/etc/rpm", Freeze::Subtree),
     ("/etc/systemd/system.conf", Freeze::Subtree),
@@ -436,6 +448,8 @@ mod window_flow_tests {
             ("DEBIAN_FRONTEND", "noninteractive"),
             ("TZDIR", "/tmp/tz"),
             ("USER", &"u".repeat(WINDOW_RUN_ENV_VALUE_MAX + 1)),
+            ("LC_CTYPE", "/tmp/locale"),
+            ("TZ", ":/tmp/zone"),
         ]));
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
@@ -451,6 +465,11 @@ mod window_flow_tests {
             ]
         );
         assert!(env.contains(&("PATH".to_string(), WINDOW_RUN_PATH.to_string())));
+        // a zone by its name is kept, by a path it is not
+        let tz = window_run_env(s(&[("TZ", "Europe/Rome"), ("LANGUAGE", "it:en")]));
+        assert!(tz.contains(&("TZ".to_string(), "Europe/Rome".to_string())), "{tz:?}");
+        assert!(tz.contains(&("LANGUAGE".to_string(), "it:en".to_string())), "{tz:?}");
+        assert!(window_run_env(s(&[("TZ", "/etc/x")])).iter().all(|(k, _)| k != "TZ"));
     }
 
     /// Lot 2.3b: no name `window-run` keeps is one the kernel's eviction
@@ -529,8 +548,12 @@ mod window_flow_tests {
             "/etc/ld.so.preload",
             "/etc/ld.so.cache",
             "/etc/ld.so.conf.d",
+            "/etc/apt/apt.conf",
             "/etc/apt/apt.conf.d",
+            "/etc/dpkg/dpkg.cfg",
             "/etc/dpkg/dpkg.cfg.d",
+            "/etc/dnf/dnf.conf",
+            "/etc/yum.conf",
             "/var/lib/dpkg/info",
             "/etc/dnf/plugins",
             "/etc/systemd/system.conf",
