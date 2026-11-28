@@ -886,6 +886,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
 
 ### default.trusted-installer-grant.socket
@@ -894,6 +895,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
 
 ### default.response-status.agent-id

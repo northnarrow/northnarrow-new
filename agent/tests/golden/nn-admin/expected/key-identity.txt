@@ -4896,6 +4896,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: reading private key absent.key: No such file or directory (os error 2)
 --- agent
 (no connection)
@@ -4906,6 +4907,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key loose.key is accessible to group or others (mode 640): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
 --- agent
 (no connection)
@@ -4916,6 +4918,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key loose.key is accessible to group or others (mode 644): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
 --- agent
 (no connection)
@@ -4927,6 +4930,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 300s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
@@ -4946,6 +4950,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key loose.key is accessible to group or others (mode 644): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
 --- agent
 (no connection)
@@ -4956,6 +4961,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key file bad.key is empty
 --- agent
 (no connection)
@@ -4966,6 +4972,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key must be 64 hex chars (got 4): bad.key
 --- agent
 (no connection)
@@ -4976,6 +4983,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key hex decode failed: Invalid character 'z' at position 0
 --- agent
 (no connection)
@@ -4986,6 +4994,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: private key key.d is accessible to group or others (mode 755): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
 --- agent
 (no connection)
@@ -4996,6 +5005,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 300s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
@@ -5014,6 +5024,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id not found at absent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
 --- agent
 (no connection)
@@ -5024,6 +5035,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id file bad_id present but corrupted: agent_id is all zeros — the test fixtures' identity, never minted
 --- agent
 (no connection)
@@ -5034,6 +5046,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id file bad_id present but corrupted: agent_id has 4 hex chars (expected 32)
 --- agent
 (no connection)
@@ -5044,6 +5057,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id file bad_id present but corrupted: agent_id is not valid hex: Invalid character 'z' at position 0
 --- agent
 (no connection)
@@ -5054,6 +5068,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id file bad_id present but corrupted: agent_id file has embedded newline — expected single-line hex
 --- agent
 (no connection)
@@ -5064,6 +5079,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: reading agent_id id.d: Is a directory (os error 21)
 --- agent
 (no connection)

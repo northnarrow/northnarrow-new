@@ -2780,6 +2780,377 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.window-run.unknown-flag
+$ nn-admin window-run --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+|   tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'
+|
+| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <COMMAND>...
+|
+| For more information, try '--help'.
+
+### clap.window-run.missing-required
+$ nn-admin window-run
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|   <COMMAND>...
+|
+| Usage: nn-admin window-run --key <KEY> -- <COMMAND>...
+|
+| For more information, try '--help'.
+
+### clap.window-run.key.missing-value
+$ nn-admin window-run --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-run.window-secs.missing-value
+$ nn-admin window-run --window-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--window-secs <WINDOW_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-run.agent-id-file.missing-value
+$ nn-admin window-run --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-run.socket.missing-value
+$ nn-admin window-run --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-run.interactive.given-twice
+$ nn-admin window-run --interactive --interactive
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--interactive' cannot be used multiple times
+|
+| Usage: nn-admin window-run [OPTIONS] --key <KEY> -- <COMMAND>...
+|
+| For more information, try '--help'.
+
+### clap.window-run.interactive.with-a-value
+$ nn-admin window-run --interactive=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--interactive' found; no more were expected
+|
+| Usage: nn-admin window-run --key <KEY> --interactive -- <COMMAND>...
+|
+| For more information, try '--help'.
+
+### clap.window-run.accept-foreign.missing-value
+$ nn-admin window-run --accept-foreign
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--accept-foreign <SHA256>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.unknown-flag
+$ nn-admin installer-window --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin installer-window [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.installer-window.missing-required
+$ nn-admin installer-window
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|   --script <PATH>
+|
+| Usage: nn-admin installer-window --key <KEY> --script <PATH>
+|
+| For more information, try '--help'.
+
+### clap.installer-window.stray-positional
+$ nn-admin installer-window stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin installer-window [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.installer-window.key.missing-value
+$ nn-admin installer-window --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.window-secs.missing-value
+$ nn-admin installer-window --window-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--window-secs <WINDOW_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.agent-id-file.missing-value
+$ nn-admin installer-window --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.socket.missing-value
+$ nn-admin installer-window --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.script.missing-value
+$ nn-admin installer-window --script
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--script <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.installer-window.for-package.given-twice
+$ nn-admin installer-window --for-package --for-package
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--for-package' cannot be used multiple times
+|
+| Usage: nn-admin installer-window [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.installer-window.for-package.with-a-value
+$ nn-admin installer-window --for-package=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--for-package' found; no more were expected
+|
+| Usage: nn-admin installer-window --key <KEY> --for-package
+|
+| For more information, try '--help'.
+
+### clap.installer-window.accept-foreign.missing-value
+$ nn-admin installer-window --accept-foreign
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--accept-foreign <SHA256>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-stop.unknown-flag
+$ nn-admin window-stop --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin window-stop [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.window-stop.restart.given-twice
+$ nn-admin window-stop --restart --restart
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--restart' cannot be used multiple times
+|
+| Usage: nn-admin window-stop [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.window-stop.restart.with-a-value
+$ nn-admin window-stop --restart=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--restart' found; no more were expected
+|
+| Usage: nn-admin window-stop --restart
+|
+| For more information, try '--help'.
+
+### clap.window-stop.generation.missing-value
+$ nn-admin window-stop --generation
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--generation <GENERATION>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-stop.socket.missing-value
+$ nn-admin window-stop --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-lease.unknown-flag
+$ nn-admin window-lease --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin window-lease [OPTIONS] --link <PATH>
+|
+| For more information, try '--help'.
+
+### clap.window-lease.missing-required
+$ nn-admin window-lease
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --link <PATH>
+|
+| Usage: nn-admin window-lease --link <PATH>
+|
+| For more information, try '--help'.
+
+### clap.window-lease.stray-positional
+$ nn-admin window-lease stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin window-lease [OPTIONS] --link <PATH>
+|
+| For more information, try '--help'.
+
+### clap.window-lease.link.missing-value
+$ nn-admin window-lease --link
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--link <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-lease.create.given-twice
+$ nn-admin window-lease --create --create
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--create' cannot be used multiple times
+|
+| Usage: nn-admin window-lease [OPTIONS] --link <PATH>
+|
+| For more information, try '--help'.
+
+### clap.window-lease.create.with-a-value
+$ nn-admin window-lease --create=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--create' found; no more were expected
+|
+| Usage: nn-admin window-lease --link <PATH> --create
+|
+| For more information, try '--help'.
+
+### clap.window-lease.generation.missing-value
+$ nn-admin window-lease --generation
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--generation <GENERATION>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.window-lease.socket.missing-value
+$ nn-admin window-lease --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.response.unknown-flag
 $ nn-admin response --no-such-flag
 exit: 2

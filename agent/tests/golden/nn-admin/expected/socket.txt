@@ -9968,6 +9968,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 300s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
@@ -9986,6 +9987,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: invalid signature (key not in admin.pub, or wrong bytes)
 --- agent
 connection 1
@@ -10001,6 +10003,7 @@ exit: 3
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: no pending challenge (retry)
 --- agent
 connection 1
@@ -10016,6 +10019,7 @@ exit: 4
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: rate limited; retry after 7s
 --- agent
 connection 1
@@ -10031,6 +10035,7 @@ exit: 7
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: role denied (the submitted key lacks the `trusted-installer` role in admin.pub — add it to the line's role list)
 --- agent
 connection 1
@@ -10046,6 +10051,7 @@ exit: 6
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: quorum not met (1/2)
 --- agent
 connection 1
@@ -10061,6 +10067,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: clock skew (server_ts=1750000000, max ±30s); NTP-sync this host and the agent host, then retry
 --- agent
 connection 1
@@ -10076,6 +10083,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: agent_id mismatch (the --agent-id-file content doesn't match the agent's bootstrapped UUID)
 --- agent
 connection 1
@@ -10091,6 +10099,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: server rejected operation
 --- agent
 connection 1
@@ -10106,6 +10115,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: server speaks protocol v1
 --- agent
 connection 1
@@ -10121,6 +10131,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: the agent verified the grant and refused it, nothing armed (a window is already open, or the agent could not open this one: its journal says why)
 --- agent
 connection 1
@@ -10136,6 +10147,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: reading frame length header: failed to fill whole buffer
 --- agent
 connection 1
@@ -10148,6 +10160,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
@@ -10161,6 +10174,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: reading frame length header: failed to fill whole buffer
 --- agent
 connection 1
@@ -10175,6 +10189,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: decode_frame: postcard decode failed: Found a varint that didn't terminate. Is the usize too big for this platform?
 --- agent
 connection 1
@@ -10190,6 +10205,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: advertised frame body 65537 > limit 65536
 --- agent
 connection 1
@@ -10204,6 +10220,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: reading frame body: failed to fill whole buffer
 --- agent
 connection 1
@@ -10218,6 +10235,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: unexpected reply to TrustedInstallerGrantRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
@@ -10233,6 +10251,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: connecting to admin.sock: No such file or directory (os error 2)
 
 ### sock.trusted-installer-grant.refused-connection
@@ -10241,6 +10260,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
@@ -10251,6 +10271,7 @@ exit: 17
 --- stdout
 (empty)
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: connecting to admin.sock: Permission denied (os error 13)
 | trusted-installer-grant: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin trusted-installer-grant …`. This does not mean the agent is stopped
 --- agent
@@ -12818,6 +12839,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 120s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
@@ -12836,6 +12858,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 1s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: --window-secs 0 clamped to 1 (agent ceiling)
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
@@ -12855,6 +12878,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 600s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
+| trusted-installer-grant: deprecated — this opens the host-wide window; use `nn-admin window-run -- <command>`, whose window is for that command only
 | trusted-installer-grant: --window-secs 3600 clamped to 600 (agent ceiling)
 | trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent

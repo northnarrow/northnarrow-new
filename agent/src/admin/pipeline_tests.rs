@@ -1113,6 +1113,8 @@ fn result_of(reply: &AdminMessage) -> AdminResult {
         AdminMessage::TelemetryStatusResponse(x) => x.result,
         AdminMessage::RemediateRansomwareResponse(x) => x.result,
         AdminMessage::IntegrityAcknowledgeResponse(x) => x.result,
+        // lot 2.3b: the tree grant's reply
+        AdminMessage::WindowReply(x) => x.result,
         other => panic!("not a signed verb's reply: {other:?}"),
     }
 }
