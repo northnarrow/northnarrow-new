@@ -899,28 +899,31 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
         // either the parent dir or the target inode itself is in the
         // protected set — that covers both "rm somefile inside dir" and
         // "rm /the/protected/file".
+        // The typed arguments are read first: an argument read raw
+        // (`raw_arg`, a probe read through `ctx + 8 * i`) before its typed
+        // read let LLVM reuse that modified context pointer for the typed
+        // load, which the verifier refuses (5.15: "dereference of modified
+        // ctx ptr").
+        let parent: *const c_void = ctx.arg(0);
+        let dentry: *const c_void = ctx.arg(1);
+        // (scalars for the global functions: the hook's typed pointers are
+        // refused there)
+        let (dir_s, dentry_s) = (crate::window_tree::raw_arg(ctx, 0), crate::window_tree::raw_arg(ctx, 1));
         // Lot 2.3b (the single-use leases): PID 1's removal of one of our
         // units' enablement links a member leased for it (`systemctl
         // disable` inside the window), consumed here, signed.
-        if crate::window_tree::opaque(crate::window_tree::nn_tree_lease(
-            crate::window_tree::raw_arg(ctx, 0),
-            crate::window_tree::raw_arg(ctx, 1),
-        )) != 0
-        {
+        if crate::window_tree::opaque(crate::window_tree::nn_tree_lease(dir_s, dentry_s)) != 0 {
             return 0;
         }
-        let parent: *const c_void = ctx.arg(0);
         if deny_if_protected(FS_OP_UNLINK, parent, hook::INODE_UNLINK) {
             return -EPERM;
         }
-        let dentry: *const c_void = ctx.arg(1);
         if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_UNLINK) {
             if deny_if_protected(FS_OP_UNLINK, target_inode, hook::INODE_UNLINK) {
                 return -EPERM;
             }
         }
         // Lot 2.3a (the review of #647): our units' enablement links, by name
-        let (dir_s, dentry_s) = (crate::window_tree::raw_arg(ctx, 0), crate::window_tree::raw_arg(ctx, 1));
         if crate::window_tree::opaque(nn_unit_link(dir_s, dentry_s, u64::from(FS_OP_UNLINK))) != 0 {
             return -EPERM;
         }

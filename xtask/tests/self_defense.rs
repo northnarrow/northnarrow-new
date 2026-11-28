@@ -1408,9 +1408,18 @@ fn the_freeze_is_asked_at_every_mutation_hook_and_judges_outsiders_only() {
 #[test]
 fn a_lease_is_consumed_once_by_pid1_s_removal_of_our_link_only() {
     let ip = code("agent-ebpf/src/inode_protect.rs");
+    // the typed arguments read before the raw ones (5.15's verifier refused
+    // the typed load through the context pointer a raw read had moved)
     in_order(
         body(&ip, "try_inode_unlink"),
-        &["nn_tree_lease(", "return 0;", "deny_if_protected(FS_OP_UNLINK, parent"],
+        &[
+            "let parent: *const c_void = ctx.arg(0);",
+            "let dentry: *const c_void = ctx.arg(1);",
+            "raw_arg(ctx, 0), crate::window_tree::raw_arg(ctx, 1)",
+            "nn_tree_lease(dir_s, dentry_s)",
+            "return 0;",
+            "deny_if_protected(FS_OP_UNLINK, parent",
+        ],
     )
     .unwrap();
     let mut callers = 0;
