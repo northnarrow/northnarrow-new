@@ -952,8 +952,9 @@ fn the_ancestors_and_the_block_devices_are_judged() {
 }
 
 /// Lot 2.3a: `task_kill` protects a new instance before it registers
-/// (a process running our binary; the window lifts that one for its
-/// members, never a registered one), guards a member of an open window
+/// (a process running our binary, not its role's live holder, in its first
+/// seconds; the window lifts that one for its members, never a registered
+/// one), guards a member of an open window
 /// from outsiders (D7, `systemd-shutdown` aside), and records every
 /// default-fatal signal it lets through to a protected process (330 a), a
 /// refused one by caller and signal.
@@ -964,7 +965,7 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
         body(&t, "try_task_kill"),
         &[
             "let registered = is_protected_pid(target_tgid);",
-            "let is_protected = registered || crate::bpf_defense::task_runs_own_binary(target as *const u8);",
+            "let is_protected = registered || new_instance(target as *const u8, target_tgid);",
             "if !is_protected {",
             "crate::window_tree::opaque(crate::window_tree::nn_tree_target_guarded(crate::window_tree::raw_arg(ctx, 0))) != 0",
             "&& !(caller_tgid == 1 && pid1_is_final_shutdown())",
@@ -974,6 +975,20 @@ fn task_kill_protects_a_new_instance_guards_the_members_and_records_fatal_signal
             "if !registered && crate::inode_protect::override_active() {\n            let_through(sig, target_tgid);\n            return 0;\n        }",
             "if caller_tgid == 1 && (pid1_granted(sig) || pid1_is_final_shutdown()) {\n            let_through(sig, target_tgid);\n            return 0;\n        }",
             "crate::inode_protect::emit_signal(FS_OP_SIGNAL, sig as u32, target_tgid);\n        -EPERM",
+        ],
+    )
+    .unwrap();
+    // a new instance: our binary's role, not its live holder, its age
+    // (the fixtures' teardown of an evicted holder, a helper left behind)
+    in_order(
+        body(&t, "new_instance"),
+        &[
+            "Some(k) => crate::bpf_defense::OWN_EXE_INODES.get(&k).copied().unwrap_or(0),",
+            "if role == 0 {\n            return false;\n        }",
+            "let holder = crate::bpf_defense::ROLE_TGIDS.get(u32::from(role - 1)).copied();",
+            "task.add(off!(TASK_STRUCT_START_TIME_OFFSET))",
+            ".map(|start| bpf_ktime_get_ns().saturating_sub(start));",
+            "northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, age)",
         ],
     )
     .unwrap();

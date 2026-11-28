@@ -413,6 +413,44 @@ pub const fn denial_class(tree_in_force: bool, member: bool) -> u8 {
     }
 }
 
+// ── a new instance (task_kill) ─────────────────────────────────────────
+
+/// How long a process running the agent's or the watchdog's binary is
+/// protected by `task_kill` before it registers: its first 10 s. A new
+/// instance registers in the pinned `PROTECTED_PIDS` within its first
+/// second or two (into its predecessor's map, before its bootstraps).
+pub const NEW_INSTANCE_NS: u64 = 10_000_000_000;
+
+/// Whether `task_kill` protects a target that is not a protected pid: it
+/// runs one of our binaries (`role`: `OWN_EXE_INODES`' role of its
+/// executable, 0 for none), it is not that role's live holder (`holder`:
+/// the role's `ROLE_TGIDS` slot; `tgid`: the target's), and it is a new
+/// instance, in its first [`NEW_INSTANCE_NS`] (`age_ns`; `None`: its start
+/// unread, protected). A holder that is no longer a protected pid, and a
+/// process past its first seconds (a helper left behind by an agent that
+/// exited), are signalled as before; the window lifts the protection for
+/// the processes it lifts.
+#[inline(always)]
+pub const fn new_instance_protected(
+    role: u8,
+    holder: Option<u32>,
+    tgid: u32,
+    age_ns: Option<u64>,
+) -> bool {
+    if role == 0 {
+        return false;
+    }
+    if let Some(h) = holder {
+        if h == tgid {
+            return false;
+        }
+    }
+    match age_ns {
+        Some(a) => a < NEW_INSTANCE_NS,
+        None => true,
+    }
+}
+
 // ── the fatal signals (lot 330 a) ──────────────────────────────────────
 
 /// Whether `sig`'s default action ends the process (terminate, or core
@@ -875,6 +913,33 @@ mod tests {
         assert_eq!(denial_class(false, true), DENIAL_WINDOW_NONE);
         assert_eq!(denial_class(true, false), DENIAL_WINDOW_OUTSIDER);
         assert_eq!(denial_class(true, true), DENIAL_WINDOW_KEPT);
+    }
+
+    /// Lot 2.3a: a new instance is protected before it registers; the
+    /// role's live holder, a process of no binary of ours and one past its
+    /// first seconds are not (the fixtures' teardown, a helper left behind).
+    #[test]
+    fn a_new_instance_is_protected_only_in_its_first_seconds_and_not_as_its_role_s_holder() {
+        let young = Some(NEW_INSTANCE_NS - 1);
+        assert!(new_instance_protected(2, Some(100), 200, young));
+        assert!(new_instance_protected(1, None, 200, Some(0)));
+        assert!(
+            new_instance_protected(2, Some(100), 200, None),
+            "its start unread"
+        );
+        assert!(
+            !new_instance_protected(0, Some(100), 200, young),
+            "not our binary"
+        );
+        assert!(
+            !new_instance_protected(2, Some(200), 200, young),
+            "the role's holder"
+        );
+        assert!(
+            !new_instance_protected(2, Some(100), 200, Some(NEW_INSTANCE_NS)),
+            "past its first seconds"
+        );
+        assert_eq!(NEW_INSTANCE_NS, 10_000_000_000);
     }
 
     #[test]

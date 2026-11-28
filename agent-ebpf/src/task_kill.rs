@@ -46,7 +46,33 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
+use crate::btf_offsets::{TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET};
+
+/// Lot 2.3a (a new instance): `task` (thread group `tgid`) runs the agent's
+/// or the watchdog's binary, is not that role's live holder, and is in its
+/// first seconds (`northnarrow_common::window_tree::new_instance_protected`):
+/// a new instance between its exec and its registration in
+/// `PROTECTED_PIDS`. Its start is `start_time` (`CLOCK_MONOTONIC`, as
+/// `bpf_ktime_get_ns`); unread, it is protected.
+#[inline(always)]
+fn new_instance(task: *const u8, tgid: u32) -> bool {
+    // SAFETY: `task` is the hook's target task; every read below goes
+    // through `bpf_probe_read_kernel`.
+    unsafe {
+        let role = match crate::bpf_defense::task_exe_key(task) {
+            Some(k) => crate::bpf_defense::OWN_EXE_INODES.get(&k).copied().unwrap_or(0),
+            None => 0,
+        };
+        if role == 0 {
+            return false;
+        }
+        let holder = crate::bpf_defense::ROLE_TGIDS.get(u32::from(role - 1)).copied();
+        let age = bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64)
+            .ok()
+            .map(|start| bpf_ktime_get_ns().saturating_sub(start));
+        northnarrow_common::window_tree::new_instance_protected(role, holder, tgid, age)
+    }
+}
 
 /// Kept for the doc/trace vocabulary; the policy below is now
 /// deny-by-default for every signal, not a KILL/TERM allowlist.
@@ -272,10 +298,10 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         // R14a: a worker is protected as a target, as the agent and the
         // watchdog are.
         // Lot 2.3a (a new instance): and a process running the agent's or the
-        // watchdog's binary before it registered (a new instance's first
-        // moments), as `ptrace_check::target_is_protected` protects it.
+        // watchdog's binary before it registered — not its role's holder, in
+        // its first seconds ([`new_instance`]).
         let registered = is_protected_pid(target_tgid);
-        let is_protected = registered || crate::bpf_defense::task_runs_own_binary(target as *const u8);
+        let is_protected = registered || new_instance(target as *const u8, target_tgid);
         let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         if !is_protected {
             // Lot 2.3a (D7): a member of an open tree window, from outside
