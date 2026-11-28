@@ -1350,6 +1350,14 @@ pub const INODE_EXT_WINDOW_KEPT: u8 = 0b10;
 /// its path). Not [`INODE_EXT_WINDOW_KEPT`]: the entries inside the
 /// directory stay the window's to lift (an installer writes there).
 pub const INODE_EXT_DIR_KEPT: u8 = 0b100;
+/// Lot 2.3a (the review of #647, the enablement links): a `*.wants` or
+/// `*.requires` directory of the unit search path holding our units'
+/// links — its entries NAMED after our units
+/// (`window_tree::UNIT_LINK_NAMES`) are refused their removal and their
+/// rename, in or out (a link made after the start included), outside the
+/// agent's family and a window's lift; set with [`INODE_EXT_NO_RENAME`]
+/// (the directory moved aside takes the links with it).
+pub const INODE_EXT_UNIT_LINKS: u8 = 0b1000;
 
 /// Whether the rename or exchange of an inode whose second word is `ext`
 /// is refused for its own sake (an ancestor), outside a window.
@@ -1979,7 +1987,7 @@ pub const FS_OP_SYSRQ: u8 = 53;
 pub const FS_OP_SYSRQ_WINDOW: u8 = 54;
 
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_FD_RECEIVE;
+pub const FS_OP_LAST: u8 = FS_OP_BDEV_PASSTHROUGH_NOTED;
 
 // Lot 2.1 (S2 scaffold): the denial codes stage S2's lots will emit,
 // reserved here in their lots' order, so that two lots never take the same
@@ -2006,7 +2014,9 @@ pub const FS_OP_SHARED_MAP: u8 = 59;
 /// ([`INODE_EXT_NO_RENAME`]), refused.
 pub const FS_OP_ANCESTOR_RENAME: u8 = 60;
 /// Lot 2.3: a write-open of a block device that backs a protected
-/// file, refused.
+/// file (or of its SCSI generic node), refused under the kernel-read
+/// option's block-device class (lot 2.3a, the review of #647: recorded
+/// and let through otherwise, [`FS_OP_BDEV_WRITE_NOTED`]).
 pub const FS_OP_BDEV_WRITE: u8 = 61;
 /// Lot 2.3: a read-open of such a block device, refused under the
 /// kernel-read option ([`KERNEL_READ_BLOCK_DEVICE`]).
@@ -2025,6 +2035,24 @@ pub const FS_OP_FATAL_SIGNAL: u8 = 63;
 /// it, so the tree's boundary is closed both ways. The target the inode
 /// (0:0 for a ring).
 pub const FS_OP_FD_RECEIVE: u8 = 64;
+/// Lot 2.3a (the review of #647): NOT a refusal — what
+/// [`FS_OP_BDEV_WRITE`] refuses under the kernel-read option, let through
+/// and recorded by default (High: the disk under the agent's files written
+/// past every inode hook; grub-install, LVM, cryptsetup, tune2fs meet
+/// it). Minor: a tool's many opens spend the non-decisive budget.
+pub const FS_OP_BDEV_WRITE_NOTED: u8 = 65;
+/// Lot 2.3a (the review of #647): a passthrough command (`SG_IO`,
+/// `SCSI_IOCTL_SEND_COMMAND`, an NVMe command ioctl:
+/// `window_tree::is_passthrough_ioctl`) to a block device that backs a
+/// protected file or to one of its disk's passthrough nodes (sg, bsg, NVMe
+/// generic or controller), refused under the kernel-read option's
+/// block-device class: `target_dev` the device's number (`MKDEV`),
+/// `target_ino` the ioctl's command.
+pub const FS_OP_BDEV_PASSTHROUGH: u8 = 66;
+/// Lot 2.3a (the review of #647): NOT a refusal — such a command let
+/// through and recorded by default (High; minor, as
+/// [`FS_OP_BDEV_WRITE_NOTED`]).
+pub const FS_OP_BDEV_PASSTHROUGH_NOTED: u8 = 67;
 
 /// Lot 2.3a: the pinned map of the block devices that back the agent's
 /// files, keyed by the kernel's `dev_t` (`MKDEV`: major << 20 | minor), as
@@ -2038,7 +2066,7 @@ pub const PROTECTED_BDEVS_MAX: u32 = 32;
 
 /// The S2 codes, with the name their records carry and the lot that emits
 /// them; those of a lot that has landed are at or below [`FS_OP_LAST`].
-pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 10] = [
+pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 13] = [
     (FS_OP_ROLE_UNMARKED, "role_unmarked", "2.2"),
     (FS_OP_BPF_CGROUP_ATTACH, "bpf_cgroup_attach", "2.2"),
     (FS_OP_KERNEL_READ, "kernel_read", "2.2"),
@@ -2049,6 +2077,13 @@ pub const S2_RESERVED_FS_OPS: [(u8, &str, &str); 10] = [
     (FS_OP_BDEV_READ, "bdev_read", "2.3"),
     (FS_OP_FATAL_SIGNAL, "fatal_signal", "2.3"),
     (FS_OP_FD_RECEIVE, "fd_receive", "2.3"),
+    (FS_OP_BDEV_WRITE_NOTED, "bdev_write_noted", "2.3"),
+    (FS_OP_BDEV_PASSTHROUGH, "bdev_passthrough", "2.3"),
+    (
+        FS_OP_BDEV_PASSTHROUGH_NOTED,
+        "bdev_passthrough_noted",
+        "2.3",
+    ),
 ];
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
@@ -2128,7 +2163,33 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_BDEV_READ
             | FS_OP_FATAL_SIGNAL
             | FS_OP_PERF_EVENT
+            // the review of #647: a block device's raw write or command let
+            // through and recorded (High by its rule; a tool's opens are many)
+            | FS_OP_BDEV_WRITE_NOTED
+            | FS_OP_BDEV_PASSTHROUGH_NOTED
     )
+}
+
+/// Lot 2.3a (the review of #647): the records that refuse nothing — each
+/// kind documented "NOT a refusal" above, the sole traces
+/// ([`is_sole_trace`]) among them. A tree window classes only the
+/// refusals (`window_tree::window_classes`): the agent's supervision
+/// signals, let through, are no outsider's refused attempt.
+pub const fn is_let_through(operation: u8) -> bool {
+    is_sole_trace(operation)
+        || matches!(
+            operation,
+            FS_OP_CGROUP_JOIN
+                | FS_OP_SYSCTL_OPT_OUT
+                | FS_OP_EXEMPT_INJECT
+                | FS_OP_BPF_PROG_OPT_OUT
+                | FS_OP_MOUNT_WINDOW
+                | FS_OP_MOUNT_NOTED
+                | FS_OP_SYSRQ_WINDOW
+                | FS_OP_FATAL_SIGNAL
+                | FS_OP_BDEV_WRITE_NOTED
+                | FS_OP_BDEV_PASSTHROUGH_NOTED
+        )
 }
 
 /// Lot 356 (pre-alpha F3-8): the records that are the ONLY trace of a
